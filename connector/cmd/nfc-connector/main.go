@@ -39,7 +39,6 @@ func main() {
 			driver = pcscDriver
 		} else {
 			log.Printf("pcsc driver degraded (status=%v), trying direct driver", health["status"])
-			pcscDriver.Close()
 		}
 	} else {
 		log.Printf("pcsc driver unavailable: %v", pcscErr)
@@ -47,10 +46,17 @@ func main() {
 
 	if driver == nil {
 		directDriver, directErr := bridge.NewDirectDriver()
-		if directErr != nil {
+		if directErr == nil {
+			driver = directDriver
+			if pcscDriver != nil {
+				pcscDriver.Close()
+			}
+		} else if pcscDriver != nil {
+			log.Printf("direct driver unavailable: %v; using degraded pcsc driver (will recover when pcscd starts)", directErr)
+			driver = pcscDriver
+		} else {
 			log.Fatalf("no working driver available: pcsc=%v direct=%v", pcscErr, directErr)
 		}
-		driver = directDriver
 	}
 	defer driver.Close()
 
