@@ -546,15 +546,18 @@ function buildWindows(version, outputDir, arch) {
   writeFileSync(
     wixSource,
     `<?xml version="1.0" encoding="UTF-8"?>
-<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs" xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
   <Package Name="Web NFC Bridge Connector" Manufacturer="Web NFC Bridge" Version="${version}" UpgradeCode="${upgradeCode}">
     <MediaTemplate EmbedCab="yes" />
+    <MajorUpgrade DowngradeErrorMessage="A newer version of [ProductName] is already installed." Schedule="afterInstallValidate" />
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="INSTALLFOLDER" Name="Web NFC Bridge Connector" />
     </StandardDirectory>
     <Feature Id="MainFeature" Title="Web NFC Bridge Connector" Level="1">
       <ComponentGroupRef Id="ConnectorFiles" />
     </Feature>
+    <!-- Kill running connector before upgrade so the exe can be replaced -->
+    <util:CloseApplication Id="CloseConnector" Target="nfc-connector.exe" RebootPrompt="no" TerminateProcess="1" />
     <CustomAction Id="LaunchConnector" FileRef="ConnectorExe" ExeCommand="--watchdog" Return="asyncNoWait" />
     <InstallExecuteSequence>
       <Custom Action="LaunchConnector" After="InstallFinalize" Condition="NOT Installed OR REINSTALL" />
@@ -581,7 +584,7 @@ function buildWindows(version, outputDir, arch) {
       version,
     ),
   );
-  run("wix", ["build", "-arch", arch, "-o", outputPath, wixSource]);
+  run("wix", ["build", "-arch", arch, "-ext", "WixToolset.Util.wixext", "-o", outputPath, wixSource]);
   rmSync(workDir, { recursive: true, force: true });
   return outputPath;
 }
