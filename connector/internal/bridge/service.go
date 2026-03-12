@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 )
@@ -154,6 +155,27 @@ func NewSession(readerName string, driverName string) *Session {
 		Driver:     driverName,
 		CreatedAt:  time.Now().UTC(),
 	}
+}
+
+// HasNFCCapableReader checks whether a driver's listed readers include at least
+// one that looks like a real NFC/contactless reader (e.g. ACR1252 PICC interface)
+// rather than a generic Windows smart card driver.
+func HasNFCCapableReader(d Driver) bool {
+	readers, err := d.ListReaders(context.Background())
+	if err != nil || len(readers) == 0 {
+		return false
+	}
+	for _, r := range readers {
+		upper := strings.ToUpper(r.Name)
+		// Known NFC reader indicators
+		if strings.Contains(upper, "PICC") ||
+			strings.Contains(upper, "CONTACTLESS") ||
+			strings.Contains(upper, "ACR") ||
+			strings.Contains(upper, "NFC") {
+			return true
+		}
+	}
+	return false
 }
 
 func firstReader(readers []Reader) *Reader {

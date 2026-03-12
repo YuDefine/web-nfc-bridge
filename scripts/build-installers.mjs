@@ -458,7 +458,34 @@ function buildMacOS(version, outputDir) {
   const preinstallPath = join(scriptsDir, "preinstall");
   writeFileSync(
     preinstallPath,
-    '#!/bin/sh\nset -eu\nplist=/Library/LaunchAgents/com.web-nfc-bridge.connector.plist\nbinary=/usr/local/libexec/web-nfc-bridge/nfc-connector\nwrapper=/usr/local/bin/web-nfc-bridge-connector\ncurrent_user=$(stat -f %Su /dev/console || true)\nif [ -n "$current_user" ] && [ "$current_user" != "root" ]; then\n  uid=$(id -u "$current_user")\n  launchctl bootout "gui/$uid" "$plist" >/dev/null 2>&1 || true\n  launchctl remove "gui/$uid/com.web-nfc-bridge.connector" >/dev/null 2>&1 || true\nfi\nrm -f "$wrapper"\nrm -f "$binary"\nrm -f "$plist"\nrmdir /usr/local/libexec/web-nfc-bridge >/dev/null 2>&1 || true\nexit 0\n',
+    [
+      "#!/bin/sh",
+      "set -eu",
+      'current_user=$(stat -f %Su /dev/console || true)',
+      'if [ -n "$current_user" ] && [ "$current_user" != "root" ]; then',
+      '  uid=$(id -u "$current_user")',
+      "",
+      "  # Remove legacy nfc-tool connector",
+      '  old_plist=/Library/LaunchAgents/com.nfc-tool.connector.plist',
+      '  launchctl bootout "gui/$uid" "$old_plist" >/dev/null 2>&1 || true',
+      '  launchctl remove "gui/$uid/com.nfc-tool.connector" >/dev/null 2>&1 || true',
+      '  rm -f "$old_plist"',
+      '  rm -f /usr/local/libexec/nfc-tool/nfc-connector',
+      '  rmdir /usr/local/libexec/nfc-tool >/dev/null 2>&1 || true',
+      '  pkgutil --forget com.nfc-tool.connector >/dev/null 2>&1 || true',
+      "",
+      "  # Remove previous web-nfc-bridge connector",
+      '  plist=/Library/LaunchAgents/com.web-nfc-bridge.connector.plist',
+      '  launchctl bootout "gui/$uid" "$plist" >/dev/null 2>&1 || true',
+      '  launchctl remove "gui/$uid/com.web-nfc-bridge.connector" >/dev/null 2>&1 || true',
+      "fi",
+      'rm -f /usr/local/bin/web-nfc-bridge-connector',
+      'rm -f /usr/local/libexec/web-nfc-bridge/nfc-connector',
+      'rm -f /Library/LaunchAgents/com.web-nfc-bridge.connector.plist',
+      'rmdir /usr/local/libexec/web-nfc-bridge >/dev/null 2>&1 || true',
+      "exit 0",
+      "",
+    ].join("\n"),
   );
   chmodSync(preinstallPath, 0o755);
 

@@ -15,7 +15,8 @@ import (
 
 // DirectDriver bypasses SCardSvr and talks directly to smart card readers
 // via SetupAPI enumeration and DeviceIoControl IOCTLs. This is needed on
-// Windows ARM64 where SCardSvr is broken (LRPC endpoint never becomes reachable).
+// Windows machines where SCardSvr is broken or returns only generic smart card
+// drivers (observed on both ARM64 and some x86 systems).
 type DirectDriver struct {
 	events          chan Event
 	stop            chan struct{}

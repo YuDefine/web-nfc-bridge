@@ -36,7 +36,15 @@ func main() {
 	if pcscErr == nil {
 		health := pcscDriver.Health(context.Background())
 		if health["status"] == "ok" {
-			driver = pcscDriver
+			// Verify PCSC has a real NFC reader, not just a generic smart card driver.
+			// On some Windows machines (x86 and ARM64), PCSC context is valid but
+			// SCardListReaders returns a generic reader (e.g. "智慧卡讀取裝置")
+			// that cannot handle NFC APDU commands.
+			if bridge.HasNFCCapableReader(pcscDriver) {
+				driver = pcscDriver
+			} else {
+				log.Printf("pcsc driver ok but no NFC-capable reader found (generic smart card driver?), trying direct driver")
+			}
 		} else {
 			log.Printf("pcsc driver degraded (status=%v), trying direct driver", health["status"])
 		}
