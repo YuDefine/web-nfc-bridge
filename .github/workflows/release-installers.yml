@@ -55,7 +55,9 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          dotnet tool install --global wix
+          # Pinned: v0.1.20 was built with WiX 6.0.2. WiX 7 requires accepting the
+          # OSMF EULA (error WIX7015); upgrading is a licensing decision.
+          dotnet tool install --global wix --version 6.0.2
           Add-Content -Path $env:GITHUB_PATH -Value "$env:USERPROFILE\.dotnet\tools"
 
       - name: Build installer
