@@ -19,10 +19,10 @@
 
 ## Windows Upgrade & Logging
 
-- MSI 使用 `MajorUpgrade`（`afterInstallInitialize`），升級時先移除舊版；偵測到升級（`WIX_UPGRADE_DETECTED`）時以 `taskkill /F /IM nfc-connector.exe` 停掉執行中的 connector，安裝完成後再以 `--watchdog` 啟動新版
+- MSI 使用 `MajorUpgrade`（`afterInstallInitialize`），升級時先移除舊版；偵測到升級（`WIX_UPGRADE_DETECTED`）時，在 `RemoveExistingProducts` 之前以 `taskkill /F /IM nfc-connector.exe` 停掉執行中的 connector（含 watchdog），安裝完成後再以 `--watchdog` 啟動新版
 - Windows build 使用 `-H=windowsgui`，沒有 console；log 寫到 `%LOCALAPPDATA%\Web NFC Bridge Connector\connector.log`
-- watchdog 啟動時若 log 超過 1 MB，改名為 `connector.log.old` 再開新檔
-- watchdog 子行程沿用 watchdog 的 log 檔（`NFC_CONNECTOR_SUPERVISED=1`），未處理的 panic 與 runtime fatal error 也會寫進同一個檔
+- 寫入會讓 log 超過 1 MB 時（啟動時或執行中皆同），先把它改名為 `connector.log.old`（取代上一份）再開新檔，最多保留兩個檔
+- watchdog 是唯一寫 log 檔的行程：子行程（`NFC_CONNECTOR_SUPERVISED=1`）的 stdout / stderr 經 pipe 交給 watchdog 寫入，未處理的 panic 與 runtime fatal error 也一併寫進去；watchdog 自己的 crash 輸出以 `debug.SetCrashOutput` 寫到當前 log 檔
 - 下游 fork 的 v0.1.23 曾把 log 寫在 `%APPDATA%`（Roaming）下的同名資料夾；升級後可手動刪除
 
 ## Ubuntu `.deb` Behavior

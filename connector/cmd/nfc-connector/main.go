@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -111,19 +112,25 @@ func runWatchdog() {
 
 	log.Printf("watchdog: supervising %s", exe)
 	for {
-		cmd := exec.Command(exe)
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		cmd.Env = supervisedChildEnv(os.Environ())
-		hideWindow(cmd)
-
-		if err := cmd.Run(); err != nil {
+		if err := superviseOnce(exe, nil, log.Writer()); err != nil {
 			log.Printf("watchdog: process exited: %v, restarting in %s", err, restartDelay)
 		} else {
 			log.Printf("watchdog: process exited cleanly, restarting in %s", restartDelay)
 		}
 		time.Sleep(restartDelay)
 	}
+}
+
+// superviseOnce runs one child process to completion. Its stdout and stderr
+// (including Go runtime crash output) go through a pipe into out, so the
+// watchdog's log is the only writer of the log file and owns rotation.
+func superviseOnce(exe string, args []string, out io.Writer) error {
+	cmd := exec.Command(exe, args...)
+	cmd.Stdout = out
+	cmd.Stderr = out
+	cmd.Env = supervisedChildEnv(os.Environ())
+	hideWindow(cmd)
+	return cmd.Run()
 }
 
 // resolveAllowedOrigins returns the origins from NFC_CONNECTOR_ALLOWED_ORIGINS
