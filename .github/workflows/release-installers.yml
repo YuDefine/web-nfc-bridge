@@ -59,6 +59,10 @@ jobs:
           Add-Content -Path $env:GITHUB_PATH -Value "$env:USERPROFILE\.dotnet\tools"
 
       - name: Build installer
+        env:
+          # Empty on the public repo. Downstream repos set this repository
+          # variable (Settings > Variables) to add their own site origins.
+          NFC_CONNECTOR_EXTRA_ALLOWED_ORIGINS: ${{ vars.NFC_CONNECTOR_EXTRA_ALLOWED_ORIGINS }}
         run: node ./scripts/build-installers.mjs --platform ${{ matrix.platform }} --version ${{ inputs.version || github.ref_name }} --output-dir artifacts/installers
 
       - name: Upload installer artifact
