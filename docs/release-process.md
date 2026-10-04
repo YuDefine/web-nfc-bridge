@@ -58,7 +58,7 @@ public repo（`YuDefine/web-nfc-bridge`）是上游，下游 fork 只是部署�
 
 ## Workflows
 
-- `ci`：在 pull request 與 `main` push 時執行 typecheck、build script 測試、Nuxt build 與 connector 測試。
+- `ci`：在 pull request 與 `main` push 時執行 lint、typecheck、build script 測試、Nuxt build 與 connector 測試。
 - `release-installers`：在 `v*` tag push 時建置安裝包並發佈 release。
 - `deploy-cloudflare`：只在上游 repo 部署 demo 站台。
 
@@ -66,6 +66,7 @@ public repo（`YuDefine/web-nfc-bridge`）是上游，下游 fork 只是部署�
 
 - `pnpm run build:app`：只建置 Nuxt 應用程式。
 - `pnpm run connector:test`：執行 connector 測試。
+- `pnpm run lint`：以 Vite+（`vp lint`，oxlint）檢查 JS / TS / Vue，warning 也視為失敗。
 - `pnpm run typecheck`：Nuxt / Vue 型別檢查。
 - `pnpm run test:scripts`：build script 的單元測試（含 Go 與 JS public origin 清單一致性檢查）。
 - `pnpm run ci`：執行本機 CI 等級驗證。

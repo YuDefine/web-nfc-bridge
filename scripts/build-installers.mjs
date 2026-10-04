@@ -9,7 +9,7 @@ import {
   rmSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve, dirname, basename } from "node:path";
+import { join, resolve, dirname } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import process from "node:process";
@@ -142,7 +142,7 @@ function latestArtifact(files, prefix, extensions) {
       });
     })
     .filter((item) => item !== null)
-    .sort((left, right) => {
+    .toSorted((left, right) => {
       const versionDelta = compareVersions(right.version, left.version);
       if (versionDelta !== 0) {
         return versionDelta;
@@ -189,7 +189,7 @@ function run(command, args, options = {}) {
   const result = spawnSync(command, args, {
     cwd: options.cwd || repoRoot,
     stdio: "inherit",
-    env: { ...process.env, ...(options.env || {}) },
+    env: { ...process.env, ...options.env },
     shell: false,
   });
   if (result.status !== 0) {
@@ -296,7 +296,7 @@ function cleanupOldArtifacts(outputDir) {
 
     const latestVersion = matched
       .map((item) => item.version)
-      .sort((left, right) => compareVersions(right, left))[0];
+      .toSorted((left, right) => compareVersions(right, left))[0];
 
     for (const artifact of matched) {
       const shouldKeep =

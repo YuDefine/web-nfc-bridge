@@ -8,7 +8,8 @@
     "build:app": "nuxt build",
     "build:cf": "NITRO_PRESET=cloudflare_module nuxt build",
     "build": "nuxt build && pnpm run installers:build",
-    "ci": "pnpm run typecheck && pnpm run test:scripts && pnpm run build:app && go test ./connector/...",
+    "ci": "pnpm run lint && pnpm run typecheck && pnpm run test:scripts && pnpm run build:app && go test ./connector/...",
+    "lint": "vp lint --deny-warnings",
     "typecheck": "nuxt typecheck",
     "test:scripts": "node --test \"scripts/**/*.test.mjs\"",
     "preview": "nuxt preview",
@@ -31,6 +32,7 @@
   },
   "devDependencies": {
     "@types/node": "^25.3.5",
+    "vite-plus": "1.0.0",
     "vue-tsc": "^3.2.5",
     "wrangler": "^4.71.0"
   }
