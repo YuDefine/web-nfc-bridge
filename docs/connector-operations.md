@@ -9,12 +9,21 @@
 - Windows ARM64: 只有在 Windows host 且可用 `wix` 時才產生 `.msi`
 - Linux x64: 產生 Ubuntu `dpkg` 可安裝的 `.deb`
 - 每次 build 完成後，`public/downloads` 只保留各平台最新版本的產物
+- 額外允許的網站 origin 以 `--extra-allowed-origins`（或環境變數 `NFC_CONNECTOR_EXTRA_ALLOWED_ORIGINS`）在 build 時帶入：寫進 macOS plist、Linux `/etc/default`，並以 `-ldflags -X main.extraAllowedOrigins` 編進 binary（Windows MSI 不設環境變數，只能靠這個預設值）；未帶入時只含 public origin
 
 ## Startup Strategy
 
 - macOS: `launchd` agent
 - Windows: Run key or Windows Service，視最終權限模型決定
 - Linux: system-level `systemd` service，安裝 `.deb` 後自動 `enable --now`
+
+## Windows Upgrade & Logging
+
+- MSI 使用 `MajorUpgrade`（`afterInstallInitialize`），升級時先移除舊版；偵測到升級（`WIX_UPGRADE_DETECTED`）時，在 `RemoveExistingProducts` 之前以 `taskkill /F /IM nfc-connector.exe` 停掉執行中的 connector（含 watchdog），安裝完成後再以 `--watchdog` 啟動新版
+- Windows build 使用 `-H=windowsgui`，沒有 console；log 寫到 `%LOCALAPPDATA%\Web NFC Bridge Connector\connector.log`
+- 寫入會讓 log 超過 1 MB 時（啟動時或執行中皆同），先把它改名為 `connector.log.old`（取代上一份）再開新檔，最多保留兩個檔
+- watchdog 是唯一寫 log 檔的行程：子行程（`NFC_CONNECTOR_SUPERVISED=1`）的 stdout / stderr 經 pipe 交給 watchdog 寫入，未處理的 panic 與 runtime fatal error 也一併寫進去；watchdog 自己的 crash 輸出以 `debug.SetCrashOutput` 寫到當前 log 檔
+- 下游 fork 的 v0.1.23 曾把 log 寫在 `%APPDATA%`（Roaming）下的同名資料夾；升級後可手動刪除
 
 ## Ubuntu `.deb` Behavior
 
@@ -49,6 +58,7 @@
 - 確認 localhost base URL 與頁面顯示一致
 - 確認 Connector process 已啟動
 - 確認 `NFC_CONNECTOR_ALLOWED_ORIGINS` 包含網站 origin
+- Windows 上先看 `%LOCALAPPDATA%\Web NFC Bridge Connector\connector.log`
 - 開發模式可使用 `http://localhost:*`、`https://localhost:*`、`http://127.0.0.1:*` 這類 wildcard 規則允許本機不同 port
 - 若 Web console 部署在 Cloudflare Workers 或自訂網域，allowlist 也要包含正式站台 origin，例如 `https://web-nfc-bridge.abcd854884.workers.dev` 或 `https://nfc.yudefine.com.tw`
 

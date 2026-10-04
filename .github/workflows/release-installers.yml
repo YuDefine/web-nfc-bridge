@@ -55,10 +55,18 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          dotnet tool install --global wix
+          # Pinned to WiX 5: the last release under MS-RL only. WiX 6+ binaries
+          # fall under the Open Source Maintenance Fee EULA (WiX 7 also fails
+          # with WIX7015 until it is accepted). Keep the existing MSI format and
+          # UpgradeCode so installed connectors upgrade in place.
+          dotnet tool install --global wix --version 5.0.2
           Add-Content -Path $env:GITHUB_PATH -Value "$env:USERPROFILE\.dotnet\tools"
 
       - name: Build installer
+        env:
+          # Empty on the public repo. Downstream repos set this repository
+          # variable (Settings > Variables) to add their own site origins.
+          NFC_CONNECTOR_EXTRA_ALLOWED_ORIGINS: ${{ vars.NFC_CONNECTOR_EXTRA_ALLOWED_ORIGINS }}
         run: node ./scripts/build-installers.mjs --platform ${{ matrix.platform }} --version ${{ inputs.version || github.ref_name }} --output-dir artifacts/installers
 
       - name: Upload installer artifact

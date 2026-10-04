@@ -20,7 +20,7 @@
 - **寫卡** — 將結構化 JSON 以 NDEF 記錄寫入卡片，並回讀驗證
 - **即時事件** — 透過 WebSocket 串流卡片感應、讀卡機狀態與操作結果
 - **安全設計** — HMAC 簽章的短效 token、來源白名單、禁止任意 APDU 直通
-- **跨平台** — macOS/Windows/Linux 使用 PC/SC 驅動，Windows ARM64 另有 Direct IOCTL 驅動
+- **跨平台安裝包** — 提供 macOS（Apple Silicon）、Windows x64/ARM64、Linux x64 安裝包，以 PC/SC 為主，Windows 另有 Direct IOCTL 備援驅動。目前僅 macOS 完成驗證，詳見[平台支援](#平台支援)
 
 ## 架構
 
@@ -156,21 +156,25 @@ Base URL：`http://127.0.0.1:42619`
 
 ## 平台支援
 
+下列平台都已發佈安裝包，但只有留下實機驗證紀錄的平台才標為已驗證。以 [docs/platform-support.md](docs/platform-support.md) 為準，本表不得標示比它更高的狀態。
+
 | 平台 | 架構 | 驅動 | 狀態 |
 |------|------|------|------|
-| macOS | Apple Silicon / Intel | PC/SC | 已驗證 |
-| Windows | x64 | PC/SC | 已驗證 |
-| Windows | ARM64 | Direct IOCTL | 已驗證 |
-| Linux | x64 | PC/SC | 已驗證 |
+| macOS | Apple Silicon | PC/SC | 已驗證（讀／寫） |
+| Windows | x64 | PC/SC，Direct IOCTL 備援 | 已出安裝包、驗證中 |
+| Windows | ARM64 | PC/SC，Direct IOCTL 備援 | 已出安裝包、驗證中（高風險） |
+| Linux | x64 | PC/SC | 已出安裝包、驗證中 |
+
+macOS Intel 沒有安裝包，不支援。
 
 ### 測試環境
 
-| 平台 | 裝置 | 作業系統版本 |
-|------|------|------------|
-| macOS | Mac mini M4 | macOS Tahoe 26.3.1 |
-| Windows x64 | Intel NUC | Windows 11 25H2 |
-| Windows ARM64 | ASUS Zenbook A14 (Snapdragon X - X126100) | Windows 11 ARM 25H2 |
-| Linux x64 | — | Ubuntu Server 24.04 |
+| 平台 | 裝置 | 作業系統版本 | 驗證狀態 |
+|------|------|------------|----------|
+| macOS | Mac mini M4 | macOS Tahoe 26.3.1 | 已驗證 |
+| Windows x64 | Intel NUC | Windows 11 25H2 | 驗證中 |
+| Windows ARM64 | ASUS Zenbook A14 (Snapdragon X - X126100) | Windows 11 ARM 25H2 | 驗證中 |
+| Linux x64 | — | Ubuntu Server 24.04 | 驗證中 |
 
 - **讀卡機**：ACS ACR1252U-M1
 - **卡片**：NTAG 216（NFC Type 2）
@@ -199,7 +203,7 @@ Connector 環境變數：
 |------|--------|------|
 | `NFC_CONNECTOR_ADDR` | `127.0.0.1:42619` | Connector 監聽位址 |
 | `NFC_CONNECTOR_SHARED_SECRET` | `development-shared-secret` | HMAC 簽章金鑰 |
-| `NFC_CONNECTOR_ALLOWED_ORIGINS` | localhost + 127.0.0.1 | 以逗號分隔的來源白名單 |
+| `NFC_CONNECTOR_ALLOWED_ORIGINS` | localhost／127.0.0.1（任意 port）＋ public demo 站台，以及 build 時加入的 origin | 以逗號分隔的來源白名單；有設定時取代預設值 |
 
 ## 文件
 

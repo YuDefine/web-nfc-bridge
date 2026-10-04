@@ -44,6 +44,7 @@ pnpm run deploy:cf
 Workflow 檔案位於 `.github/workflows/deploy-cloudflare.yml`。它會：
 
 - 在 `main` push 時自動部署。
+- 只在 `YuDefine/web-nfc-bridge` 執行；下游 fork 保留同一份檔案，job 會被略過（見 [release-process.md](release-process.md)）。
 - 支援 `workflow_dispatch`，可用 gh CLI 對指定 branch 手動部署。
 - 允許覆寫 Worker 名稱與 `site_origin`，方便先做預覽測試。
 
@@ -108,6 +109,8 @@ http://localhost:*,https://localhost:*,http://127.0.0.1:*,https://127.0.0.1:*,ht
 ```
 
 目前新產生的安裝器預設值已包含上述 Workers URL 與自訂網域；已安裝的舊版 Connector 仍需要手動更新環境變數後重啟。
+
+部署到其他網域時，不要修改原始碼裡的預設清單，改在 build 安裝包時帶入額外 origin（`--extra-allowed-origins` 或 repository variable `NFC_CONNECTOR_EXTRA_ALLOWED_ORIGINS`），細節見 [release-process.md](release-process.md)。
 
 ## 注意事項
 

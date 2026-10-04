@@ -28,6 +28,9 @@ concurrency:
 
 jobs:
   deploy:
+    # Only the public upstream deploys the demo site. Downstream forks keep this
+    # file unchanged (no diff to maintain) and the job is skipped there.
+    if: github.repository == 'YuDefine/web-nfc-bridge'
     runs-on: ubuntu-latest
     permissions:
       contents: read
