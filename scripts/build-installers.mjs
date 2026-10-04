@@ -13,6 +13,10 @@ import { join, resolve, dirname, basename } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import process from "node:process";
+import {
+  extraAllowedOriginsEnv,
+  resolveAllowedOrigins,
+} from "./lib/allowed-origins.mjs";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const supportedPlatforms = [
@@ -50,16 +54,6 @@ const artifactFamilies = [
 ];
 const downloadsDir = join(repoRoot, "public", "downloads");
 const downloadsManifestPath = join(downloadsDir, "manifest.json");
-const defaultAllowedOrigins = [
-  "http://localhost:*",
-  "https://localhost:*",
-  "http://127.0.0.1:*",
-  "https://127.0.0.1:*",
-  "https://web-nfc-bridge.abcd854884.workers.dev",
-  "https://web-nfc-bridge.abcd854884.workers.dev.",
-  "https://nfc.yudefine.com.tw",
-  "https://nfc.yudefine.com.tw.",
-].join(",");
 const installerCatalog = [
   {
     platform: "macOS",
@@ -334,11 +328,25 @@ function nativeOutputName(platform, version) {
   }
 }
 
-function buildGoBinary(outputPath, env, { extraLdflags = "" } = {}) {
+function buildGoBinary(
+  outputPath,
+  env,
+  { extraLdflags = "", extraAllowedOrigins = [] } = {},
+) {
   ensureDir(dirname(outputPath));
   const buildVersion = env.BUILD_VERSION || "dev";
   const buildTime = env.BUILD_TIME || new Date().toISOString();
-  const ldflags = `-X main.version=${buildVersion} -X main.buildTime=${buildTime}${extraLdflags ? " " + extraLdflags : ""}`;
+  const ldflags = [
+    `-X main.version=${buildVersion}`,
+    `-X main.buildTime=${buildTime}`,
+    // Origins are validated by parseExtraAllowedOrigins, so they contain no spaces.
+    extraAllowedOrigins.length > 0
+      ? `-X main.extraAllowedOrigins=${extraAllowedOrigins.join(",")}`
+      : "",
+    extraLdflags,
+  ]
+    .filter(Boolean)
+    .join(" ");
   run(
     "go",
     [
@@ -384,7 +392,7 @@ function createDebPackage(packageRootDir, controlDir, outputPath) {
   );
 }
 
-function buildMacOS(version, outputDir) {
+function buildMacOS(version, outputDir, allowedOrigins) {
   if (process.platform !== "darwin") {
     throw new Error("macOS pkg packaging must run on a macOS host");
   }
@@ -403,13 +411,17 @@ function buildMacOS(version, outputDir) {
   ensureDir(scriptsDir);
 
   const binaryPath = join(binaryDir, "nfc-connector");
-  buildGoBinary(binaryPath, {
-    BUILD_VERSION: version,
-    BUILD_TIME: new Date().toISOString(),
-    GOOS: "darwin",
-    GOARCH: "arm64",
-    CGO_ENABLED: "1",
-  });
+  buildGoBinary(
+    binaryPath,
+    {
+      BUILD_VERSION: version,
+      BUILD_TIME: new Date().toISOString(),
+      GOOS: "darwin",
+      GOARCH: "arm64",
+      CGO_ENABLED: "1",
+    },
+    { extraAllowedOrigins: allowedOrigins.extra },
+  );
 
   const wrapperPath = join(wrapperDir, "web-nfc-bridge-connector");
   writeFileSync(
@@ -442,7 +454,7 @@ function buildMacOS(version, outputDir) {
       <key>NFC_CONNECTOR_DRIVER</key>
       <string>pcsc</string>
       <key>NFC_CONNECTOR_ALLOWED_ORIGINS</key>
-      <string>${defaultAllowedOrigins}</string>
+      <string>${allowedOrigins.all.join(",")}</string>
       <key>NFC_CONNECTOR_SHARED_SECRET</key>
       <string>development-shared-secret</string>
     </dict>
@@ -513,7 +525,7 @@ function buildMacOS(version, outputDir) {
   return outputPath;
 }
 
-function buildWindows(version, outputDir, arch) {
+function buildWindows(version, outputDir, arch, allowedOrigins) {
   const goArch = arch === "x64" ? "amd64" : arch;
 
   if (process.platform !== "win32" || !findTool("wix")) {
@@ -535,7 +547,10 @@ function buildWindows(version, outputDir, arch) {
       GOOS: "windows",
       GOARCH: goArch,
     },
-    { extraLdflags: "-H=windowsgui" },
+    {
+      extraLdflags: "-H=windowsgui",
+      extraAllowedOrigins: allowedOrigins.extra,
+    },
   );
 
   const wixSource = join(workDir, "connector.wxs");
@@ -590,7 +605,7 @@ function buildWindows(version, outputDir, arch) {
   return outputPath;
 }
 
-function buildLinux(version, outputDir) {
+function buildLinux(version, outputDir, allowedOrigins) {
   const workDir = mkdtempSync(join(tmpdir(), "web-nfc-bridge-linux-deb-"));
   const dataRoot = join(workDir, "data");
   const controlRoot = join(workDir, "control");
@@ -605,13 +620,17 @@ function buildLinux(version, outputDir) {
   ensureDir(controlRoot);
 
   const binaryPath = join(binaryDir, "nfc-connector");
-  buildGoBinary(binaryPath, {
-    BUILD_VERSION: version,
-    BUILD_TIME: new Date().toISOString(),
-    GOOS: "linux",
-    GOARCH: "amd64",
-    CGO_ENABLED: "1",
-  });
+  buildGoBinary(
+    binaryPath,
+    {
+      BUILD_VERSION: version,
+      BUILD_TIME: new Date().toISOString(),
+      GOOS: "linux",
+      GOARCH: "amd64",
+      CGO_ENABLED: "1",
+    },
+    { extraAllowedOrigins: allowedOrigins.extra },
+  );
 
   writeFileSync(
     join(wrapperDir, "web-nfc-bridge-connector"),
@@ -624,7 +643,7 @@ function buildLinux(version, outputDir) {
     [
       'NFC_CONNECTOR_ADDR="127.0.0.1:42619"',
       'NFC_CONNECTOR_DRIVER="pcsc"',
-      `NFC_CONNECTOR_ALLOWED_ORIGINS="${defaultAllowedOrigins}"`,
+      `NFC_CONNECTOR_ALLOWED_ORIGINS="${allowedOrigins.all.join(",")}"`,
       'NFC_CONNECTOR_SHARED_SECRET="development-shared-secret"',
     ].join("\n") + "\n",
   );
@@ -716,16 +735,16 @@ function buildLinux(version, outputDir) {
   return outputPath;
 }
 
-function buildPlatform(platform, version, outputDir) {
+function buildPlatform(platform, version, outputDir, allowedOrigins) {
   switch (platform) {
     case "macos":
-      return buildMacOS(version, outputDir);
+      return buildMacOS(version, outputDir, allowedOrigins);
     case "windows-x64":
-      return buildWindows(version, outputDir, "x64");
+      return buildWindows(version, outputDir, "x64", allowedOrigins);
     case "windows-arm64":
-      return buildWindows(version, outputDir, "arm64");
+      return buildWindows(version, outputDir, "arm64", allowedOrigins);
     case "linux-x64":
-      return buildLinux(version, outputDir);
+      return buildLinux(version, outputDir, allowedOrigins);
     default:
       throw new Error(`Unsupported platform target: ${platform}`);
   }
@@ -735,7 +754,17 @@ const args = parseArgs(process.argv.slice(2));
 const version = resolveVersion(args.version);
 const requestedPlatform = args.platform || "all";
 const outputDir = resolve(repoRoot, args["output-dir"] || "public/downloads");
+// Downstream builds pass extra origins via --extra-allowed-origins or the
+// NFC_CONNECTOR_EXTRA_ALLOWED_ORIGINS environment variable (comma separated).
+const allowedOrigins = resolveAllowedOrigins(
+  args["extra-allowed-origins"] ?? process.env[extraAllowedOriginsEnv],
+);
 ensureDir(outputDir);
+console.log(
+  allowedOrigins.extra.length > 0
+    ? `Extra allowed origins: ${allowedOrigins.extra.join(", ")}`
+    : "Extra allowed origins: none (public origins only)",
+);
 
 const platforms =
   requestedPlatform === "all" ? supportedPlatforms : [requestedPlatform];
@@ -745,7 +774,12 @@ for (const platform of platforms) {
       `Unknown platform '${platform}'. Supported: ${supportedPlatforms.join(", ")}, all`,
     );
   }
-  const artifactPath = buildPlatform(platform, version, outputDir);
+  const artifactPath = buildPlatform(
+    platform,
+    version,
+    outputDir,
+    allowedOrigins,
+  );
   if (artifactPath) {
     console.log(`Built ${platform} installer: ${artifactPath}`);
     continue;

@@ -19,7 +19,14 @@ import (
 var version = "dev"
 var buildTime = "unknown"
 
-const defaultAllowedOrigins = "http://localhost:*,https://localhost:*,http://127.0.0.1:*,https://127.0.0.1:*,https://web-nfc-bridge.abcd854884.workers.dev,https://web-nfc-bridge.abcd854884.workers.dev.,https://nfc.yudefine.com.tw,https://nfc.yudefine.com.tw."
+// publicAllowedOrigins must match publicAllowedOrigins in
+// scripts/lib/allowed-origins.mjs (checked by scripts/lib/allowed-origins.test.mjs).
+const publicAllowedOrigins = "http://localhost:*,https://localhost:*,http://127.0.0.1:*,https://127.0.0.1:*,https://web-nfc-bridge.abcd854884.workers.dev,https://web-nfc-bridge.abcd854884.workers.dev.,https://nfc.yudefine.com.tw,https://nfc.yudefine.com.tw."
+
+// extraAllowedOrigins is injected by scripts/build-installers.mjs via
+// -ldflags "-X main.extraAllowedOrigins=..." for downstream builds. Windows
+// installers set no environment, so this is the only way extra origins reach them.
+var extraAllowedOrigins = ""
 
 func main() {
 	initLogging()
@@ -31,7 +38,7 @@ func main() {
 
 	addr := getenv("NFC_CONNECTOR_ADDR", "127.0.0.1:42619")
 	secret := getenv("NFC_CONNECTOR_SHARED_SECRET", "development-shared-secret")
-	allowedOrigins := strings.Split(getenv("NFC_CONNECTOR_ALLOWED_ORIGINS", defaultAllowedOrigins), ",")
+	allowedOrigins := resolveAllowedOrigins(os.Getenv("NFC_CONNECTOR_ALLOWED_ORIGINS"))
 
 	var driver bridge.Driver
 	pcscDriver, pcscErr := bridge.NewPCSCDriver()
@@ -117,6 +124,27 @@ func runWatchdog() {
 		}
 		time.Sleep(restartDelay)
 	}
+}
+
+// resolveAllowedOrigins returns the origins from NFC_CONNECTOR_ALLOWED_ORIGINS
+// when set; otherwise the built-in public origins plus any build-time extras.
+func resolveAllowedOrigins(fromEnv string) []string {
+	raw := fromEnv
+	if strings.TrimSpace(raw) == "" {
+		raw = publicAllowedOrigins + "," + extraAllowedOrigins
+	}
+
+	origins := []string{}
+	seen := map[string]bool{}
+	for _, origin := range strings.Split(raw, ",") {
+		origin = strings.TrimSpace(origin)
+		if origin == "" || seen[origin] {
+			continue
+		}
+		seen[origin] = true
+		origins = append(origins, origin)
+	}
+	return origins
 }
 
 func getenv(key string, fallback string) string {
