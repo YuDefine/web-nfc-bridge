@@ -61,3 +61,24 @@ jobs:
         run: |
           GOOS=windows GOARCH=amd64 go vet ./connector/...
           GOOS=windows GOARCH=arm64 go vet ./connector/...
+
+  connector-test-windows:
+    name: connector-test-${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Windows-only code (file logging, crash output, Direct IOCTL driver)
+        # only runs on real Windows, on both shipped architectures.
+        os: [windows-latest, windows-11-arm]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run connector tests
+        run: go test ./connector/...
+

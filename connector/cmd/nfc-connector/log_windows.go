@@ -25,11 +25,7 @@ func initLogging() {
 		return
 	}
 
-	w, err := openRotatingLog(filepath.Join(dir, logDirName), maxLogBytes, func(f *os.File) {
-		// Unhandled panics and fatal runtime errors write to fd 2, which does
-		// not exist under -H=windowsgui; send them to the current log file.
-		_ = debug.SetCrashOutput(f, debug.CrashOptions{})
-	})
+	w, err := openRotatingLog(filepath.Join(dir, logDirName), maxLogBytes, setCrashOutput)
 	if err != nil {
 		return
 	}
@@ -39,4 +35,11 @@ func initLogging() {
 	log.SetOutput(w)
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	log.Printf("--- log init (pid=%d) ---", os.Getpid())
+}
+
+// setCrashOutput sends unhandled panics and fatal runtime errors, which write
+// to fd 2 (absent under -H=windowsgui), to the current log file. Called with
+// nil it releases the previous file so rotation can rename it.
+func setCrashOutput(f *os.File) {
+	_ = debug.SetCrashOutput(f, debug.CrashOptions{})
 }

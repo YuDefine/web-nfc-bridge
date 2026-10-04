@@ -135,11 +135,17 @@ func TestRotatingLogWritesOversizedEntryToEmptyFile(t *testing.T) {
 	}
 }
 
-func TestRotatingLogCallsOnOpenForEachFile(t *testing.T) {
+func TestRotatingLogReleasesFileBeforeRotationAndReportsNewFile(t *testing.T) {
 	dir := t.TempDir()
-	var opened []string
+	var calls []string
 
-	l, err := openRotatingLog(dir, 4, func(f *os.File) { opened = append(opened, f.Name()) })
+	l, err := openRotatingLog(dir, 4, func(f *os.File) {
+		if f == nil {
+			calls = append(calls, "release")
+			return
+		}
+		calls = append(calls, "use "+filepath.Base(f.Name()))
+	})
 	if err != nil {
 		t.Fatalf("openRotatingLog: %v", err)
 	}
@@ -147,13 +153,9 @@ func TestRotatingLogCallsOnOpenForEachFile(t *testing.T) {
 	writeString(t, l, "1234")
 	writeString(t, l, "5678")
 
-	if len(opened) != 2 {
-		t.Fatalf("expected onOpen for initial open and rotation, got %v", opened)
-	}
-	for _, name := range opened {
-		if name != filepath.Join(dir, logFileName) {
-			t.Fatalf("expected onOpen with current log path, got %s", name)
-		}
+	want := []string{"use " + logFileName, "release", "use " + logFileName}
+	if strings.Join(calls, ",") != strings.Join(want, ",") {
+		t.Fatalf("expected useFile calls %v, got %v", want, calls)
 	}
 }
 

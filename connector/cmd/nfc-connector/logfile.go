@@ -28,12 +28,14 @@ type rotatingLog struct {
 	maxBytes int64
 	file     *os.File
 	size     int64
-	// onOpen runs with every newly opened file (Windows uses it to point
-	// runtime crash output at the current file).
-	onOpen func(*os.File)
+	// useFile is called with each newly opened file, and with nil just before
+	// the current file is closed for rotation. Windows uses it for runtime
+	// crash output, whose duplicated handle would otherwise keep the file open:
+	// Go opens files without FILE_SHARE_DELETE there, so the rename would fail.
+	useFile func(*os.File)
 }
 
-func openRotatingLog(dir string, maxBytes int64, onOpen func(*os.File)) (*rotatingLog, error) {
+func openRotatingLog(dir string, maxBytes int64, useFile func(*os.File)) (*rotatingLog, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
@@ -41,7 +43,7 @@ func openRotatingLog(dir string, maxBytes int64, onOpen func(*os.File)) (*rotati
 	l := &rotatingLog{
 		path:     filepath.Join(dir, logFileName),
 		maxBytes: maxBytes,
-		onOpen:   onOpen,
+		useFile:  useFile,
 	}
 	if err := l.open(); err != nil {
 		return nil, err
@@ -80,8 +82,8 @@ func (l *rotatingLog) open() error {
 
 	l.file = f
 	l.size = info.Size()
-	if l.onOpen != nil {
-		l.onOpen(f)
+	if l.useFile != nil {
+		l.useFile(f)
 	}
 	return nil
 }
@@ -89,6 +91,9 @@ func (l *rotatingLog) open() error {
 // rotate must be called with l.mu held. On failure the file stays nil and the
 // next Write reopens it.
 func (l *rotatingLog) rotate() {
+	if l.useFile != nil {
+		l.useFile(nil)
+	}
 	_ = l.file.Close()
 	l.file = nil
 
