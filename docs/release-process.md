@@ -47,7 +47,7 @@ public repo（`YuDefine/web-nfc-bridge`）是上游，下游 fork 只是部署�
 
 本機建置等效指令：`node ./scripts/build-installers.mjs --platform linux-x64 --extra-allowed-origins https://example.com`（也可改用同名環境變數）。
 
-### v0.1.21–v0.1.23 的處理
+### v0.1.20–v0.1.23 的處理
 
 `v0.1.21`、`v0.1.22`、`v0.1.23` 是在下游 fork 線上建立的 tag，上游沒有對應的 tag 與 Release：
 
@@ -55,6 +55,12 @@ public repo（`YuDefine/web-nfc-bridge`）是上游，下游 fork 只是部署�
 - 下游既有的這三個 tag 與 Release 保留不動（已有使用者安裝，改寫會讓版本來源無從追查），也**不推到上游**。
 - 它們包含的通用修正（Windows MSI 升級時停止舊 connector、Windows 檔案 log）已 cherry-pick 進上游 `main`，隨 `v0.1.24` 發佈；下游專屬的部分改由上述 repository variable 與 workflow 條件取代。
 - 下游從 `v0.1.23` 升到 `v0.1.24` 時，版本號仍然遞增，Windows MSI 可正常升級。
+
+`v0.1.20` 則是**同名異物**：上游與下游各自建立了 `v0.1.20`，指向不同 commit（下游那個已含下游專屬 origin），兩邊也都已發佈 Release。
+
+- 兩個 `v0.1.20` 都已有人安裝，保持原狀，不刪除、不移動。
+- 本機同時設了上游與下游 remote 時，下游 remote 設 `git config remote.<downstream>.tagOpt --no-tags`，避免 fetch 時把同名 tag 混在一起；本機的 tag 一律以上游為準。
+- 回報問題時，`v0.1.20` 需註明是上游或下游的 Release。
 
 ## Workflows
 
