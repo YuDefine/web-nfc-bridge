@@ -51,3 +51,10 @@ jobs:
 
       - name: Run connector tests
         run: go test ./connector/...
+
+      # Windows-only files (log_windows.go, direct_driver_windows.go, ...) are
+      # not compiled by the Linux test run above.
+      - name: Vet Windows builds
+        run: |
+          GOOS=windows GOARCH=amd64 go vet ./connector/...
+          GOOS=windows GOARCH=arm64 go vet ./connector/...
