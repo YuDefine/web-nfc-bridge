@@ -575,7 +575,7 @@ function buildWindows(version, outputDir, arch, allowedOrigins) {
     <CustomAction Id="StopConnector" Directory="System64Folder" ExeCommand="taskkill.exe /F /IM nfc-connector.exe" Return="ignore" />
     <CustomAction Id="LaunchConnector" FileRef="ConnectorExe" ExeCommand="--watchdog" Return="asyncNoWait" />
     <InstallExecuteSequence>
-      <Custom Action="StopConnector" After="InstallInitialize" Condition="WIX_UPGRADE_DETECTED" />
+      <Custom Action="StopConnector" Before="RemoveExistingProducts" Condition="WIX_UPGRADE_DETECTED" />
       <Custom Action="LaunchConnector" After="InstallFinalize" Condition="NOT Installed OR REINSTALL" />
     </InstallExecuteSequence>
   </Package>
