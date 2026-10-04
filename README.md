@@ -20,7 +20,7 @@ This architecture works on **macOS, Windows (x64/ARM64), and Linux** — anywher
 - **Write** — Write structured JSON payloads as NDEF records with read-back verification
 - **Real-time events** — WebSocket stream for card presence, reader status, and operation results
 - **Security by design** — HMAC-signed short-lived tokens, origin allowlist, no arbitrary APDU passthrough
-- **Cross-platform** — PC/SC driver for macOS/Windows/Linux, plus a Direct IOCTL driver for Windows ARM64
+- **Cross-platform installers** — macOS (Apple Silicon), Windows x64/ARM64 and Linux x64 packages built on PC/SC, with a Direct IOCTL fallback driver on Windows. Only macOS is validated so far; see [Platform Support](#platform-support)
 
 ## Architecture
 
@@ -156,21 +156,25 @@ Constraints:
 
 ## Platform Support
 
+Installers are published for every platform below, but only platforms with a recorded hardware validation are marked Validated. [docs/platform-support.md](docs/platform-support.md) is the source of truth; this table must not claim more than it does.
+
 | Platform | Architecture | Driver | Status |
 |----------|-------------|--------|--------|
-| macOS | Apple Silicon / Intel | PC/SC | Validated |
-| Windows | x64 | PC/SC | Validated |
-| Windows | ARM64 | Direct IOCTL | Validated |
-| Linux | x64 | PC/SC | Validated |
+| macOS | Apple Silicon | PC/SC | Validated (read/write) |
+| Windows | x64 | PC/SC, Direct IOCTL fallback | Installer available, validation in progress |
+| Windows | ARM64 | PC/SC, Direct IOCTL fallback | Installer available, validation in progress (high risk) |
+| Linux | x64 | PC/SC | Installer available, validation in progress |
 
-### Tested Environment
+macOS Intel has no installer and is not supported.
 
-| Platform | Device | OS Version |
-|----------|--------|------------|
-| macOS | Mac mini M4 | macOS Tahoe 26.3.1 |
-| Windows x64 | Intel NUC | Windows 11 25H2 |
-| Windows ARM64 | ASUS Zenbook A14 (Snapdragon X - X126100) | Windows 11 ARM 25H2 |
-| Linux x64 | — | Ubuntu Server 24.04 |
+### Test Environments
+
+| Platform | Device | OS Version | Validation |
+|----------|--------|------------|------------|
+| macOS | Mac mini M4 | macOS Tahoe 26.3.1 | Validated |
+| Windows x64 | Intel NUC | Windows 11 25H2 | In progress |
+| Windows ARM64 | ASUS Zenbook A14 (Snapdragon X - X126100) | Windows 11 ARM 25H2 | In progress |
+| Linux x64 | — | Ubuntu Server 24.04 | In progress |
 
 - **Reader**: ACS ACR1252U-M1
 - **Card**: NTAG 216 (NFC Type 2)
@@ -199,7 +203,7 @@ Environment variables for the connector:
 |----------|---------|-------------|
 | `NFC_CONNECTOR_ADDR` | `127.0.0.1:42619` | Connector listen address |
 | `NFC_CONNECTOR_SHARED_SECRET` | `development-shared-secret` | HMAC signing key |
-| `NFC_CONNECTOR_ALLOWED_ORIGINS` | localhost + 127.0.0.1 | Comma-separated origin allowlist |
+| `NFC_CONNECTOR_ALLOWED_ORIGINS` | localhost / 127.0.0.1 (any port) + the public demo sites, plus any origins added at build time | Comma-separated origin allowlist; replaces the default when set |
 
 ## Documentation
 
