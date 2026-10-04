@@ -15,6 +15,11 @@ export const publicAllowedOrigins = [
 
 export const extraAllowedOriginsEnv = "NFC_CONNECTOR_EXTRA_ALLOWED_ORIGINS";
 
+// LDH hostname (letters, digits, hyphen; dot-separated, optional trailing dot).
+// URL parsing alone accepts characters such as & " $ ` in hosts, which would
+// break the plist XML or the shell environment file.
+const hostnamePattern = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*\.?$/;
+
 // Parses a comma- or whitespace-separated list of exact origins
 // (scheme://host[:port], no path, no wildcard). The values end up in a plist,
 // a shell environment file and Go -ldflags, so anything else is rejected.
@@ -41,6 +46,11 @@ export function parseExtraAllowedOrigins(raw) {
     if (url.protocol !== "https:" && url.protocol !== "http:") {
       throw new Error(
         `Invalid extra allowed origin '${entry}': only http and https are allowed`,
+      );
+    }
+    if (!hostnamePattern.test(url.hostname)) {
+      throw new Error(
+        `Invalid extra allowed origin '${entry}': hostname may only contain letters, digits, '-' and '.'`,
       );
     }
     if (url.origin !== entry.replace(/\/$/, "")) {
