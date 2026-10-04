@@ -19,7 +19,7 @@ func TestRotatingLogRotatesWithCrashOutputOnWindows(t *testing.T) {
 	if err != nil {
 		t.Fatalf("openRotatingLog: %v", err)
 	}
-	defer l.file.Close()
+	defer l.Close()
 	writeString(t, l, "first\n")
 	writeString(t, l, "second\n")
 

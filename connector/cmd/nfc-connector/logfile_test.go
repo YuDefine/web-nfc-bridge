@@ -31,7 +31,7 @@ func TestOpenRotatingLogCreatesDirectoryAndFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("openRotatingLog: %v", err)
 	}
-	defer l.file.Close()
+	defer l.Close()
 	writeString(t, l, "hello\n")
 
 	if got := readFile(t, filepath.Join(dir, logFileName)); got != "hello\n" {
@@ -50,7 +50,7 @@ func TestRotatingLogAppendsBelowLimit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("openRotatingLog: %v", err)
 	}
-	defer l.file.Close()
+	defer l.Close()
 	writeString(t, l, "next\n")
 
 	if got := readFile(t, logPath); got != "previous\nnext\n" {
@@ -76,7 +76,7 @@ func TestRotatingLogRotatesOversizedFileOnFirstWrite(t *testing.T) {
 	if err != nil {
 		t.Fatalf("openRotatingLog: %v", err)
 	}
-	defer l.file.Close()
+	defer l.Close()
 	writeString(t, l, "fresh\n")
 
 	if got := readFile(t, logPath); got != "fresh\n" {
@@ -95,7 +95,7 @@ func TestRotatingLogRotatesWhileRunning(t *testing.T) {
 	if err != nil {
 		t.Fatalf("openRotatingLog: %v", err)
 	}
-	defer l.file.Close()
+	defer l.Close()
 
 	writeString(t, l, "aaaaaa\n") // 7 bytes
 	writeString(t, l, "bbbbbb\n") // would reach 14 > 10: rotate first
@@ -124,7 +124,7 @@ func TestRotatingLogWritesOversizedEntryToEmptyFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("openRotatingLog: %v", err)
 	}
-	defer l.file.Close()
+	defer l.Close()
 	writeString(t, l, "longer than the limit\n")
 
 	if got := readFile(t, filepath.Join(dir, logFileName)); got != "longer than the limit\n" {
@@ -149,7 +149,7 @@ func TestRotatingLogReleasesFileBeforeRotationAndReportsNewFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("openRotatingLog: %v", err)
 	}
-	defer l.file.Close()
+	defer l.Close()
 	writeString(t, l, "1234")
 	writeString(t, l, "5678")
 
@@ -166,7 +166,7 @@ func TestRotatingLogConcurrentWritesKeepEveryLine(t *testing.T) {
 	if err != nil {
 		t.Fatalf("openRotatingLog: %v", err)
 	}
-	defer l.file.Close()
+	defer l.Close()
 
 	const writers, lines = 8, 100
 	var wg sync.WaitGroup
@@ -184,6 +184,34 @@ func TestRotatingLogConcurrentWritesKeepEveryLine(t *testing.T) {
 	got := readFile(t, filepath.Join(dir, logFileName))
 	if strings.Count(got, "line\n") != writers*lines || len(got) != writers*lines*len("line\n") {
 		t.Fatalf("expected %d intact lines, got %d bytes", writers*lines, len(got))
+	}
+}
+
+func TestRotatingLogCloseReleasesFileAndReopensOnWrite(t *testing.T) {
+	dir := t.TempDir()
+	var calls []string
+
+	l, err := openRotatingLog(dir, maxLogBytes, func(f *os.File) {
+		if f == nil {
+			calls = append(calls, "release")
+			return
+		}
+		calls = append(calls, "use")
+	})
+	if err != nil {
+		t.Fatalf("openRotatingLog: %v", err)
+	}
+	if err := l.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	writeString(t, l, "after close\n")
+	defer l.Close()
+
+	if got := strings.Join(calls, ","); got != "use,release,use" {
+		t.Fatalf("expected use,release,use, got %s", got)
+	}
+	if got := readFile(t, filepath.Join(dir, logFileName)); got != "after close\n" {
+		t.Fatalf("expected write after Close to reopen the log, got %q", got)
 	}
 }
 

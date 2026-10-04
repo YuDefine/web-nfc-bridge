@@ -29,7 +29,7 @@ func TestSuperviseOnceCapturesChildCrashOutput(t *testing.T) {
 	if err != nil {
 		t.Fatalf("openRotatingLog: %v", err)
 	}
-	defer out.file.Close()
+	defer out.Close()
 
 	err = superviseOnce(os.Args[0], []string{"-test.run=^TestCrashingChildHelper$"}, out)
 

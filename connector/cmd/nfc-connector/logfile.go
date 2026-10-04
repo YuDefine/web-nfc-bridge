@@ -69,6 +69,23 @@ func (l *rotatingLog) Write(p []byte) (int, error) {
 	return n, err
 }
 
+// Close closes the current file and releases it from useFile. A later Write
+// reopens it.
+func (l *rotatingLog) Close() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if l.file == nil {
+		return nil
+	}
+	if l.useFile != nil {
+		l.useFile(nil)
+	}
+	err := l.file.Close()
+	l.file = nil
+	return err
+}
+
 func (l *rotatingLog) open() error {
 	f, err := os.OpenFile(l.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
