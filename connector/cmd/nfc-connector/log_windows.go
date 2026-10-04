@@ -3,33 +3,29 @@
 package main
 
 import (
-	"fmt"
 	"log"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 )
 
-const maxLogBytes = 1 << 20 // 1 MB
-
+// initLogging sends all output to %LOCALAPPDATA%\Web NFC Bridge Connector\connector.log.
+// Windows builds use -H=windowsgui, which leaves the process without a console,
+// so without this a crash on startup leaves no trace.
 func initLogging() {
-	dir, err := os.UserConfigDir()
-	if err != nil {
-		return // fall back to default (nowhere on windowsgui)
-	}
-
-	logDir := filepath.Join(dir, "Web NFC Bridge Connector")
-	if err := os.MkdirAll(logDir, 0o755); err != nil {
+	if isSupervisedChild() {
+		// stdout/stderr are already the watchdog's log file (inherited handles),
+		// including Go runtime crash output.
 		return
 	}
 
-	logPath := filepath.Join(logDir, "connector.log")
-
-	// Rotate: if the file exceeds maxLogBytes, rename to .old and start fresh.
-	if info, err := os.Stat(logPath); err == nil && info.Size() > maxLogBytes {
-		_ = os.Rename(logPath, logPath+".old")
+	// os.UserCacheDir is %LocalAppData% on Windows.
+	dir, err := os.UserCacheDir()
+	if err != nil {
+		return
 	}
 
-	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	f, err := openRotatingLog(filepath.Join(dir, logDirName), maxLogBytes)
 	if err != nil {
 		return
 	}
@@ -38,17 +34,12 @@ func initLogging() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	log.Printf("--- log init (pid=%d) ---", os.Getpid())
 
-	// Also redirect the child process stdout/stderr to this file when running
-	// as watchdog. We redirect os.Stderr so that the watchdog's exec.Command
-	// inherits it.
-	redirectStderr(f)
-
-	fmt.Fprintf(os.Stderr, "") // ensure stderr fd is valid after redirect
-}
-
-// redirectStderr points os.Stderr to the given file so child processes
-// spawned with cmd.Stderr = os.Stderr will inherit file-based logging.
-func redirectStderr(f *os.File) {
-	os.Stderr = f
+	// The watchdog passes os.Stdout/os.Stderr to its child, so the child's
+	// output (and runtime crash output) lands in the same file.
 	os.Stdout = f
+	os.Stderr = f
+
+	// Unhandled panics and fatal runtime errors write to fd 2, which does not
+	// exist under -H=windowsgui; send them to the log file as well.
+	_ = debug.SetCrashOutput(f, debug.CrashOptions{})
 }

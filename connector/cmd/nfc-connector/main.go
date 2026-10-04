@@ -107,7 +107,7 @@ func runWatchdog() {
 		cmd := exec.Command(exe)
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
-		cmd.Env = os.Environ()
+		cmd.Env = supervisedChildEnv(os.Environ())
 		hideWindow(cmd)
 
 		if err := cmd.Run(); err != nil {
