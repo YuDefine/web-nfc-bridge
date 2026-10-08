@@ -1,0 +1,69 @@
+{
+  "$schema": "../../clade/registry/consumer-meta.schema.json",
+  "$comment": "Scaffolded by clade scripts/scaffold-consumer-meta.ts 2026-10-08. Nuxt 4 on Cloudflare Workers + local Go connector; no auth, no DB, port 3030.",
+  "schemaVersion": "1",
+  "consumerId": "web-nfc-bridge",
+  "dev": {
+    "ports": [
+      {
+        "port": 3030,
+        "alias": "main",
+        "purpose": "dev (Nuxt)"
+      }
+    ],
+    "leaseMode": "advisory",
+    "commands": {
+      "spawn": "pnpm dev:agent",
+      "status": "pnpm dev:status",
+      "kill": "pnpm dev:kill"
+    },
+    "singleton": "scripts/dev-singleton.ts",
+    "worktreePattern": "../web-nfc-bridge-wt/<branch>",
+    "envSyncPolicy": {
+      "filesToCopy": [],
+      "filesToGenerate": [],
+      "source": "main"
+    }
+  },
+  "auth": {
+    "provider": "none",
+    "portPinned": false,
+    "oauthRedirectUris": [],
+    "devSigninEnabled": false,
+    "devSigninEndpoint": null,
+    "devSigninFlag": null,
+    "cookieNamespace": null
+  },
+  "browser": {
+    "cdpPort": 9333,
+    "profileMode": "dedicated-bh-chrome",
+    "loginRequired": false
+  },
+  "database": {
+    "kind": "none",
+    "instances": {},
+    "envVarNames": {},
+    "seedCommand": null,
+    "previewEnvCapability": "none"
+  },
+  "commands": {
+    "typecheck": "pnpm typecheck",
+    "lint": "pnpm lint",
+    "test": null,
+    "build": "pnpm build",
+    "smoke": null
+  },
+  "deploy": {
+    "platform": "cloudflare-workers",
+    "prodUrl": null,
+    "previewUrlShape": null,
+    "deployTrigger": "push-main"
+  },
+  "verification": {
+    "healthEndpoints": [],
+    "smokePaths": [],
+    "manualGates": [
+      "## 人工檢查 in specs/plans/*/tasks.md"
+    ]
+  }
+}

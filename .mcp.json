@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "codebase-memory-mcp": {
+      "type": "stdio",
+      "command": "codebase-memory-mcp"
+    }
+  }
+}

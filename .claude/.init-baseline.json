@@ -1,0 +1,14 @@
+{
+  "date": "2026-10-08T13:02:15.366Z",
+  "consumer": "web-nfc-bridge",
+  "conventions": {
+    "audit-trail": "none",
+    "evlog-stack": "none",
+    "verify-channels": "none",
+    "dev-login": "none",
+    "code-quality-tooling": "drift",
+    "nuxt-security": "none",
+    "user-lifecycle": "none",
+    "deploy-track": "compliant"
+  }
+}

@@ -4,7 +4,7 @@
   "type": "module",
   "packageManager": "pnpm@10.31.0",
   "scripts": {
-    "dev": "nuxt dev",
+    "dev": "nuxt dev --port 3030",
     "build:app": "nuxt build",
     "build:cf": "NITRO_PRESET=cloudflare_module nuxt build",
     "build": "nuxt build && pnpm run installers:build",
@@ -23,7 +23,20 @@
     "installers:build:macos": "node ./scripts/build-installers.mjs --platform macos",
     "installers:build:windows-x64": "node ./scripts/build-installers.mjs --platform windows-x64",
     "installers:build:windows-arm64": "node ./scripts/build-installers.mjs --platform windows-arm64",
-    "installers:build:linux-x64": "node ./scripts/build-installers.mjs --platform linux-x64"
+    "installers:build:linux-x64": "node ./scripts/build-installers.mjs --platform linux-x64",
+    "hub:bootstrap": "node ${CLADE_HOME:-$HOME/offline/clade}/scripts/bootstrap-hub.ts",
+    "hub:check": "node ${CLADE_HOME:-$HOME/offline/clade}/scripts/sync-rules.ts --check",
+    "hub:sync": "node ${CLADE_HOME:-$HOME/offline/clade}/scripts/hub-sync.ts",
+    "hub:doctor": "node ${CLADE_HOME:-$HOME/offline/clade}/scripts/sync-rules.ts --check --strict",
+    "hub:prune": "node ${CLADE_HOME:-$HOME/offline/clade}/scripts/sync-rules.ts --prune",
+    "hub:vendor": "node ${CLADE_HOME:-$HOME/offline/clade}/scripts/sync-vendor.ts",
+    "hub:vendor:check": "node ${CLADE_HOME:-$HOME/offline/clade}/scripts/sync-vendor.ts --check",
+    "hub:vendor:force": "node ${CLADE_HOME:-$HOME/offline/clade}/scripts/sync-vendor.ts --force",
+    "format": "vp fmt --write --ignore-path .oxfmtignore",
+    "format:check": "vp fmt --check --ignore-path .oxfmtignore",
+    "flow": "node .clade/vendor/scripts/flow/flow.ts",
+    "doctor": "node vendor/doctor-shared/run.mjs",
+    "postinstall": "node -e \"const f=require('node:fs'),p=require('node:path'),o=require('node:os'),s=require('node:child_process');const c=process.env.CLADE_HOME||[p.join(o.homedir(),'clade'),p.join(o.homedir(),'offline','clade')].find(x=>f.existsSync(x));if(!c){console.warn('[clade] not found locally — skip bootstrap. Set CLADE_HOME or clone to ~/clade');process.exit(0)}const r=s.spawnSync('node',[p.join(c,'scripts','bootstrap-hub.ts')],{stdio:'inherit'});process.exit(r.status||0)\""
   },
   "dependencies": {
     "@nuxt/ui": "^4.5.1",
