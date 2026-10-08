@@ -1,0 +1,504 @@
+#!/usr/bin/env bash
+# 🔒 LOCKED — managed by clade · Source: vendor/scripts/gate-slot.sh · 改這裡無效，下次 propagate 會覆寫；請改 $CLADE_HOME/vendor/scripts/gate-slot.sh
+# clade gate-slot — 限制同時執行的 heavy gate（typecheck / test）數量。
+#
+# 為什麼存在：post-edit hook 每次編輯 .ts/.vue 都跑完整 typecheck，pre-push 又跑一次。
+# 多個 consumer session 並行時，尖峰可同時有 3+ 個 vue-tsc（實測 ~266% CPU / 8.5 GiB RAM），
+# 把整台開發 VM 拖進 CPU wait + swap thrash。這支腳本是唯一的併發閘門 SoT。
+#
+# usage:
+#   gate-slot.sh <try|wait> <key> -- <command> [args...]
+#   gate-slot.sh status
+#
+# modes:
+#   try   取不到 slot 立刻 exit 75（EX_TEMPFAIL），呼叫端自行決定 skip（post-edit hook 走這條）
+#   wait  等到取得 slot 才執行（pre-push / 手動 pnpm typecheck 走這條，品質 gate 不可略過）
+#   status  唯讀：逐行印出 lock dir 內每個 lock 的持有者（TD-1072，見下方 print_status）
+#
+# env:
+#   CLADE_HEAVY_GATE_SLOTS   整台機器同時執行上限（預設 2，clamp 到 1..8）
+#   CLADE_GATE_LOCK_DIR      lock 檔目錄（預設 ${XDG_RUNTIME_DIR:-/tmp}/clade-gates）
+#   CLADE_GATE_WAIT_TIMEOUT  wait 模式最長等待秒數（預設 1800）
+#   CLADE_GATE_SLOT_HELD     外層已持有 heavy slot＋repo lock；本層直接 exec，不重複上鎖（防自我死鎖）。
+#                            只有 heavy 路徑會 export 它——light 沒持有 heavy 資源，NEVER 替巢狀 gate 宣稱已持有
+#   CLADE_GATE_LIGHT_HELD    外層已持有 light slot；只讓巢狀的 light 直接 exec，巢狀 heavy 照常取鎖
+#   CLADE_GATE_SLOT_METRICS  設為檔案路徑時，取到 slot 後 append 一行 JSON
+#                            {key,mode,class,slots,slot_wait_ms}（opt-in，未設不寫；寫失敗不影響 gate）
+#   CLADE_GATE_CLASS         heavy（預設）| light。由 clade-gate 判定後設定，本層讀完即 unset（W-2026-09-24-gate-slot-light-lane）
+#   CLADE_LIGHT_GATE_SLOTS   light 類整台機器同時執行上限（預設 2，clamp 到 1..8）
+#
+# 兩層鎖：
+#   1. repo lock  —— 同一個 repo 同時只跑一個 heavy gate（去重：pre-push 與 post-edit 撞在一起）
+#   2. slot lock  —— 整台機器同時只跑 N 個 heavy gate（跨 repo 總量上限）
+#
+# light 類（W-2026-09-24-gate-slot-light-lane）：少數檔的定點測試不取上面兩層，改取獨立的 light-<i>.lock semaphore。
+# 動機：heavy slot 降到 1 之後（TD-685），重跑 5 個小測試檔要排在別 repo 的整套 suite 後面，
+# agent 於是自己繞過閘門直跑——那才是真正沒有上限的路徑。light 類仍有全機上限、仍進記憶體
+# scope 與 MAX_RUNTIME，**NEVER** 讓它完全免閘。判定「算不算 light」只在 clade-gate，本檔只認 env。
+# 兩層都用 flock(1)。fd 由 exec 出去的子行程繼承，鎖隨行程結束自動釋放（含被 kill / timeout）。
+#
+# 降級原則：flock 不存在、lock dir 不可寫、參數異常時一律 **直接執行原命令**，
+# 絕不因為閘門本身故障而擋掉品質 gate。
+
+set -uo pipefail
+
+BUSY=75
+
+usage() {
+  printf 'usage: gate-slot.sh <try|wait> <key> -- <command> [args...] | gate-slot.sh status\n' >&2
+  exit 2
+}
+
+if [ "${1:-}" = status ]; then
+  [ "$#" -eq 1 ] || usage
+  mode=status
+else
+  [ "$#" -ge 3 ] || usage
+  mode=$1
+  key=$2
+  shift 2
+  [ "${1:-}" = "--" ] && shift
+  [ "$#" -ge 1 ] || usage
+  case "$mode" in
+    try | wait) ;;
+    *) usage ;;
+  esac
+fi
+
+# 只作用於這一層：讀完就 unset，被包的命令裡再進 gate-slot 時回到 heavy（同 CLADE_GATE_MODE）。
+# MUST 在任何「降級直接 exec」之前：flock 不存在、lock dir 建不起來、SLOT_HELD 等路徑都會
+# 直接 exec inner command，放在後面它就帶著 light 外洩進去。
+GATE_CLASS=heavy
+[ "${CLADE_GATE_CLASS:-}" = light ] && GATE_CLASS=light
+unset CLADE_GATE_CLASS
+
+# 外層已持有 slot（例如 post-edit hook 已上鎖，內層 pnpm typecheck 又轉呼叫 clade-gate）。
+# 沒有這個 escape hatch，第二層會在同一個 repo lock 上等自己 → 死鎖。
+if [ "$mode" != status ] && [ "${CLADE_GATE_SLOT_HELD:-}" = "1" ]; then
+  exec "$@"
+fi
+# light 裡再進 light：已經佔著一格 light，再排一格在 CLADE_LIGHT_GATE_SLOTS=1 時會等自己。
+# 巢狀 heavy 不走這裡——它要的 repo lock／heavy slot 外層 light 並沒有持有。
+if [ "$mode" != status ] && [ "$GATE_CLASS" = light ] && [ "${CLADE_GATE_LIGHT_HELD:-}" = "1" ]; then
+  exec "$@"
+fi
+
+[ "$mode" = status ] || command -v flock >/dev/null 2>&1 || exec "$@"
+
+# LOCK_DIR 決定「全機 semaphore 的命名空間」。NEVER 直接退 /tmp —— cron / systemd
+# service / daemon 起的 gate 沒有 XDG_RUNTIME_DIR，會落到 /tmp/clade-gates 形成**第二套
+# 獨立 semaphore**，全機上限靜默變成 2N，而且兩邊各自看起來都正常運作。用 id -u 推導
+# /run/user/<uid>，只有它真的不存在才退 /tmp（TD-685）。
+_default_lock_dir() {
+  if [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -d "$XDG_RUNTIME_DIR" ]; then
+    printf '%s/clade-gates' "$XDG_RUNTIME_DIR"
+    return
+  fi
+  _uid=$(id -u 2>/dev/null || echo '')
+  if [ -n "$_uid" ] && [ -d "/run/user/$_uid" ]; then
+    printf '/run/user/%s/clade-gates' "$_uid"
+    return
+  fi
+  printf '/tmp/clade-gates'
+}
+LOCK_DIR=${CLADE_GATE_LOCK_DIR:-$(_default_lock_dir)}
+[ "$mode" = status ] || mkdir -p "$LOCK_DIR" 2>/dev/null || exec "$@"
+
+# 上限 clamp（heavy 20、light 8）與 CI 併發設定的 SoT：scripts/test-lanes/lane-capacity.json
+# runner.heavyGateSlotsMax／lightGateSlotsMax——改這裡的 clamp 時同步那個檔（test/lane-capacity-sot.test.ts 擋漂移）。
+# heavy clamp 要涵蓋該主機的 host-cap（容量比例判準 Rule 4）；只改 .env 而 clamp 沒放寬，值會被靜默壓回 clamp。
+SLOTS=${CLADE_HEAVY_GATE_SLOTS:-2}
+case "$SLOTS" in
+  '' | *[!0-9]*) SLOTS=2 ;;
+esac
+[ "$SLOTS" -lt 1 ] && SLOTS=1
+[ "$SLOTS" -gt 20 ] && SLOTS=20
+
+LIGHT_SLOTS=${CLADE_LIGHT_GATE_SLOTS:-2}
+case "$LIGHT_SLOTS" in
+  '' | *[!0-9]*) LIGHT_SLOTS=2 ;;
+esac
+[ "$LIGHT_SLOTS" -lt 1 ] && LIGHT_SLOTS=1
+[ "$LIGHT_SLOTS" -gt 8 ] && LIGHT_SLOTS=8
+
+if [ "$GATE_CLASS" = light ]; then
+  SLOT_PREFIX=light
+  ACTIVE_SLOTS=$LIGHT_SLOTS
+else
+  SLOT_PREFIX=heavy
+  ACTIVE_SLOTS=$SLOTS
+fi
+
+# ── status：唯讀的持有者清單（TD-1072）────────────────────────────────────
+# 呼叫端（propagate 的 push 逾時判讀）要回答「我排隊時是誰佔著 slot」。證據 MUST 由
+# gate-slot 自己給 —— lock dir 的推導、slot 數的 clamp 都只在本檔，NEVER 在呼叫端
+# 另寫一份會漂移的路徑邏輯。
+#
+# 輸出：每個持有者一行 tab 分隔的 key=value，cwd 放最後；沒有持有者的 lock 印 `state=free`。
+# 判不出來一律 `state=unknown` 帶 `reason=`，NEVER 把判不出印成 free。
+# NEVER 用 `flock -n` 探測：那會短暫搶到 slot，讓正在輪詢的 waiter 錯過一輪。
+# 同 print_holder_diag：只印 comm 不印 argv（argv 可能帶 token，TD-685）。
+#
+# NEVER 把 `fuser <lock>` 的清單報成持有者：它列的是「開著 lock 檔的行程」，排隊者也開著——
+# repo lock 是先 `exec 9>>` 才 `flock -w`，acquire_slot 取不到 slot 前也短暫開檔。
+# 持有者由下面三層判定，依序：
+#   1. sidecar `<lock>.holder`：取到鎖的 gate-slot 自己寫的 $$（之後 exec timeout／
+#      systemd-run --scope 都不換 pid、fd 一路繼承），且該 pid 此刻真的開著這個 lock 檔
+#   2. /proc/locks：kernel 說這個 inode 有沒有被 FLOCK 佔（排隊者不會出現在裡面）。它的 pid
+#      欄是取鎖那支 `flock` 子行程、通常已結束，所以只判 held／free，不拿來認人
+#   3. 兩者都沒有（macOS 等）：有開檔者就 unknown 並列出 openers（含排隊者），否則 free
+print_status() {
+  local i lock
+  printf 'lock_dir=%s\tslots=%s\n' "$LOCK_DIR" "$SLOTS"
+  for i in $(seq 1 "$SLOTS"); do
+    print_lock_status "$LOCK_DIR/heavy-$i.lock" "slot=$i/$SLOTS"
+  done
+  # light 類只印有持有者的：呼叫端（push-timeout-phase）讀 heavy 行判「誰佔著 slot」，
+  # free 的 light 行對它是雜訊。
+  for i in $(seq 1 "$LIGHT_SLOTS"); do
+    [ -f "$LOCK_DIR/light-$i.lock" ] &&
+      print_lock_status "$LOCK_DIR/light-$i.lock" "slot=light-$i/$LIGHT_SLOTS" held-only
+  done
+  for lock in "$LOCK_DIR"/repo-*.lock; do
+    # repo lock 一個 repo 一支、只增不刪；free 的全印出來是雜訊，只印有持有者的。
+    [ -f "$lock" ] && print_lock_status "$lock" 'slot=repo' held-only
+  done
+}
+
+# sidecar 的 pid 還活著、而且真的開著這個 lock 檔才算數；否則是上一任留下的 stale 檔。
+valid_holder_pid() {
+  local lock=$1 pid real fd
+  [ -r "$lock.holder" ] || return 1
+  pid=$(head -n 1 "$lock.holder" 2>/dev/null)
+  case "$pid" in '' | *[!0-9]*) return 1 ;; esac
+  [ -d "/proc/$pid/fd" ] || return 1
+  real=$(readlink -f "$lock" 2>/dev/null) || return 1
+  for fd in /proc/"$pid"/fd/*; do
+    if [ "$(readlink "$fd" 2>/dev/null)" = "$real" ]; then
+      printf '%s' "$pid"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# 0 = held，1 = free，2 = 判不出（沒有 /proc/locks 或 stat 不是 GNU 形式）。
+kernel_lock_state() {
+  local lock=$1 dev ino key
+  [ -r /proc/locks ] || return 2
+  dev=$(stat -c '%d' "$lock" 2>/dev/null) || return 2
+  ino=$(stat -c '%i' "$lock" 2>/dev/null) || return 2
+  case "$dev$ino" in '' | *[!0-9]*) return 2 ;; esac
+  # glibc dev_t 解碼；/proc/locks 以 `%02x:%02x:%lu` 印 major:minor:inode。
+  key=$(printf '%02x:%02x:%s' "$(((dev >> 8) & 0xfff))" "$(((dev & 0xff) | ((dev >> 12) & 0xfff00)))" "$ino")
+  grep -q "FLOCK .* $key " /proc/locks && return 0
+  return 1
+}
+
+print_lock_status() {
+  local lock=$1 label=$2 filter=${3:-} name pid line state openers
+  name=$(basename "$lock")
+  if [ ! -f "$lock" ]; then
+    [ "$filter" = held-only ] || printf 'lock=%s\t%s\tstate=free\n' "$name" "$label"
+    return
+  fi
+  if pid=$(valid_holder_pid "$lock"); then
+    line=$(ps -o etime=,comm= -p "$pid" 2>/dev/null | awk '{$1=$1; print}')
+    if [ -n "$line" ]; then
+      printf 'lock=%s\t%s\tstate=held\tpid=%s\tetime=%s\tcomm=%s\tcwd=%s\n' \
+        "$name" "$label" "$pid" "${line%% *}" "${line#* }" \
+        "$(readlink "/proc/$pid/cwd" 2>/dev/null || echo unknown)"
+      return
+    fi
+  fi
+  kernel_lock_state "$lock"
+  state=$?
+  if [ "$state" -eq 0 ]; then
+    # 被佔但 sidecar 無效：持有者是沒寫 sidecar 的舊版 gate-slot，或非 gate-slot 的 flock。
+    printf 'lock=%s\t%s\tstate=held\tholder=unknown\n' "$name" "$label"
+    return
+  fi
+  if [ "$state" -eq 1 ]; then
+    [ "$filter" = held-only ] || printf 'lock=%s\t%s\tstate=free\n' "$name" "$label"
+    return
+  fi
+  if ! command -v fuser >/dev/null 2>&1; then
+    printf 'lock=%s\t%s\tstate=unknown\treason=no-fuser\n' "$name" "$label"
+    return
+  fi
+  openers=$(fuser "$lock" 2>/dev/null | awk '{$1=$1; gsub(/ /, ","); print}')
+  if [ -z "$openers" ]; then
+    [ "$filter" = held-only ] || printf 'lock=%s\t%s\tstate=free\n' "$name" "$label"
+    return
+  fi
+  printf 'lock=%s\t%s\tstate=unknown\treason=no-proc-locks\topeners=%s\n' "$name" "$label" "$openers"
+}
+
+if [ "$mode" = status ]; then
+  print_status
+  exit 0
+fi
+
+# slots 降到 1 的機器上佇列會變深（一套 typecheck 3–8 分鐘，3–4 個 waiter 要排得完），
+# 1800s 會讓品質 gate 變成隨機 exit 75。NEVER 改成無限等 —— 逾時的 holder 診斷是唯一
+# 會留下現場的東西。
+WAIT_TIMEOUT=${CLADE_GATE_WAIT_TIMEOUT:-3600}
+case "$WAIT_TIMEOUT" in
+  '' | *[!0-9]*) WAIT_TIMEOUT=1800 ;;
+esac
+
+safe_key=$(printf '%s' "$key" | tr -c 'A-Za-z0-9._-' '-')
+REPO_LOCK="$LOCK_DIR/repo-$safe_key.lock"
+
+# lock dir 存在但不可寫（權限 / 唯讀 fs）→ 降級直接跑，不要在這裡失敗。
+: >>"$REPO_LOCK" 2>/dev/null || exec "$@"
+
+# 取到鎖的那一刻由本行程寫下自己是持有者（status 的第 1 層證據，見 print_status 上方）。
+# 原子寫；寫失敗不影響 gate。stale 檔 NEVER 主動刪：會和剛取到鎖、正要覆寫的新持有者競態。
+record_holder() {
+  local tmp="$1.holder.$$"
+  if ! { printf '%s\n' "$$" >"$tmp" && mv -f "$tmp" "$1.holder"; } 2>/dev/null; then
+    rm -f "$tmp" 2>/dev/null
+  fi
+  return 0
+}
+
+# 印 lock holder 診斷到 stderr（逾時出口用）。
+# 用法: print_holder_diag <lock_file> <context_msg>
+# NEVER 自動 kill — 低 CPU 不蘊含卡死（I/O bound 同樣低 CPU）。
+print_holder_diag() {
+  local lock_file=$1 context=$2
+  printf '\n── gate-slot diagnostic ──\n' >&2
+  printf '75 = 等不到 slot，不是 gate 失敗（inner command 從未執行）\n' >&2
+  printf 'context: %s\n' "$context" >&2
+  printf 'lock file: %s\n' "$lock_file" >&2
+  local holder_pids
+  holder_pids=$(fuser "$lock_file" 2>/dev/null) || true
+  if [ -n "$holder_pids" ]; then
+    printf 'holder process(es):\n' >&2
+    for pid in $holder_pids; do
+      printf '  pid=%s\n' "$pid" >&2
+      # NEVER 印完整 command line：agent 起的 gate 其 argv 可能帶 token / API key，而這段
+      # 診斷會落進 CI log 與 session transcript（TD-685）。判孤兒需要的是 etime vs CPU time
+      # 的落差與 PPID，不是完整參數 —— 要看參數的人自己去 `ps -p <pid> -o args=`，那是有
+      # 意識的動作，不是被動落進 log。cwd 不含祕密，且是判「這是哪個 repo 的 gate」最有用的一格。
+      ps -o pid=,ppid=,etime=,time=,comm= -p "$pid" 2>/dev/null | while IFS= read -r line; do
+        printf '    %s\n' "$line" >&2
+      done
+      printf '    cwd=%s\n' "$(readlink "/proc/$pid/cwd" 2>/dev/null || echo unknown)"
+      # cgroup 節流三格（TD-909）：2026-09-03 那次的 holder 不是 I/O bound 也不是 CPU
+      # bound —— 它卡在 `__mem_cgroup_handle_over_high`，因為它繼承了呼叫端 session 的
+      # scope（`memory.high` 6 GiB）而不是自己的。當時要靠一輪人工鑑識才問出「scope 是誰的」，
+      # 而那三格全都在 /proc 裡、印出來零成本。**印、不判、不殺** —— 判定仍歸讀的人。
+      local holder_wchan holder_scope holder_high
+      holder_wchan=$(cat "/proc/$pid/wchan" 2>/dev/null || echo unknown)
+      holder_scope=$(awk -F/ '{print $NF}' "/proc/$pid/cgroup" 2>/dev/null | tail -1)
+      printf '    wchan=%s\n' "${holder_wchan:-unknown}" >&2
+      printf '    cgroup-scope=%s\n' "${holder_scope:-unknown}" >&2
+      holder_high=$(awk '/^high /{print $2}' \
+        "/sys/fs/cgroup$(awk -F: '{print $3}' "/proc/$pid/cgroup" 2>/dev/null | tail -1)/memory.events" \
+        2>/dev/null)
+      [ -n "$holder_high" ] && printf '    memory.events high=%s\n' "$holder_high" >&2
+      if [ "$holder_wchan" = "__mem_cgroup_handle_over_high" ]; then
+        printf '    ⚠ 此刻正被 cgroup memory.high 節流。這是瞬時狀態，單次取樣命中\n' >&2
+        printf '      NEVER 讀成「卡死了、可以放掉它的 slot」——每個吃記憶體的行程都會經過\n' >&2
+        printf '      這個 path（上面的 high 計數就是進出次數）。要判的是 scope 對不對。\n' >&2
+      fi
+    done
+  else
+    printf 'holder: (no process found on lock — may have just released)\n' >&2
+  fi
+  printf '──────────────────────────\n' >&2
+}
+
+# ── 等待期間的訊號處置（TD-685）──────────────────────────────────────────
+# 沒有 trap 時，waiter 卡在下面的 `until acquire_slot; do sleep 2; done` 輪詢迴圈裡，
+# Ctrl-C **不會**讓它離開 —— 2026-08-29 實測：送 SIGINT 後 waiter 存活，等 holder 釋放
+# 後照樣執行了 inner command。使用者以為自己取消了，實際上那份工作照跑。
+#
+# 這裡只管**等待階段**。取到 slot 之後走 exec，行程映像被換掉、trap 一併消失，
+# 訊號由 inner command 自己處置 —— 那正是想要的（NEVER 讓閘門攔截 gate 自己的 Ctrl-C）。
+_gate_abort() {
+  # Reap this helper's background lock waiter before closing its inherited fd.
+  # These are our wait commands, not another job holding the lock.
+  #
+  # 逐 pid `wait "$pid"`，NEVER 裸 `wait`（TD-1110）：process-group SIGTERM 同時打到
+  # 背景 flock 與本 shell 時，flock 可能先死、並已被 `wait "$!"` 的 wait4 reap 掉，
+  # trap 卻在 bash 更新 job 狀態之前觸發 —— job table 仍記它 running。此時裸 `wait`
+  # 會進入 wait4→ECHILD→重試 的自旋（100% CPU、永不返回，WAIT_TIMEOUT 也救不了，
+  # 因為計時的 flock 已經死了）；`wait "$pid"` 對同一個過期 pid 則是回 127 立即返回。
+  # bash 5.3.9 實測：裸 wait 無負載 11/150、24 CPU burner 下 46/100 卡死；逐 pid 0/250。
+  for _gate_wait_pid in $(jobs -pr); do
+    # 同一張過期 job table 還有第二個效應：列出的 pid 可能已被 reap 並被 kernel 配給
+    # 不相干的行程，kill 會誤殺。送訊號前確認 PPID 仍為本 shell；ps 不可用或 pid 已
+    # 消失時（回傳空）退回既有行為——ESRCH 本來就無害，而活著的 flock 是 $$ 的子行程。
+    _gate_ppid=$(ps -o ppid= -p "$_gate_wait_pid" 2>/dev/null | tr -d '[:space:]')
+    if [ -z "$_gate_ppid" ] || [ "$_gate_ppid" = "$$" ]; then
+      kill -TERM "$_gate_wait_pid" 2>/dev/null || true
+    fi
+    wait "$_gate_wait_pid" 2>/dev/null || true
+  done
+  printf '\ngate-slot: 收到 %s，放棄等待 slot（inner command 未執行）\n' "$1" >&2
+  exit "$2"
+}
+trap '_gate_abort SIGINT 130' INT
+trap '_gate_abort SIGTERM 143' TERM
+
+# 毫秒時鐘用 bash 5 的 EPOCHREALTIME，NEVER 用 `date +%s%3N`：BSD date 原樣印 `…3N`，
+# uutils date（2026-09-17 本機實測）把 %3N 印成完整 9 位奈秒，兩者都讓算術靜默錯位。
+# 取不到（bash 3.2 無此變數）就當量不到、不寫。
+_now_ms() {
+  local v=${EPOCHREALTIME:-}
+  v=${v/[.,]/}
+  case "$v" in '' | *[!0-9]*) return 0 ;; esac
+  printf '%s' "$((v / 1000))"
+}
+_wait_started_ms=$(_now_ms)
+
+# light 類不取 repo lock：repo lock 防的是同一 repo 兩套 heavy gate 重複跑，而定點重跑
+# 幾個檔正是在同 repo 的 heavy gate 旁邊做的事——排在它後面就回到 W-2026-09-24-gate-slot-light-lane 的原狀。
+if [ "$GATE_CLASS" = heavy ]; then
+  exec 9>>"$REPO_LOCK"
+  if [ "$mode" = wait ]; then
+    # Bash defers traps while a foreground flock blocks; its wait builtin is
+    # interruptible, so PID-only cancellation can abort a same-repo wait too.
+    flock -w "$WAIT_TIMEOUT" 9 &
+    if ! wait "$!"; then
+      print_holder_diag "$REPO_LOCK" "repo lock wait timed out after ${WAIT_TIMEOUT}s (key=$safe_key)"
+      exit "$BUSY"
+    fi
+  else
+    flock -n 9 || exit "$BUSY"
+  fi
+  record_holder "$REPO_LOCK"
+fi
+
+# 掃描 slot 1..N，取到第一個空的就持有。fd 11..30 對應 slot 1..20。
+acquire_slot() {
+  local i fd
+  for i in $(seq 1 "$ACTIVE_SLOTS"); do
+    fd=$((10 + i))
+    : >>"$LOCK_DIR/$SLOT_PREFIX-$i.lock" 2>/dev/null || continue
+    eval "exec $fd>>\"\$LOCK_DIR/\$SLOT_PREFIX-\$i.lock\"" 2>/dev/null || continue
+    if flock -n "$fd"; then
+      record_holder "$LOCK_DIR/$SLOT_PREFIX-$i.lock"
+      return 0
+    fi
+    eval "exec $fd>&-" 2>/dev/null || true
+  done
+  return 1
+}
+
+if ! acquire_slot; then
+  if [ "$mode" = try ]; then
+    exit "$BUSY"
+  fi
+  deadline=$(($(date +%s) + WAIT_TIMEOUT))
+  until acquire_slot; do
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      # 印所有 slot lock 的 holder 診斷
+      for si in $(seq 1 "$ACTIVE_SLOTS"); do
+        slot_lock="$LOCK_DIR/$SLOT_PREFIX-$si.lock"
+        [ -f "$slot_lock" ] && print_holder_diag "$slot_lock" "$SLOT_PREFIX slot $si/$ACTIVE_SLOTS holder (slot acquire timed out after ${WAIT_TIMEOUT}s, key=$safe_key)"
+      done
+      exit "$BUSY"
+    fi
+    sleep 2
+  done
+fi
+
+# 只替巢狀 gate 宣稱「本層真的持有的資源」：heavy 持有 repo lock＋heavy slot，巢狀任何 gate 直接 exec；
+# light 只持有 light slot，巢狀 heavy MUST 照常取 repo lock 與 heavy slot（檔頭「NEVER 讓它完全免閘」）。
+if [ "$GATE_CLASS" = heavy ]; then
+  export CLADE_GATE_SLOT_HELD=1
+else
+  export CLADE_GATE_LIGHT_HELD=1
+fi
+
+# 等待量測（W-2026-09-16-delivery-throughput H2）：push_ms 裡有多少是排 slot、多少是 gate 實跑，
+# 過去無從分辨。只記「取到 slot 為止」的等待；實跑時間由呼叫端以總時長相減——exec 之後
+# 本行程已不存在，NEVER 為了量 run time 改成背景執行（會丟掉 TTY 與 process group）。
+if [ -n "${CLADE_GATE_SLOT_METRICS:-}" ] && [ -n "$_wait_started_ms" ]; then
+  _waited_ms=$(($(_now_ms) - _wait_started_ms))
+  printf '{"key":"%s","mode":"%s","class":"%s","slots":%s,"slot_wait_ms":%s}\n' \
+    "$safe_key" "$mode" "$GATE_CLASS" "$ACTIVE_SLOTS" "$_waited_ms" >>"$CLADE_GATE_SLOT_METRICS" 2>/dev/null || true
+fi
+
+# ── holder 端自願上界 ──────────────────────────────────────────────────────
+# slot 數降到 1 之後，孤兒 holder 的代價從「半容量」升級成「全機 heavy gate 停擺」
+# （pitfall 2026-08-22：一支十小時的 nuxt typecheck 孤兒把 repo lock 佔住，PPID=1、
+# CPU time 46s）。這裡給 holder 自己一個上界讓它自我釋放。
+#
+# 這與已否決的「從外面 kill 判定為 stale 的 holder」不是同一件事：那條被否決是因為
+# 低 CPU 不蘊含卡死，會誤殺別 session 正在跑的品質 gate。本段是**同一個行程自己**帶進來的
+# 上界，沒有任何判斷、不看 CPU、不猜狀態，到點就結束自己。
+#
+# exec 而非背景執行：保住 TTY、保住 process group（Ctrl-C 照常送達）、鎖的 fd 由
+# timeout 行程持有，它結束時一併釋放。逾時回 124（`timeout` 的標準碼）—— 與 exit 75
+# 同型的「這是閘門說的話，不是 gate 說的話」，語義寫在 rules/core 與本註解。
+# CLADE_HEAVY_GATE_MAX_RUNTIME=0 關閉。
+MAX_RUNTIME=${CLADE_HEAVY_GATE_MAX_RUNTIME:-3600}
+case "$MAX_RUNTIME" in
+  '' | *[!0-9]*) MAX_RUNTIME=3600 ;;
+esac
+
+# ── 記憶體天花板：自己的 cgroup，不繼承呼叫端的（TD-909）────────────────────
+# 併發天花板（上面的 slot semaphore）與記憶體天花板是同一個不變式的兩半：
+# 「一個 heavy gate 該吃多少這台機器」。拆到兩個檔就會出現「有些路徑有上限、
+# 有些沒有」的靜默半套 —— 2026-09-03 的事故正是那個形狀：clade 的 propagate 對
+# consumer push，consumer 的 pre-push typecheck 於是跑在 **clade session 的** scope
+# 裡（memory.high 6 GiB），撞線後被 kernel 節流成 livelock。
+#
+# `MemoryMax` 是這一段的重點，不是 `MemoryHigh`。事故當下 memory.max 是 8 GiB 而
+# 用量停在 6.66 GiB —— **永遠不會 OOM kill**，只會無限節流，最壞情況是「不終止」。
+# 給了 Max 之後最壞情況降級成「被 kernel 殺掉，有明確 exit signal」。
+# **NEVER 只給 MemoryHigh** —— 那只是把同一個 livelock 搬進私有 cgroup，症狀一模一樣。
+# MemorySwapMax=0：允許 swap 等於把節流換成慢一千倍地跑，同樣不會終止。
+#
+# `--scope`（不是 service）是刻意的：實測 scope 下 pgid 與 sid 都不變、命令是呼叫端的
+# 直接子行程，所以呼叫端的 `process.kill(-pid)` 群組殺照樣送達。**NEVER 改成 service
+# 模式** —— 那會 reparent 到 user manager，真的斬斷群組殺。
+#
+# systemd --user 不可用時（容器 / 非 systemd）無聲降級成裸 exec：少了天花板，
+# 併發閘門仍在。predicate 逐字沿用 cbm-index.sh 已驗證過的那一條，NEVER 另發明第二套。
+GATE_MEM_HIGH=${CLADE_HEAVY_GATE_MEM_HIGH:-6G}
+GATE_MEM_MAX=${CLADE_HEAVY_GATE_MEM_MAX:-7G}
+
+# scope 可用時把整棵 holder tree 包進去。**NEVER 改成 exec 回 "$0"** —— 那會走上面
+# 第 51 行的 CLADE_GATE_SLOT_HELD short-circuit，那條路徑直接 exec 不帶 timeout，
+# MAX_RUNTIME 會靜默消失，而外觀與正常執行完全相同。
+mem_scope_available() {
+  [ "${CLADE_HEAVY_GATE_MEM_SCOPE:-1}" = '1' ] || return 1
+  command -v systemd-run >/dev/null 2>&1 || return 1
+  case "$(systemctl --user is-system-running 2>/dev/null)" in
+    running | degraded) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+if [ "$MAX_RUNTIME" -gt 0 ] && command -v timeout >/dev/null 2>&1; then
+  set -- timeout --signal=TERM --kill-after=30 "$MAX_RUNTIME" "$@"
+fi
+
+if mem_scope_available; then
+  # scope 包在 timeout 外面 —— 逃出去的孫行程也在同一個 cgroup 裡，
+  # 這正是 2026-09-03 那隻 reparent 到 pid 1 的 vue-tsc 逃掉的那一格。
+  # flock 的 fd 在此之前就取得，scope 下照常繼承，鎖隨行程結束釋放的性質不變。
+  # Only hosts with an installed agent slice opt in. macOS/non-systemd keeps the old scope.
+  gate_slice_args=()
+  if [ "$GATE_CLASS" = heavy ] && [ "$(systemctl --user show -p LoadState --value agent-workloads.slice 2>/dev/null)" = loaded ]; then
+    gate_slice_args=(--slice=agent-workloads.slice)
+  fi
+  # gate 底下全是批次工作。與互動 session 同權重時，滿載下 claude TUI 主執行緒喚醒延遲實測達
+  # 300ms、herdr 56ms；scope 設 idle 權重（cgroup cpu.idle）後 herdr 降到 5ms，批次仍吃得到所有閒置 CPU。
+  # systemd < 252 不認得 idle，會讓 systemd-run 整個失敗，所以先驗版本。
+  gate_cpu_args=()
+  if [ "$(systemctl --version 2>/dev/null | awk 'NR == 1 { print $2 + 0 }')" -ge 252 ] 2>/dev/null; then
+    gate_cpu_args=(-p CPUWeight=idle)
+  fi
+  exec systemd-run --user --scope -q "${gate_slice_args[@]}" "${gate_cpu_args[@]}" \
+    -p MemoryHigh="$GATE_MEM_HIGH" -p MemoryMax="$GATE_MEM_MAX" -p MemorySwapMax=0 \
+    "$@"
+fi
+
+exec "$@"

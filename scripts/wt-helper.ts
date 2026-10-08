@@ -1,0 +1,9227 @@
+#!/usr/bin/env node
+// 🔒 LOCKED — managed by clade · Source: vendor/scripts/wt-helper.ts · 改這裡無效，下次 propagate 會覆寫；請改 $CLADE_HOME/vendor/scripts/wt-helper.ts
+
+/**
+ * wt-helper.ts — session worktree management
+ *
+ * Subcommands:
+ *   add <slug>       Create worktree at ~/offline/<consumer>-wt/<slug>/
+ *                    on branch session/<YYYY-MM-DD-HHMM>-<slug>; post-create
+ *                    fast-forward merge origin/<landing-base> so projection layers
+ *                    (rules/, scripts/, etc.) are current.
+ *   list [--json] [--no-landed-state]
+ *                    Enumerate session worktrees with path, branch,
+ *                    last-commit ISO timestamp, days-since-touch, merged flag,
+ *                    landedState (in-history / in-base / in-worktree /
+ *                    clean-apply / superseded / conflict / unknown — TD-863),
+ *                    landedReason, supersededBy, and dirty (uncommitted path
+ *                    count in the session worktree). --no-landed-state skips
+ *                    those four fields (they cost a diff + apply per tree).
+ *   reconcile <slug> [--json]
+ *                    After rebase, reconcile the worktree's ignored projection
+ *                    receipt against main's receipt and the worktree's clean HEAD.
+ *   prune            Interactively remove worktrees whose branches are
+ *                    already merged into main. Per-entry [y/N] confirm.
+ *   cleanup <slug> [--dry-run]
+ *                    Remove one session worktree by slug. Requires --force
+ *                    if branch not merged AND --force-discard-unland if
+ *                    branch HEAD has files NOT landed into main's working
+ *                    tree. Pre-checks both gates and reports the full flag
+ *                    combo needed. --dry-run reports the verdict read-only.
+ *                    Squash-landed branches (refs/wt-landed/<slug> matching
+ *                    the branch tip) skip both ancestry gates; a GitHub PR
+ *                    merged at the exact branch tip (headRefOid == tip,
+ *                    base == landing base) counts as equivalent server-side
+ *                    landing evidence — the local branch ref is then deleted
+ *                    outright (its head stays reachable via refs/pull/N/head;
+ *                    TD-1103; gh errors stay fail-closed);
+ *                    clade-managed projection drift is exempt from the
+ *                    uncommitted gate. --superseded-by <spec>[,…] --reason
+ *                    <text> declares that main later rewrote the unlanded
+ *                    hunks (TD-1082): every unlanded file needs a later main
+ *                    commit touching it or a named replacement on main; the
+ *                    tip is pinned in refs/wt-superseded/ first, and an event
+ *                    is appended to <git-common-dir>/wt-superseded.jsonl
+ *                    once the worktree is removed. --discard-pathspec
+ *                    <path>[,…] lets dirty files under those literal paths
+ *                    through the uncommitted gate after saving them to
+ *                    refs/clade-residue/<slug> (+ ~/.cache/clade/wt-residue/);
+ *                    any other dirt still blocks. Build artifacts and
+ *                    oversized files are dropped, not saved.
+ *   residue-prune    Delete refs/clade-residue/* past the retention window.
+ *   merge-back <slug> [--dry-run] [--auto-stash] [--no-cleanup] [--accept-landed]
+ *                    Legacy squash into main; source retained until formal commit.
+ *                    New workflows use `batch`. Pre-flight detects main-worktree
+ *                    blockers (modified or untracked files at branch's
+ *                    changeset paths). With --auto-stash, stashes blockers
+ *                    as `wt-merge-block/<slug>/<ISO>` for later reconcile
+ *                    via stash-reconcile.mjs.
+ *                    Branch content already carried into main by another path
+ *                    ends cleanly (no --force): if every path the branch
+ *                    touched is byte-identical in main, nothing is left to
+ *                    squash. When some paths still differ, they are listed and
+ *                    --accept-landed is the explicit exit — it pins the tip as
+ *                    refs/wt-accepted-landed/<slug> before discarding the delta.
+ *                    --work-done files a flow `work.done` claim against the
+ *                    work id the worktree's claim is bound to (ambient
+ *                    $CLADE_WORK_ID only as fallback; a mismatch or no id at
+ *                    all refuses before anything moves — TD-915); requires
+ *                    --verification and is refused with --dry-run. Opt-in on
+ *                    purpose: landing one branch is a smaller claim than
+ *                    "this work is finished".
+ *                    Refuses before touching anything when main's index is
+ *                    not empty (TD-739 / TD-964) or when local main has
+ *                    commits pre-sync will not bring into the branch
+ *                    (TD-745). No flag bypasses either gate.
+ *   land-pending <slug> [opts]
+ *                    Alias for merge-back. Semantic marker for migrating
+ *                    grandfathered worktrees from the pre-atomic flow.
+ *   orphan-prune [--force]
+ *                    Scan <consumer>-wt/ for directories not registered as
+ *                    git worktrees (no .git file). These are leftovers from
+ *                    incomplete cleanup (typically gitignored screenshots).
+ *                    Without --force: list orphans. With --force: remove them.
+ *   rescue           List pre-fork baseline rescue candidates: pinned
+ *                    `refs/wt-baseline/*` (cmdAdd stash strategy + post-2026-05-17
+ *                    pin) and fsck-found dangling unreachable wt-baseline
+ *                    stashes (fallback). --show <ref|sha> prints the full
+ *                    patch via `git stash show -p`.
+ *
+ * Consumer-root resolution: walks up from cwd to the first `.git` (file or
+ * directory), then uses `git rev-parse --git-common-dir` to canonicalize —
+ * this works whether cwd is in the main worktree, a monorepo subdirectory,
+ * or already inside a session worktree.
+ */
+
+import { execFileSync, spawn, spawnSync } from 'node:child_process'
+import { createHash, randomUUID } from 'node:crypto'
+import {
+  appendFileSync,
+  chmodSync,
+  closeSync,
+  constants as fsConstants,
+  cpSync,
+  copyFileSync,
+  existsSync,
+  fsyncSync,
+  fstatSync,
+  ftruncateSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  openSync,
+  readFileSync,
+  readlinkSync,
+  readSync,
+  readdirSync,
+  renameSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+  writeSync,
+  realpathSync,
+  rmSync,
+  unlinkSync,
+} from 'node:fs'
+import { homedir, tmpdir } from 'node:os'
+import { basename, dirname, join, relative, resolve } from 'node:path'
+import { stdin, stdout } from 'node:process'
+import { fileURLToPath } from 'node:url'
+import { extendCodexWorktreeHookTrust } from './codex-worktree-trust.ts'
+import { createInterface } from 'node:readline/promises'
+import {
+  classifyDirtyPaths,
+  bindClaimWorkId,
+  claimHolderVerdict,
+  dropClaim,
+  findClaimByWorktree,
+  findClaimByWorktreeObserved,
+  genSessionId,
+  readActiveClaims,
+  readActiveClaimsObserved,
+  writeClaim,
+  claimConflictsForPath,
+  formatClaimConflict,
+} from './claim-helper.ts'
+import { ensureNoStaleIndexLock } from './_git-lock-detect.ts'
+import { isLockedProjectionPathFor } from './locked-projection.ts'
+import {
+  countUserDirty,
+  isIgnorableWorktreeDrift,
+  isToolManagedDrift,
+  matchesDiscardPathspec,
+  parseDiscardPathspecs,
+} from './wip-dirty.ts'
+import {
+  reconcileLandedProjectionState,
+  reconcileRebasedProjectionState,
+} from './lib/projection-ledger-reconcile.ts'
+import { describeEnsureResult, runWtEnvBootstrap } from './lib/wt-env-bootstrap-runner.ts'
+import { landWorktreePatch } from './lib/wt-patch-landing.ts'
+import {
+  formatWorktreeBacklog,
+  WORKTREE_BACKLOG_LIMIT,
+  WORKTREE_STALE_DAYS,
+  type WorktreeBacklog,
+} from './lib/worktree-backlog.ts'
+import { normalizeUnsplitArgv, UnsplitArgvError, type FlagOptions } from './lib/argv-unsplit.ts'
+import {
+  HOST_CONFIG_REMEDY,
+  assertNoHostConfigReferences,
+  findHostConfigReferences,
+  formatHostConfigRefs,
+} from './lib/host-config-refs.ts'
+import {
+  localMachineLabel,
+  MACHINE_LABEL_PATTERN,
+  REMOTE_PATH_PREFIX,
+  shellQuote,
+  sshBin,
+  SSH_OPTIONS,
+} from './lib/herdr-machine.ts'
+import {
+  assertNoPublishInFlight as assertNoPublishInFlightShared,
+  detectPublishInFlight as detectPublishInFlightShared,
+  inFlightHoldersFor as inFlightHoldersForShared,
+} from './lib/publish-in-flight.ts'
+import {
+  runBatchCommand,
+  assertLegacyAllowed,
+  githubRepositoryFromRemote,
+  BatchUsageError,
+  BATCH_USAGE,
+} from './wt-batch.ts'
+import {
+  errorMessage,
+  known,
+  unknown as toUnknown,
+  type Observed,
+  type UncommittedFiles,
+} from './lib/safety-observation.ts'
+import {
+  readTeardownJournal,
+  recordedModuleChain,
+  WT_TEARDOWN_JOURNAL_NAME,
+} from './preservation-policy.ts'
+import { enforceDiskAdmission } from './lib/disk-low-water.ts'
+
+interface WtOptions {
+  json?: boolean
+  force?: boolean
+  forceDiscardUnland?: boolean
+  forceDiscardUncommitted?: boolean
+  acceptLanded?: boolean
+  dryRun?: boolean
+  patch?: boolean
+  autoStash?: boolean
+  includeWorktreeWip?: boolean
+  cleanup?: boolean
+  noopIfMissing?: boolean
+  skipPreSync?: boolean
+  skipPreforkAudit?: boolean
+  includeUnrelatedDirty?: boolean
+  allowOrphanRecord?: boolean
+  precheckBaseline?: string
+  baselineStrategy?: string
+  baselineScopePaths?: string
+  baselineStashName?: string
+  show?: string
+  taskSummary?: string
+  /** 預期落地方式（worktree 根治 C1）：pr｜batch｜none；預設 pr。寫進 resource.registered。 */
+  landing?: string
+  /** `<scheme>:<id>` naming the work this worktree serves — `td:TD-787`, `notion:<uuid>`. */
+  origin?: string
+  workDone?: boolean
+  verification?: string
+  /** TD-1064 明示覆寫：知道有 publish 在飛仍要動 main。NEVER 當成預設值傳。 */
+  iKnowPublishIsRunning?: boolean
+  /** TD-1064：這次動作要寫的那棵樹。一次性 fixture repo 不在 guard 射程內。 */
+  targetRoot?: string
+  expectedPaths?: string
+  agent?: string
+  minimalStashPaths?: string[]
+  /** Fork from this ref instead of the landing base. Must be integration/… */
+  base?: string
+  /**
+   * add：fetch 後以 `origin/<branch>` 開同名 branch 的樹（推進既有 PR，不是開 `session/…` 新 branch）。
+   * 本地已有同名 branch 且 HEAD ≠ origin/<branch> → 拒絕。不與 --base／--precheck-baseline 併用。
+   */
+  checkout?: string
+}
+
+/** `planCheckoutBranch`／`checkedOutWorktree` 注入的 git runner 只帶 cwd；具名型別避開 consumer doctor TS0002。 */
+type GitRunOptions = { cwd?: string }
+
+function git(args, opts = {}) {
+  const out = execFileSync('git', args, {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+    ...opts,
+  })
+  return out ? out.trim() : ''
+}
+
+// per-worktree backing service 的 spawner 已抽到 `lib/wt-env-bootstrap-runner.ts` —— 因為
+// `dev-session.ts` 的 preflight（per `db-preview-env.md` § 缺席側）也要呼叫它，而不可能為此
+// import 整個 wt-helper。本檔仍 re-export，既有 import 端不受影響。
+export { runWtEnvBootstrap }
+
+// TD-323: stash-reconcile.ts 與 wt-helper.ts 永遠是同目錄 sibling —— clade home 在
+// `vendor/scripts/`、consumer 在 `scripts/`。寫死任一側只是把 MODULE_NOT_FOUND 搬家，
+// 所以復原指令的路徑一律由本檔自身位置推出。
+const WT_HELPER_DIR = dirname(fileURLToPath(import.meta.url))
+
+// 本檔在自己那棵樹裡的相對位置（clade `vendor/scripts` / consumer `scripts`）。
+// **MUST 在 module load 當下算**，不能等到要印訊息時才算：merge-back 的收尾訊息印在
+// `cmdCleanup` 之後，而本檔若是 worktree 的副本在跑，那時自己的目錄已經被刪了，
+// `git -C <已刪目錄>` 會失敗 → 落回絕對路徑 → 又指向已刪除的目錄。
+const WT_HELPER_SUBDIR = (() => {
+  try {
+    const ownTop = execFileSync('git', ['rev-parse', '--show-toplevel'], {
+      cwd: WT_HELPER_DIR,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim()
+    const sub = relative(ownTop, WT_HELPER_DIR)
+    return sub && !sub.startsWith('..') ? sub : ''
+  } catch {
+    return ''
+  }
+})()
+
+/**
+ * 回傳供 coordinator 直接執行的 `node <path>/stash-reconcile.ts`（相對 repo root）。
+ *
+ * 錨點是「**main root 底下的**對應副本」，不是執行中的那一份。`/wt` 執行期間，本檔常常是
+ * worktree 的副本在跑；直接拿 `WT_HELPER_DIR` 相對 main root 會得到 `..` 開頭而 fallback 成
+ * 絕對路徑，而這行訊息印在 cmdCleanup 刪掉該 worktree **之後**——coordinator 會拿到一條指向
+ * 已刪除目錄的路徑。那是 TD-323 的 MODULE_NOT_FOUND 換個形式。
+ */
+function stashReconcileCmd(baseRoot = undefined) {
+  const abs = join(WT_HELPER_DIR, 'stash-reconcile.ts')
+  // `baseRoot` MUST 由呼叫端傳它早先解好的 consumerRoot。同一個 cleanup 時序問題的
+  // 另一半：訊息印出時 process.cwd() 可能停在已被刪除的 worktree（Node 回快取字串、
+  // 不 throw），`findConsumerRoot()` 於是一路往上走到 `/` 才拋 —— 又落回絕對路徑。
+  let root = baseRoot
+  if (!root) {
+    try {
+      root = findConsumerRoot()
+    } catch {
+      return `node ${abs}`
+    }
+  }
+  // WT_HELPER_SUBDIR 套到 main root 上就是使用者該跑的那一份。
+  if (WT_HELPER_SUBDIR) {
+    const candidate = join(root, WT_HELPER_SUBDIR, 'stash-reconcile.ts')
+    if (existsSync(candidate)) return `node ${relative(root, candidate)}`
+  }
+  const rel = relative(root, abs)
+  return rel && !rel.startsWith('..') ? `node ${rel}` : `node ${abs}`
+}
+
+function findConsumerRoot(start = process.cwd()) {
+  let dir = resolve(start)
+  while (dir !== dirname(dir)) {
+    if (existsSync(join(dir, '.git'))) break
+    dir = dirname(dir)
+  }
+  if (!existsSync(join(dir, '.git'))) {
+    throw new Error('Not inside a git repository (no .git found in any parent)')
+  }
+  const commonDirRaw = git(['rev-parse', '--git-common-dir'], { cwd: dir })
+  const commonDir = resolve(dir, commonDirRaw)
+  return dirname(commonDir)
+}
+
+const LANDINGS = ['pr', 'batch', 'none'] as const
+
+/** `--landing`／`CLADE_WT_LANDING` → pr｜batch｜none；缺或不認得 → pr（PR 制是預設落地方式）。 */
+function normalizeLanding(raw: string | undefined): (typeof LANDINGS)[number] {
+  const value = String(raw ?? '')
+    .trim()
+    .toLowerCase()
+  return (LANDINGS as readonly string[]).includes(value)
+    ? (value as (typeof LANDINGS)[number])
+    : 'pr'
+}
+
+function makeSlugSafe(s) {
+  const cleaned = String(s ?? '')
+    .toLowerCase()
+    .replace(/\s+/g, '-')
+    .replace(/[^a-z0-9-]/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '')
+  if (!cleaned) throw new Error(`Slug normalizes to empty: ${JSON.stringify(s)}`)
+  return cleaned
+}
+
+const pad2 = (n) => String(n).padStart(2, '0')
+
+function timestampPrefix(date = new Date()) {
+  return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}-${pad2(date.getHours())}${pad2(date.getMinutes())}`
+}
+
+function parseWorktreeList(porcelain) {
+  const records = porcelain.split(/\n\n+/)
+  const result = []
+  for (const r of records) {
+    if (!r.trim()) continue
+    const entry: Record<string, string> = {}
+    for (const line of r.split('\n')) {
+      const idx = line.indexOf(' ')
+      if (idx < 0) {
+        entry[line] = ''
+      } else {
+        entry[line.slice(0, idx)] = line.slice(idx + 1)
+      }
+    }
+    if (entry.worktree) {
+      result.push({
+        path: entry.worktree,
+        head: entry.HEAD,
+        branch: entry.branch || null,
+        detached: Object.prototype.hasOwnProperty.call(entry, 'detached'),
+        ...(Object.prototype.hasOwnProperty.call(entry, 'locked') ? { locked: true } : {}),
+      })
+    }
+  }
+  return result
+}
+
+/**
+ * Worktree 的 landing base —— fork 從哪裡來、之後要 land 回哪裡去。
+ *
+ * **NEVER 寫死 `'main'`。** merge-back 的落地動作是在 consumer root 裡跑
+ * `git merge --squash <branch>`（本檔 `cmdMergeBack()`），它 land 進去的是 consumer root
+ * 的**當前 HEAD**，不是名為 `main` 的 branch。fork 端若寫死 `main`，兩端就在
+ * 「main checkout 不在 main 上」時分岔 —— 這是長命 feature branch（`feat/*`、release
+ * branch、fork 的預設分支不叫 main）的常態，不是邊角。
+ *
+ * 實證（2026-08-22 fc-stepwall）：main checkout 在 `feat/self-host-evlog-admin`
+ * （領先 `main` 16 個 commit），`wt-helper add` 從 stale `main` fork 出來的 worktree
+ * 缺應有的規格、`app/`、`DESIGN.md` —— 而 merge-back 會 land 回 `feat/...`。
+ * 症狀出現在 worktree 內（檔案不見了），根因在 fork 端，中間隔了整個 session。
+ *
+ * 解析不出具名 branch（detached HEAD）時才回退 `main`：那時沒有「當前 branch」可用，
+ * 而 detached HEAD 上跑 merge-back 本來就會被其他 gate 擋下。
+ *
+ * consumer root 就在 `main` 上時本函式回 `'main'` —— 與寫死時**逐字相同**，所以這個
+ * 改動對 fleet 的常見路徑是恆等的。
+ */
+function resolveLandingBase(cwd) {
+  try {
+    const branch = git(['symbolic-ref', '--quiet', '--short', 'HEAD'], { cwd }).trim()
+    if (branch) return branch
+  } catch {}
+  return 'main'
+}
+
+/** detached 樹的 ancestry gate：HEAD commit 是 landing base 的祖先才算 merged；判不出一律 false。 */
+function isAncestorOfLandingBase(cwd, rev, baseBranch = resolveLandingBase(cwd)) {
+  try {
+    git(['merge-base', '--is-ancestor', rev, baseBranch], { cwd })
+    return true
+  } catch {
+    return false
+  }
+}
+
+function mergedBranches(cwd, baseBranch = resolveLandingBase(cwd)) {
+  let raw = ''
+  try {
+    raw = git(['branch', '--merged', baseBranch], { cwd })
+  } catch {
+    return new Set()
+  }
+  const set = new Set()
+  for (const line of raw.split('\n')) {
+    const b = line.replace(/^[*+]?\s*/, '').trim()
+    if (b) set.add(b)
+  }
+  return set
+}
+
+function sessionWorktrees(cwd) {
+  const out = git(['worktree', 'list', '--porcelain'], { cwd })
+  return parseWorktreeList(out).filter(
+    (w) => w.branch && w.branch.startsWith('refs/heads/session/'),
+  )
+}
+
+/**
+ * 一個 change slug 對應到哪一棵 session worktree —— **這是全 fleet 唯一的那份 matcher**。
+ *
+ * 為什麼要是唯一的：merge-back 入口用它決定「要把哪一棵樹 merge-back 進 main」，
+ * 而 pre-merge gate 用它決定「要掃哪一棵樹」。兩邊只要各寫一份，就會出現
+ * 「gate 驗過的那棵樹」與「Step 0 land 進去的那棵樹」不是同一棵——而那種不一致事後
+ * 完全看不出來（gate 綠、archive 成功、內容不對）。**NEVER** 在別處重寫這個 find。
+ *
+ * 回 `null` 代表這個 change 沒有 session worktree（在 main 上做完的 change，或 worktree
+ * 已被 merge-back 清掉）——那時 main 就是正解，呼叫端照 main 走即可。
+ */
+export function findSessionWorktreeForSlug(consumerRoot, cleanSlug) {
+  const wts = sessionWorktrees(consumerRoot)
+  return (
+    wts.find(
+      (w) => w.path.endsWith(`/${cleanSlug}`) && w.branch && w.branch.endsWith(`-${cleanSlug}`),
+    ) ?? null
+  )
+}
+
+/**
+ * `wt-helper resolve <slug>` —— 給 shell gate 用的解析入口。
+ *
+ * 印出該 change 所在 worktree 的絕對路徑（找不到就什麼都不印）。exit code 刻意分三態，
+ * 讓呼叫端能區分「沒有 worktree」與「這支根本跑不起來」：
+ *   0 = 找到，stdout 是 worktree 路徑
+ *   3 = 沒有對應的 session worktree（**不是錯誤**，main 就是正解）
+ *   1 = 真的出錯（不在 git repo、slug 不合法…）
+ *
+ * **NEVER 把 3 讀成失敗而 fail-closed**：change 在 main 上做完是完全正常的路徑（SKILL.md
+ * 的 in-main-done archive），把它擋掉會讓沒開 worktree 的 change 一律 archive 不了。
+ */
+async function cmdResolve(slug, opts: WtOptions = {}) {
+  if (!slug) {
+    throw new Error('Usage: wt-helper resolve <slug> [--json]')
+  }
+  const cleanSlug = makeSlugSafe(slug)
+  const consumerRoot = findConsumerRoot()
+  const target = findSessionWorktreeForSlug(consumerRoot, cleanSlug)
+  if (opts.json) {
+    console.log(
+      JSON.stringify({
+        slug: cleanSlug,
+        found: Boolean(target),
+        path: target?.path ?? null,
+        branch: target?.branch?.replace('refs/heads/', '') ?? null,
+        consumerRoot,
+      }),
+    )
+  } else if (target) {
+    console.log(target.path)
+  }
+  if (!target) process.exitCode = 3
+}
+
+async function prompt(question) {
+  const rl = createInterface({ input: stdin, output: stdout })
+  try {
+    return await rl.question(question)
+  } finally {
+    rl.close()
+  }
+}
+
+// ── Worktree dev-port allocation (TD-434) ─────────────────────────────────
+//
+// A consumer's dev port is a single registry value (rules/core/dev-port-allocation.md
+// § 3), but worktrees are mandatory for any tracked-file work — so N worktrees of
+// the same consumer race for one port. The loser either gets EADDRINUSE or is
+// silently moved by Nuxt's auto-increment, which decouples it from the tunnel's
+// hard-coded `port:`.
+//
+// Allocation lives here rather than in each consumer's package.json because the
+// registry spaces bases +10 apart, leaving base+1..base+9 free per consumer. An
+// offset applied uniformly to every declared port keeps the whole set inside the
+// consumer's own band, so no consumer's dev script or nuxt.config needs to change.
+
+// Dev-port allocation lives in ./lib/worktree-dev-port.ts — the single SoT.
+import {
+  DEV_PORT_BAND,
+  allocateWorktreeDevPorts as allocateWorktreeDevPortsIn,
+  devPortCapacity as devPortCapacityOf,
+  devPortStateDir,
+  pickDevPortOffset as pickDevPortOffsetIn,
+  planWorktreeDevPorts,
+  readWorktreeDevPorts,
+  releaseWorktreeDevPorts,
+  type WorktreePortBand,
+} from './lib/worktree-dev-port.ts'
+
+// Re-exported: test/wt-helper-dev-port-offset.test.ts imports them from here.
+export const pickDevPortOffset = pickDevPortOffsetIn
+export const devPortCapacity = devPortCapacityOf
+
+/**
+ * Ports this consumer declares, sorted ascending — the first entry is the base
+ * the band is measured from.
+ *
+ * `.claude/consumer-meta.json` `dev.ports[]` is the list (it carries aliases and
+ * any secondary targets), but the registry is the SoT for the base. Both are
+ * available consumer-side; when they disagree the meta file is stale and
+ * allocating from it would hand out ports inside a band this consumer no longer
+ * owns, so this throws rather than guessing.
+ */
+function readDeclaredDevPorts(root) {
+  let ports = []
+  try {
+    const meta = JSON.parse(readFileSync(join(root, '.claude', 'consumer-meta.json'), 'utf8'))
+    ports = (meta?.dev?.ports ?? [])
+      .map((p) => ({ port: Number(p.port), alias: p.alias ?? 'main' }))
+      .filter((p) => Number.isInteger(p.port) && p.port > 0)
+      .toSorted((a, b) => a.port - b.port)
+  } catch {
+    return []
+  }
+  if (ports.length === 0) return []
+
+  let registryBase = null
+  try {
+    const reg = JSON.parse(readFileSync(join(root, '.clade', 'registry', 'consumers.json'), 'utf8'))
+    const list = Array.isArray(reg) ? reg : (reg.consumers ?? [])
+    const entry = list.find((c) => c.consumer_id === basename(root))
+    registryBase = entry?.dev_ports?.nuxt ?? null
+  } catch {
+    // No projected registry — consumer-meta stands alone.
+  }
+  if (registryBase !== null && registryBase !== ports[0].port) {
+    throw new Error(
+      `dev-port: consumer-meta base ${ports[0].port} != registry dev_ports.nuxt ${registryBase}.\n` +
+        `Align .claude/consumer-meta.json with the registry before opening worktrees ` +
+        `(rules/core/dev-port-allocation.md § 3).`,
+    )
+  }
+  return ports
+}
+
+/**
+ * Who currently holds an offset, newest-allocated last. Feeds the exhaustion
+ * message: "the band is full" is not actionable, "these four worktrees hold it"
+ * is. Stale records are dropped by the next locked allocation pass, so this
+ * only lists holders whose worktree still exists.
+ */
+function devPortHolders(consumerRoot) {
+  const dir = devPortStateDir(consumerRoot)
+  const byWorktree = new Map()
+  let entries
+  try {
+    entries = readdirSync(dir)
+  } catch {
+    return []
+  }
+  for (const name of entries) {
+    if (!name.endsWith('.json')) continue
+    let rec
+    try {
+      rec = JSON.parse(readFileSync(join(dir, name), 'utf8'))
+    } catch {
+      continue
+    }
+    if (typeof rec?.wtPath !== 'string' || rec.wtPath === '' || !existsSync(rec.wtPath)) continue
+    if (!Number.isInteger(rec.offset)) continue
+    // 同一棵樹可能同時有 legacy `<basename>.json` 與新 `<basename>--<sha>.json` 兩筆——
+    // 佔的是同一格 offset，holders 以「樹」計，不然 held 數與 reclaim 的 freed 數都虛增。
+    const owner = resolve(rec.wtPath)
+    if (byWorktree.has(owner)) continue
+    byWorktree.set(owner, { offset: rec.offset, slug: basename(rec.wtPath), wtPath: rec.wtPath })
+  }
+  return [...byWorktree.values()].toSorted((a, b) => a.offset - b.offset)
+}
+
+/**
+ * The exhaustion message, shared by `add` (warning) and `dev` (hard error).
+ * Names the real capacity and the current holders — the reader's next action is
+ * picking one to land, and that decision needs both numbers.
+ */
+function devPortExhaustedReport(consumerRoot, declared) {
+  const capacity = devPortCapacity(declared, readWorktreeBand(consumerRoot))
+  const holders = devPortHolders(consumerRoot)
+  const spread = declared.length > 1 ? declared[declared.length - 1].port - declared[0].port : 0
+  const why =
+    capacity < DEV_PORT_BAND
+      ? ` (band width ${DEV_PORT_BAND} minus ${spread} for the ` +
+        `${declared[0].port}→${declared[declared.length - 1].port} declared spread)`
+      : ''
+  const lines = [`dev-port capacity is ${capacity}${why}, and all ${capacity} are held:`]
+  for (const h of holders) lines.push(`  +${h.offset}  ${h.slug}`)
+  lines.push(
+    `Landing one of these ('wt-helper merge-back <slug>') frees its offset.`,
+    `Offsets are handed out at 'wt-helper add' time and on first 'wt-helper dev';`,
+    `a worktree created while the band was full holds none, so removing a worktree`,
+    `that never had one frees nothing.`,
+  )
+  return lines.join('\n')
+}
+
+/**
+ * Allocate this worktree's dev-port offset and persist it. Returns the record,
+ * or null when the consumer declares no dev ports / the band is exhausted.
+ */
+
+/**
+ * This consumer's worktree band from the projected registry, or null when it
+ * declares none (then only the base+1..base+9 pool exists).
+ */
+function readWorktreeBand(root): WorktreePortBand | null {
+  try {
+    const reg = JSON.parse(readFileSync(join(root, '.clade', 'registry', 'consumers.json'), 'utf8'))
+    const list = Array.isArray(reg) ? reg : (reg.consumers ?? [])
+    const entry = list.find((c) => c.consumer_id === basename(root))
+    const band = entry?.dev_ports?.worktree_band
+    if (!Array.isArray(band) || band.length !== 2 || !band.every(Number.isInteger)) return null
+    // 逐項取出再組 tuple。`return band` 交出去的是 `any[]`，而 `WorktreePortBand` 是
+    // `[number, number]` —— 長度保證在 runtime 檢查裡，型別系統看不到，所以要在這裡收窄。
+    return [band[0], band[1]]
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Allocate this worktree's dev-port offset and persist it. Returns the record,
+ * or null when the consumer declares no dev ports / both pools are exhausted.
+ */
+function allocateWorktreeDevPorts(consumerRoot, wtPath) {
+  return allocateWorktreeDevPortsIn(
+    consumerRoot,
+    wtPath,
+    readDeclaredDevPorts(consumerRoot),
+    readWorktreeBand(consumerRoot),
+  )
+}
+
+const TUNNEL_ENV_KEYS = new Set(['TUNNEL_HOSTNAME', 'TUNNEL_NAME', 'CLOUDFLARE_API_KEY'])
+
+/**
+ * True when this worktree carries tunnel credentials but has no per-worktree
+ * tunnel identity to use them with — i.e. starting a dev server here would
+ * claim the main checkout's hostname. `metaRoot` is where the policy is read from — main, when
+ * the caller is the env copy that read its filesToCopy there (TD-059).
+ */
+function detectSharedTunnelRisk(root, metaRoot = root) {
+  let meta
+  try {
+    meta = JSON.parse(readFileSync(join(metaRoot, '.claude', 'consumer-meta.json'), 'utf8'))
+  } catch {
+    return null
+  }
+  if (meta?.dev?.perWorktreeTunnel) return null
+  const files = meta?.dev?.envSyncPolicy?.filesToCopy ?? []
+  for (const f of files) {
+    let text
+    try {
+      text = readFileSync(join(root, f), 'utf8')
+    } catch {
+      continue
+    }
+    const hit = text
+      .split('\n')
+      .some((line) => TUNNEL_ENV_KEYS.has(line.match(/^\s*([A-Z_][A-Z0-9_]*)\s*=/)?.[1] ?? ''))
+    if (hit) return { file: f }
+  }
+  return null
+}
+
+// Paths under clade-managed projection control are matched by
+// LOCKED_PROJECTION_RE / isLockedProjectionPathFor imported from
+// `./locked-projection.ts` (single source of truth shared with the clade
+// _validate-manifests.ts cross-check — see Phase 6 / closes TD-018).
+
+// matchClaimGlob / classifyDirtyPaths moved to ./claim-helper.ts (TD-435) so
+// every tool that moves a working tree shares one ownership predicate.
+
+/**
+ * The de-dup ask ("回我一聲你已經動筆了沒") that used to be broadcast, answered locally at the one
+ * moment it is cheap: opening the worktree. Warn-only and best-effort — an overlap is a reason to
+ * talk, NEVER a reason to refuse to open a tree (TD-794 刀 4).
+ *
+ * Silent when there is no overlap. That is the contract, not an optimisation.
+ */
+function warnOnClaimOverlap(consumerRoot: string, declaredPaths: string[], myWorktree: string) {
+  if (declaredPaths.length === 0) return
+  try {
+    const seen = new Set<string>()
+    const lines: string[] = []
+    for (const p of declaredPaths) {
+      for (const c of claimConflictsForPath(consumerRoot, p, { myWorktree })) {
+        const key = `${c.session_id}:${c.path}`
+        if (seen.has(key)) continue
+        seen.add(key)
+        lines.push(`  ${formatClaimConflict(c)}`)
+      }
+    }
+    if (lines.length === 0) return
+    console.error('  claim overlap — 這棵樹宣告的範圍與別的活 claim 交集：')
+    for (const l of lines.slice(0, 3)) console.error(l)
+  } catch {
+    // 協調訊號 NEVER 擋開樹
+  }
+}
+
+function formatActiveSessionsForError(claims) {
+  if (claims.length === 0) return '  (none)'
+  return claims
+    .map(
+      (c) =>
+        `  - ${c.session_id} [${c.agent}] change=${c.change_id ?? '(none)'} branch=${c.branch ?? '(none)'} paths=${(c.expected_paths ?? []).length}`,
+    )
+    .join('\n')
+}
+
+// Whitelist of consumer-local paths where merge-back may auto-commit oxfmt
+// drift without user confirmation. These files are NOT in LOCKED_PROJECTION_RE
+// (they are consumer-managed, not clade-projection), but they receive
+// auto-format passes from hooks and routinely produce zero-semantic drift
+// inside worktrees. Adding a path here is a deliberate trust decision: any
+// diff against HEAD that can be reproduced by `oxfmt(HEAD-version)` is
+// guaranteed to be format-only and safe to land via auto-commit.
+const OXFMT_AUTO_PATHS = new Set(['.claude/settings.json'])
+
+// Returns oxfmt's stdout when piping `text` through `oxfmt --stdin-filepath`,
+// or null if oxfmt is unavailable / errored. Tries direct `oxfmt` first, then
+// `pnpm exec oxfmt` as fallback. `cwd` matters because oxfmt resolves its
+// config (vite.config.ts / .oxfmtrc) from there — pass wtPath so config
+// matches what the worktree's hook would have applied.
+function runOxfmtStdin(text, filePath, cwd) {
+  const attempts = [
+    { cmd: 'oxfmt', args: [`--stdin-filepath=${filePath}`] },
+    { cmd: 'pnpm', args: ['exec', 'oxfmt', `--stdin-filepath=${filePath}`] },
+  ]
+  for (const { cmd, args } of attempts) {
+    try {
+      const r = spawnSync(cmd, args, {
+        input: text,
+        encoding: 'utf8',
+        cwd,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      })
+      if (r.status === 0 && typeof r.stdout === 'string') return r.stdout
+    } catch {}
+  }
+  return null
+}
+
+// isToolManagedDrift / TOOL_MANAGED_SETTING_LINE moved to ./wip-dirty.ts so the
+// "ignorable drift" rule (projection residue + tool-managed flip) lives in one
+// module shared by cleanup, merge-back and wt-batch checkpoint/draft — see
+// isIgnorableWorktreeDrift there.
+
+// Whitelist gate for the auto-commit branch in cmdMergeBack. Returns true iff:
+//   1. filePath is in OXFMT_AUTO_PATHS, AND
+//   2. `oxfmt(HEAD:filePath)` byte-equals the current working-tree content
+//      (modulo trailing-newline normalization).
+// Condition 2 mathematically excludes semantic drift: if running oxfmt on
+// HEAD reproduces the current file, the only difference between HEAD and
+// working tree is format normalization. False on any failure path (file
+// missing in HEAD, oxfmt unavailable, content differs) → caller falls back
+// to the existing STOP + 4-option guidance.
+function isFormatOnlyDrift(wtPath, filePath) {
+  if (!OXFMT_AUTO_PATHS.has(filePath)) return false
+  let headText
+  try {
+    headText = execFileSync('git', ['show', `HEAD:${filePath}`], {
+      cwd: wtPath,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+  } catch {
+    return false
+  }
+  let currentText
+  try {
+    currentText = readFileSync(join(wtPath, filePath), 'utf8')
+  } catch {
+    return false
+  }
+  const formatted = runOxfmtStdin(headText, filePath, wtPath)
+  if (formatted === null) return false
+  return stripTrailingNewlines(formatted) === stripTrailingNewlines(currentText)
+}
+
+const stripTrailingNewlines = (s) => s.replace(/\n+$/, '')
+
+// Fire-and-forget trigger for codebase-memory-mcp `index_repository` (fast mode)
+// against a freshly-created worktree. Per pitfall-consumer-mcp-codebase-memory-missing
+// (2026-05-18, severity high): without auto-index, every new worktree starts
+// as "project not indexed" → search_graph / trace_path / get_code_snippet all
+// fail, downstream implement / debug flows degrade to grep fallback.
+//
+// Design constraints:
+//   - **Silent skip on any error**: mcp binary may be missing (consumer hasn't
+//     run `codebase-memory-mcp install`), CLI may be incompatible, indexing may
+//     fail mid-run. None of these should block worktree creation success.
+//   - **Non-blocking**: spawn detached + unref so the index job runs in the
+//     background and `cmdAdd` returns immediately. A 160 MB binary loading
+//     8 GB mem budget for a fresh repo can take 30 s+; awaiting would defeat
+//     the purpose of a fast worktree fork.
+//   - **Test hook**: WT_HELPER_SKIP_INDEX=1 (set in fixtures.test) disables the
+//     spawn entirely. WT_HELPER_INDEX_BIN overrides the binary path used for the
+//     "is codebase-memory-mcp installed" skip check; the index itself runs through
+//     cbm-index.sh (TD-677, see test/cbm-index-orphan-reclaim.test.ts).
+//
+// Set up git exclude for WORKTREE-BRIEF.md so it never shows as untracked.
+//
+// TD-347: MUST write to the **common** dir (`.git/info/exclude`), not the
+// per-worktree `$GIT_DIR/info/exclude` (`.git/worktrees/<slug>/info/exclude`).
+// git reads only the common dir's copy — the per-worktree one it never opens,
+// so the previous `--git-dir` form was a silent no-op and every worktree that
+// actually produced a brief kept it as `??` forever, tripping the
+// uncommitted-files gate on merge-back / cleanup.
+//
+// The cost of the common dir is that the entry is visible to main and to every
+// other worktree. That is acceptable **for this path only**: `WORKTREE-BRIEF.md`
+// is a tool artifact this script itself writes, never a user file. NEVER widen
+// this helper to arbitrary user-supplied paths — an entry written here cannot be
+// scoped back to one worktree.
+//
+// Idempotent — safe to call multiple times. Warn-only on failure (never blocks
+// worktree creation).
+function setupBriefExclude(wtPath) {
+  try {
+    const wtGitDir = git(['rev-parse', '--path-format=absolute', '--git-common-dir'], {
+      cwd: wtPath,
+    }).trim()
+    const infoDir = join(wtGitDir, 'info')
+    mkdirSync(infoDir, { recursive: true })
+    const excludePath = join(infoDir, 'exclude')
+    const existing = existsSync(excludePath) ? readFileSync(excludePath, 'utf8') : ''
+    if (!existing.split('\n').some((l) => l.trim() === 'WORKTREE-BRIEF.md')) {
+      appendFileSync(
+        excludePath,
+        `${existing.endsWith('\n') || existing === '' ? '' : '\n'}WORKTREE-BRIEF.md\n`,
+        'utf8',
+      )
+    }
+  } catch (e) {
+    console.error(`note: brief exclude setup skipped: ${e?.message ?? e}`)
+  }
+}
+
+// Returns a Promise that resolves with `{ skipped, reason? }` once the child
+// is launched (or skip decision is made) — never rejects. Caller can `.catch`
+// defensively but no error path is actually reachable.
+export function maybeIndexRepository(worktreePath) {
+  return new Promise((resolveOuter) => {
+    try {
+      if (process.env.WT_HELPER_SKIP_INDEX === '1') {
+        resolveOuter({ skipped: true, reason: 'WT_HELPER_SKIP_INDEX=1' })
+        return
+      }
+      const binPath =
+        process.env.WT_HELPER_INDEX_BIN ||
+        join(process.env.HOME || '', '.local/bin/codebase-memory-mcp')
+      if (!existsSync(binPath)) {
+        resolveOuter({ skipped: true, reason: `binary missing: ${binPath}` })
+        return
+      }
+      // TD-677: go through the single index entry point (flock + MemoryMax cgroup,
+      // temporary-path skip, orphan-DB reclaim), never the bare CLI — per
+      // pitfall-cbm-auto-index-concurrent-oom. The wrapper indexes a missing DB on
+      // explicit calls, which is exactly what a fresh worktree needs.
+      const [command, args] = worktreeIndexCommand(worktreePath)
+      const child = spawn(command, args, {
+        detached: true,
+        stdio: 'ignore',
+      })
+      child.on('error', () => {
+        /* silent — pitfall says graceful degrade */
+      })
+      child.unref()
+      resolveOuter({ skipped: false })
+    } catch {
+      // Defensive: spawn throw on EACCES / ENOENT race — silent skip.
+      resolveOuter({ skipped: true, reason: 'spawn threw' })
+    }
+  })
+}
+
+export function worktreeIndexCommand(worktreePath: string): [string, string[]] {
+  return ['bash', [join(WT_HELPER_DIR, 'cbm-index.sh'), worktreePath, 'fast']]
+}
+
+function cleanupCodebaseMemoryIndex(worktreePath) {
+  try {
+    const dbName = worktreePath.replace(/^\//, '').replace(/\//g, '-')
+    const cacheDir = join(process.env.HOME || '', '.cache/codebase-memory-mcp')
+    let cleaned = false
+    for (const ext of ['.db', '.db-wal', '.db-shm']) {
+      const f = join(cacheDir, dbName + ext)
+      if (existsSync(f)) {
+        rmSync(f)
+        cleaned = true
+      }
+    }
+    if (cleaned) console.log(`Cleaned codebase-memory-mcp index for ${dbName}`)
+  } catch {
+    // best-effort; never block worktree removal
+  }
+}
+
+// Pin a pre-fork baseline snapshot under `refs/wt-baseline/<slug>/<iso>`.
+//
+// TD-144 fix: cmdAdd has three fork paths (main-clean, main-dirty + commit
+// strategy, main-dirty + stash strategy) but historically only the stash
+// strategy pinned a baseline ref. PTB-unsafe (Path X reset, abandon, etc.)
+// worktrees on the other two paths permanently lost user WIP because there
+// was nothing reachable to rescue from.
+//
+// This helper unifies the three paths. Behavior:
+//   • main clean → pin HEAD sha directly as marker (single-parent ref).
+//     `wt-helper rescue --show <ref>` returns "Empty stash" (no diff vs HEAD),
+//     but the ref still exists for `git show <ref>` / `git log <ref>` rescue.
+//   • main dirty → snapshot staged + unstaged + untracked via a temporary
+//     index (GIT_INDEX_FILE) so the real working tree / real index are NEVER
+//     touched. Build a stash-format 2-parent commit (HEAD + index-commit) so
+//     `git stash show -p <ref>` produces a clean diff against HEAD.
+//
+// Returns { baselineRef, type, sha }. type ∈ 'clean-main' | 'snapshot'.
+// Caller decides whether to use the returned ref (e.g. stash strategy skips
+// this because its existing post-stash pin already covers all three layers).
+function pinPreForkBaseline(consumerRoot, cleanSlug, iso, opts: { label?: string } = {}) {
+  const baselineRef = `refs/wt-baseline/${cleanSlug}/${iso}`
+  const headSha = git(['rev-parse', 'HEAD'], { cwd: consumerRoot })
+  const headTree = git(['rev-parse', 'HEAD^{tree}'], { cwd: consumerRoot })
+  const dirty = detectMainDirty(consumerRoot)
+  const dirtyCount = dirty.modified.length + dirty.untracked.length
+
+  if (dirtyCount === 0) {
+    // Clean main: pin a 2-parent stash-format marker (tree == HEAD's tree,
+    // parent[0] == HEAD, parent[1] == fresh index commit with same tree).
+    // This guarantees `rescue --show <ref>` exits 0 (empty diff vs HEAD)
+    // instead of erroring out with "not a stash-like commit". Without the
+    // 2nd parent, `git stash show -p` rejects the ref entirely.
+    const indexCommit = git(
+      ['commit-tree', headTree, '-p', headSha, '-m', `index on main: ${headSha.slice(0, 7)}`],
+      { cwd: consumerRoot },
+    )
+    const markerMessage = `On main: wt-baseline/${cleanSlug}/${iso} (clean-main marker; no diff vs HEAD)`
+    const markerSha = git(
+      ['commit-tree', headTree, '-p', headSha, '-p', indexCommit, '-m', markerMessage],
+      { cwd: consumerRoot },
+    )
+    git(['update-ref', baselineRef, markerSha], { cwd: consumerRoot })
+    return { baselineRef, type: 'clean-main', sha: markerSha }
+  }
+
+  // Dirty main: snapshot staged + unstaged + untracked into a stash-format
+  // commit using a temporary index. `git stash create -u` is unreliable
+  // across git versions (some omit untracked entirely; others add a ^3
+  // parent), so we build the commit manually for deterministic behavior.
+  const tmpIndex = join(consumerRoot, '.git', `wt-baseline-index-${cleanSlug}-${process.pid}`)
+  const label = opts.label || cleanSlug
+  const message = `On main: wt-baseline/${cleanSlug}/${iso} (pre-fork snapshot for ${label})`
+  try {
+    // Use a fresh temp index so we don't touch the real index.
+    const env = { ...process.env, GIT_INDEX_FILE: tmpIndex }
+    // Seed the temp index with HEAD's tree, then stage everything (tracked
+    // modifications + untracked) on top. This collapses all three layers
+    // (HEAD vs staged vs unstaged vs untracked) into one tree.
+    git(['read-tree', 'HEAD'], { cwd: consumerRoot, env })
+    git(['add', '-A'], { cwd: consumerRoot, env, stdio: 'pipe' })
+    const fullTree = git(['write-tree'], { cwd: consumerRoot, env })
+    // Build an "index commit" parent so the resulting commit is a valid
+    // 2-parent stash entry (parent[0]=HEAD, parent[1]=index). This is what
+    // `git stash show -p` requires — a single-parent commit looks like
+    // "Empty stash" to that command.
+    const indexCommit = git(
+      ['commit-tree', fullTree, '-p', headSha, '-m', `index on main: ${headSha.slice(0, 7)}`],
+      { cwd: consumerRoot },
+    )
+    const snapshotSha = git(
+      ['commit-tree', fullTree, '-p', headSha, '-p', indexCommit, '-m', message],
+      { cwd: consumerRoot },
+    )
+    git(['update-ref', baselineRef, snapshotSha], { cwd: consumerRoot })
+    return { baselineRef, type: 'snapshot', sha: snapshotSha }
+  } finally {
+    // Always delete the temp index to avoid leaving artifacts under .git/.
+    try {
+      if (existsSync(tmpIndex)) unlinkSync(tmpIndex)
+    } catch {
+      // Non-fatal: leftover temp index file in .git/ is harmless and
+      // overwritten by next pin run (same pid + slug + ISO combo unlikely).
+    }
+  }
+}
+
+// TD-614: gitignored runtime 檔在 linked worktree 內不存在（`git worktree` fork 只帶
+// tracked 檔），而讀它們的工具**不會報錯**——`consumers.local` 缺席時 fleet audit 只掃到
+// clade 自己，輸出讀起來與「全綠」同形。失效方向是假陰性，所以在 fork 當下就補上。
+//
+// 用 symlink 不用 copy：這些檔是**本機當前狀態**（registry 覆寫、路徑指標），worktree
+// 讀到的必須是 main root 的現況，不是 fork 當下的快照。
+// **NEVER** 反過來讓 audit 在找不到檔時 fallback 去讀 main working tree —— 那會讓
+// worktree 內的 audit 讀到不屬於該 branch 的狀態。
+const GITIGNORED_RUNTIME_LINKS = ['consumers.local']
+
+// main worktree 的 root。linked worktree 的 `--git-common-dir` 指回 main 的 `.git`，
+// 所以 dirname 就是 main root。**NEVER 寫死路徑** —— 這支同時服務 11 個 consumer。
+export function mainWorktreeRoot(cwd) {
+  const common = git(['rev-parse', '--path-format=absolute', '--git-common-dir'], { cwd })
+  return dirname(common.trim())
+}
+
+export function linkGitignoredRuntimeFiles(
+  consumerRoot,
+  wtPath,
+  names = GITIGNORED_RUNTIME_LINKS,
+  strict = false,
+) {
+  const linked = []
+  let mainRoot
+  try {
+    mainRoot = mainWorktreeRoot(consumerRoot)
+  } catch {
+    return linked
+  }
+  for (const name of names) {
+    try {
+      const src = join(mainRoot, name)
+      const dst = join(wtPath, name)
+      if (!existsSync(src) || existsSync(dst)) continue
+      // 只 link 真的被 ignore 的檔：非 ignored 的 symlink 會變成 untracked 檔，
+      // 接著 merge-back / cleanup 的 uncommitted-files gate 就擋在它上面。
+      // 判準取**目的地 worktree** 的 ignore 視角（檔案落在那裡），不是 main 的 ——
+      // 兩邊的 `.gitignore` 可以不同（main 的是 working tree 現況，worktree 的是
+      // 它 fork 出來那個 commit 的）。
+      if (spawnSync('git', ['check-ignore', '-q', name], { cwd: wtPath }).status !== 0) continue
+      mkdirSync(dirname(dst), { recursive: true })
+      symlinkSync(src, dst)
+      linked.push(name)
+    } catch (e) {
+      if (strict) throw e
+      console.error(`note: runtime link ${name} skipped: ${e?.message ?? e}`)
+    }
+  }
+  return linked
+}
+
+const ADD_USAGE =
+  'Usage: wt-helper add <slug> --task-summary <text> [--landing pr|batch|none] [--base <ref> | --checkout <branch>] [--expected-paths <comma>] [--precheck-baseline [<change>]] [--baseline-strategy commit|stash|warn] [--baseline-scope-paths <comma>] [--baseline-stash-name <name>] [--skip-prefork-audit] [--include-unrelated-dirty]'
+
+function hashUtf8(content: string) {
+  return createHash('sha256').update(content).digest('hex')
+}
+
+/**
+ * After copying gitignored `.clade/projections` from main, rewrite `files`
+ * hashes to the worktree's actual bytes.
+ *
+ * Main's working tree can hold dirty tracked projection outputs (skills,
+ * rules). `git worktree add` checks those out from HEAD, but the copied
+ * state still records main's dirty hashes. SessionStart `sync-rules --check`
+ * then throws `local or modified file conflict` and auto-repair refuses to
+ * overwrite. Rehashing makes previousHash == currentHash so repair can do
+ * an owned update instead.
+ *
+ * Missing paths are dropped: keeping them would claim ownership of files
+ * the worktree never received (typically main-only dirty tracked files).
+ */
+export function reconcileCopiedProjectionState(
+  wtPath: string,
+  consumerRoot?: string,
+  { branchChanged = new Set<string>() }: { branchChanged?: ReadonlySet<string> } = {},
+) {
+  const dir = join(wtPath, '.clade', 'projections')
+  if (!existsSync(dir)) return { updated: 0, skipped: [] as string[] }
+  let updated = 0
+  const skipped: string[] = []
+  for (const name of readdirSync(dir)) {
+    if (!name.endsWith('.json')) continue
+    const path = join(dir, name)
+    let state
+    try {
+      state = JSON.parse(readFileSync(path, 'utf8'))
+    } catch {
+      continue
+    }
+    if (!state || typeof state !== 'object' || typeof state.files !== 'object' || !state.files)
+      continue
+    const files = { ...state.files }
+    let dirty = false
+    for (const rel of Object.keys(files)) {
+      const abs = join(wtPath, rel)
+      if (!existsSync(abs) || !statSync(abs).isFile()) {
+        delete files[rel]
+        if (
+          state.sourceInputs &&
+          typeof state.sourceInputs === 'object' &&
+          rel in state.sourceInputs
+        ) {
+          const next = { ...state.sourceInputs }
+          delete next[rel]
+          state.sourceInputs = next
+        }
+        dirty = true
+        continue
+      }
+      // TD-1140 r1: a projection path the branch itself changed (merge-base..HEAD) is a
+      // hand edit committed on the worktree, not a projection output. Adopting its HEAD
+      // hash would claim it as owned and let the next sync-rules overwrite it silently;
+      // keep the copied (main) hash so the check surfaces it as a local conflict.
+      if (branchChanged.has(rel)) {
+        skipped.push(rel)
+        continue
+      }
+      const tracked = spawnSync('git', ['cat-file', '-e', `HEAD:${rel}`], {
+        cwd: wtPath,
+        encoding: 'utf8',
+      })
+      let hash: string | undefined
+      if (tracked.status === 0) {
+        hash = hashUtf8(
+          execFileSync('git', ['show', `HEAD:${rel}`], { cwd: wtPath, encoding: 'utf8' }),
+        )
+      } else {
+        const live = hashUtf8(readFileSync(abs, 'utf8'))
+        const mainAbs = consumerRoot ? join(consumerRoot, rel) : ''
+        if (
+          consumerRoot &&
+          existsSync(mainAbs) &&
+          statSync(mainAbs).isFile() &&
+          hashUtf8(readFileSync(mainAbs, 'utf8')) !== live
+        )
+          continue
+        hash = live
+      }
+      if (files[rel] !== hash) {
+        files[rel] = hash
+        dirty = true
+      }
+    }
+    // A codex `delivery` marker is a pure function of the files map
+    // (buildState re-derives it on every apply). A copied state whose files map
+    // was reduced here — or reduced by an earlier run that predates this
+    // clearing — can hold a marker its map no longer supports (`skill-packages`
+    // over an AGENTS.md-only map fails apply's `invalid Codex delivery marker`
+    // fail-closed check). Drop the claim unconditionally: it carries no
+    // information the next apply cannot recompute.
+    if (typeof state.delivery === 'string') {
+      delete state.delivery
+      dirty = true
+    }
+    if (!dirty) continue
+    state.files = files
+    // A codex `delivery` marker is derived from the files map; a reconcile that
+    // dropped owned paths can invalidate it (`skill-packages` over an
+    // AGENTS.md-only map fails apply's `invalid Codex delivery marker`
+    // fail-closed check). The next apply re-derives the marker in buildState,
+    // so drop the stale claim instead of letting it describe files the state
+    // no longer owns.
+    if (typeof state.delivery === 'string') delete state.delivery
+    writeFileSync(path, `${JSON.stringify(state, null, 2)}\n`)
+    updated++
+  }
+  return { updated, skipped }
+}
+
+/**
+ * `.clade/bin/*` shim 的相對 import（`from './x.ts'`、`import './x.ts'`、
+ * `import('./x.ts')` 全算）。clade-gate 的 vendor/signals 匯入就是動態形式。
+ */
+const SHIM_LOCAL_IMPORT_RE = /(?:\bfrom\s*|\bimport\s*\(?\s*)['"](\.[^'"]+)['"]/g
+
+/**
+ * 閉包檔落在這些 vendored 目錄內（含自身與子層）時，以**整個父目錄**為 seed
+ * 單位：`vendor/signals` 的 `schema.json`、`fixtures/` 是 `__dirname` 讀的資料檔，
+ * import 掃描碰不到，只種 `.ts` 會讓 ledger writer 在第一次記錄時才炸。
+ * `.clade/scripts` 不在列：那裡全是 import 掃描看得到的 `.ts`，沒有
+ * `__dirname` 讀的資料檔，整棵搬只會把閉包外的檔案一起捲進 move 清單。
+ */
+const SHIM_DEP_WHOLE_DIR_ROOTS = ['.clade/vendor', '.clade/signals']
+
+/**
+ * 整目錄名單裡的例外：runtime 訊號歷史（`vendor/ledger/*.jsonl` 與 lock）是
+ * main 的累積，整棵搬進新 worktree 等於把別樹的訊號當它自己的。命中一律逐檔。
+ * `.clade`／`.clade/vendor` 根用精確匹配——它們的子目錄要繼續往整目錄名單判定；
+ * `vendor/ledger` 連子層一起鎖逐檔。
+ */
+const SHIM_DEP_FILE_ONLY_PARENTS = new Set(['.clade', '.clade/vendor'])
+
+function shimDepSeedUnit(consumerRoot: string, absPath: string): string | null {
+  const rel = relative(consumerRoot, absPath)
+  // 閉包走出 `.clade/` 的不歸 substrate 管（repo 根的檔多半 tracked，git 自帶）。
+  if (rel !== '.clade' && !rel.startsWith('.clade/')) return null
+  const parent = dirname(rel)
+  if (
+    SHIM_DEP_FILE_ONLY_PARENTS.has(parent) ||
+    parent === '.clade/vendor/ledger' ||
+    parent.startsWith('.clade/vendor/ledger/')
+  )
+    return rel
+  if (SHIM_DEP_WHOLE_DIR_ROOTS.some((root) => parent === root || parent.startsWith(`${root}/`)))
+    return parent
+  // 其餘一律逐檔，NEVER 讓 `.clade/` 或 `.clade/vendor` 整棵成為單位。
+  return rel
+}
+
+/**
+ * `.clade/bin/*` shim 的執行期依賴閉包（main checkout 為準）。
+ *
+ * bin 由 gitignore 逐檔種入，它相對匯入的檔案（`vendor/` 等）同樣
+ * gitignored 卻沒有對應的 seed——缺依賴的 worktree 跑 shim 起手即
+ * ERR_MODULE_NOT_FOUND。
+ *
+ * 種子範圍以「shim 實際 import／執行到的路徑」為準：從 main 的 `.clade/bin/*`
+ * 遞移解出相對匯入閉包，逐檔收斂成 seed 單位（見 shimDepSeedUnit），
+ * 不是整個 `.clade/` 盲拷。main 缺席的落點回傳不了——seed 端同樣供應不了。
+ * worktree 側的 bin 也併入掃描：tracked bin 的舊版可能匯入 main 已不用的
+ * 路徑，缺它照樣是 module-link 就斷。
+ *
+ * 回傳的單位互不巢狀：父目錄單位的整棵複製已涵蓋子層單位；巢狀單位進入
+ * refresh 的 move 清單會在父層搬走後對子層 ENOENT。
+ */
+export function cladeBinShimSeedPaths(consumerRoot: string, wtPath?: string): string[] {
+  const units = new Set<string>()
+  const seen = new Set<string>()
+  const queue: string[] = []
+  for (const root of [consumerRoot, wtPath]) {
+    if (!root) continue
+    const binDir = join(root, '.clade', 'bin')
+    if (!existsSync(binDir)) continue
+    for (const entry of readdirSync(binDir)) {
+      const file = join(binDir, entry)
+      try {
+        if (statSync(file).isFile()) queue.push(file)
+      } catch {
+        // dangling symlink：跳過自己，不吃掉其餘 shim（比照 bin 複製的 per-entry try）
+      }
+    }
+  }
+  // 落點統一映射回 consumer 空間：wt 側 bin（tracked 舊版）resolve 出來的是
+  // worktree 路徑，但供應源永遠是 main——缺件判缺席、閉包遞移都看 main 那份。
+  const toConsumerAbs = (absPath: string) => {
+    if (wtPath) {
+      const fromWt = relative(wtPath, absPath)
+      if (fromWt !== '' && fromWt !== '..' && !fromWt.startsWith('../') && fromWt !== absPath)
+        return join(consumerRoot, fromWt)
+    }
+    return absPath
+  }
+  while (queue.length > 0) {
+    const file = queue.pop() as string
+    if (seen.has(file)) continue
+    seen.add(file)
+    let src: string
+    try {
+      src = readFileSync(file, 'utf8')
+    } catch {
+      continue
+    }
+    for (const m of src.matchAll(SHIM_LOCAL_IMPORT_RE)) {
+      const resolved = toConsumerAbs(resolve(dirname(file), m[1]))
+      try {
+        if (!statSync(resolved).isFile()) continue
+      } catch {
+        continue // 缺席／dangling：供應不了；也是目錄解析的擋點（ESM 本就不接 dir import，
+        // 讓 `import '../vendor'` 落成單位會把 ledger 一起種進去）
+      }
+      const unit = shimDepSeedUnit(consumerRoot, resolved)
+      if (unit) units.add(unit)
+      queue.push(resolved)
+    }
+  }
+  const list = [...units]
+  return list.filter((u) => !list.some((v) => u.startsWith(`${v}/`))).toSorted()
+}
+
+/**
+ * Copy the gitignored clade substrate (`.agents`, `.clade/runtime`, `.clade/projections`,
+ * `.codex`, then `.clade/rules`, plus the `.clade/bin` shim dependency closure) from the
+ * main worktree into a linked worktree,
+ * and reconcile copied projection state to the worktree checkout.
+ *
+ * Shared by `wt-helper add` (fork time) and `sync-rules` write mode (a linked
+ * worktree that was created with plain `git worktree add` and therefore never
+ * got the substrate). Existing destinations are never overwritten.
+ */
+export function seedWorktreeCladeSubstrate(
+  consumerRoot: string,
+  wtPath: string,
+  {
+    strict = false,
+    log = console.log,
+    branchChanged,
+  }: {
+    strict?: boolean
+    log?: (line: string) => void
+    /** Paths the worktree branch changed itself; reconcile keeps them unadopted. */
+    branchChanged?: ReadonlySet<string>
+  } = {},
+) {
+  // TD-1037: `.clade/runtime/`、`.clade/projections/`、`.clade/rules/` 與 `.codex/` 全部在
+  // consumer .gitignore 內，而 `git worktree` fork 只帶 tracked 檔案 —— 新 worktree 因此
+  // 結構上不可能有它們。三個獨立現場（perno / cnc-link-dashboard / yudefine-blog）證實後果
+  // 相同：`sync-rules` 在 `.clade/runtime/hooks.json` 以 ENOENT 失敗（訊息 "canonical runtime
+  // projection unavailable" 指不到根因），繞過它之後 `.clade/projections/*.json` 缺席又讓
+  // ownership 判定把每個既有檔判成本地竄改。
+  //
+  // 複製 gitignored substrate 是必要的（worktree 帶不走 ignore 檔）。**不能**假設拷過來的
+  // `.clade/projections` hash 仍對得上 worktree：main 可能有 dirty 的 tracked 投影輸出，
+  // worktree 卻 checkout 自 HEAD。拷完後 MUST reconcile，見 reconcileCopiedProjectionState。
+  // 逐 entry 判 gitignore（比照上方 `.clade/bin`）：非 ignored 的檔複製過去會變成使用者從沒寫過
+  // 的 untracked 檔，接著 merge-back / cleanup 的 uncommitted-files gate 就擋在那上面。
+  // Warn-only：consumer 沒有該目錄就跳過，per-dir try 讓一個目錄的失敗不吃掉其餘目錄。
+  // `.clade/rules` **MUST NOT** 在沒有 `.clade/projections` 的樹上出現，所以它不在這一組。
+  const copied: string[] = []
+  // 放在 substrate 之前：`.clade/projections/codex.rules.json` 擁有 `.agents/skills/clade-*`，
+  // 下方 reconcile 會丟掉 worktree 沒拿到的檔，`.agents` 缺席就讓 Codex delivery marker 失配。
+  // `.agents/` 是 Codex 與 Pi 共用的 generated skill projection，但通常不進 git；
+  // `git worktree add` 因此不會帶過去。clade Pi package 本身刻意 extensions-only，
+  // 若這裡漏複製，新 worktree 會在無 collision 的同時也失去 project skills。
+  // 複製 fork 當下 main 的完整 projection，讓兩個 runtime 都只讀同一份來源。
+  try {
+    const agentsSrc = join(consumerRoot, '.agents')
+    const agentsDst = join(wtPath, '.agents')
+    if (existsSync(agentsSrc) && !existsSync(agentsDst)) {
+      cpSync(agentsSrc, agentsDst, { recursive: true })
+      copied.push('.agents')
+      log('  agent-projection: copied .agents from main')
+    } else if (existsSync(agentsSrc)) {
+      // `.agents` can be partially tracked — CPMS keeps `.agents/constitution/`
+      // in git via a `!.agents/constitution/` exception, so a linked worktree
+      // already has the directory. Treating its existence as "done" skips
+      // `.agents/skills/` forever; reconcile then strips every
+      // `.agents/skills/clade-*` entry out of codex.rules.json and leaves a
+      // `delivery: "skill-packages"` marker over an AGENTS.md-only file map,
+      // which apply fails closed as `invalid Codex delivery marker`.
+      // Merge instead: copy every missing child, never overwrite an existing
+      // one, and skip children git would have provided (non-ignored paths).
+      for (const entry of readdirSync(agentsSrc)) {
+        try {
+          const rel = `.agents/${entry}`
+          const dst = join(agentsDst, entry)
+          if (existsSync(dst)) continue
+          if (spawnSync('git', ['check-ignore', '-q', rel], { cwd: consumerRoot }).status !== 0)
+            continue
+          cpSync(join(agentsSrc, entry), dst, { recursive: true })
+          copied.push(rel)
+          log(`  agent-projection: copied ${rel} from main`)
+        } catch (entryErr) {
+          if (strict) throw entryErr
+          console.error(`note: .agents/${entry} copy skipped: ${entryErr?.message ?? entryErr}`)
+        }
+      }
+    }
+  } catch (e) {
+    if (strict) throw e
+    console.error(`note: .agents projection copy skipped: ${e?.message ?? e}`)
+  }
+
+  let copiedProjections = false
+  for (const rel of ['.clade/runtime', '.clade/projections', '.codex']) {
+    try {
+      const src = join(consumerRoot, rel)
+      const dst = join(wtPath, rel)
+      if (!existsSync(src) || existsSync(dst)) continue
+      if (spawnSync('git', ['check-ignore', '-q', rel], { cwd: consumerRoot }).status !== 0)
+        continue
+      cpSync(src, dst, { recursive: true })
+      if (rel === '.codex') {
+        try {
+          log(`  ${extendCodexWorktreeHookTrust(wtPath).reason}`)
+        } catch (error) {
+          console.error(
+            `warn: Codex worktree hook trust unchanged: ${error instanceof Error ? error.message : String(error)}`,
+          )
+        }
+      }
+      if (rel === '.clade/projections') copiedProjections = true
+      copied.push(rel)
+      log(`  clade-substrate: copied ${rel} from main (gitignored, worktree cannot check it out)`)
+    } catch (e) {
+      if (strict) throw e
+      console.error(`note: ${rel} copy skipped: ${e?.message ?? e}`)
+    }
+  }
+
+  // `.clade/rules/` 單獨拉出來，因為它的前提是 `.clade/projections/` 在位，而上面那一組是
+  // 逐目錄 warn-only —— 任何一個目錄失敗都不影響其餘目錄。
+  //
+  // 「有 rules、無 state」是一個會**無聲覆寫 tracked 檔**的組合，不只是少一份資料：
+  // `runtime-rule-plan.ts` 把 `.clade/rules/<name>.md` 渲染到 `.claude/rules/local/<name>.md`
+  // ——與 legacy 檔**同一個路徑**。state 在位時，`owned[path] !== hash` 會把「兩邊內容不一致」
+  // 擋成 `local-source-migration-required`（`local-rule-migration.ts` 的 reviewed sha256 就是
+  // 為了這件事）。state 缺席時 `owned = {}`，那道 gate 失去判斷依據，而 perno 實況證明兩邊
+  // 本來就不同（legacy hash `dd9eff…` ≠ canonical hash `c1c6de…`）。
+  //
+  // 所以：**projections 不在位就不要給 rules**。少一份 gitignored 資料的代價是那棵樹要自己
+  // 跑一次 write-mode sync-rules；給了而 gate 判不動的代價是 tracked 檔被無審核換掉。
+  try {
+    const src = join(consumerRoot, '.clade/rules')
+    const dst = join(wtPath, '.clade/rules')
+    if (existsSync(src) && !existsSync(dst)) {
+      if (
+        spawnSync('git', ['check-ignore', '-q', '.clade/rules'], { cwd: consumerRoot }).status === 0
+      ) {
+        if (existsSync(join(wtPath, '.clade/projections'))) {
+          cpSync(src, dst, { recursive: true })
+          copied.push('.clade/rules')
+          log(
+            '  clade-substrate: copied .clade/rules from main (gitignored, worktree cannot check it out)',
+          )
+        } else {
+          console.error(
+            'note: .clade/rules copy skipped — .clade/projections is absent, and canonical local rules without their ownership state would let the next projection overwrite tracked .claude/rules/local/** unreviewed',
+          )
+        }
+      }
+    }
+  } catch (e) {
+    if (strict) throw e
+    console.error(`note: .clade/rules copy skipped: ${e?.message ?? e}`)
+  }
+
+  // `.clade/bin/*` shim 的執行期依賴閉包：bin 本身走 `.gitignore` 逐檔種入
+  // （bootstrapWorktreeRuntime），它 import 的 `../vendor/signals/*` 同樣
+  // gitignored 卻沒有其他 seed 管。種子範圍以 shim 實際 import 到的路徑為準
+  // （cladeBinShimSeedPaths）：vendored 子目錄整棵種（schema.json／fixtures
+  // 是 `__dirname` 讀的資料檔，import 掃描碰不到），其餘逐檔；`.clade/vendor`
+  // 根與 `vendor/ledger`（runtime 訊號歷史）永遠不成為單位。目錄單位比照
+  // `.agents` 走 merge——缺哪個 child 補哪個，已存在的不覆寫；已存在於 wt
+  // 的整個單位交給 refresh-substrate 判定換新。
+  for (const rel of cladeBinShimSeedPaths(consumerRoot, wtPath)) {
+    try {
+      const src = join(consumerRoot, rel)
+      const dst = join(wtPath, rel)
+      if (!existsSync(src)) continue
+      if (statSync(src).isDirectory()) {
+        for (const entry of readdirSync(src)) {
+          const childRel = `${rel}/${entry}`
+          const childDst = join(dst, entry)
+          if (existsSync(childDst)) continue
+          if (
+            spawnSync('git', ['check-ignore', '-q', childRel], { cwd: consumerRoot }).status !== 0
+          )
+            continue
+          cpSync(join(src, entry), childDst, { recursive: true })
+          copied.push(childRel)
+          log(`  clade-bin-deps: copied ${childRel} from main (shim import closure)`)
+        }
+      } else {
+        if (existsSync(dst)) continue
+        if (spawnSync('git', ['check-ignore', '-q', rel], { cwd: consumerRoot }).status !== 0)
+          continue
+        mkdirSync(dirname(dst), { recursive: true })
+        cpSync(src, dst)
+        copied.push(rel)
+        log(`  clade-bin-deps: copied ${rel} from main (shim import closure)`)
+      }
+    } catch (e) {
+      if (strict) throw e
+      console.error(`note: ${rel} copy skipped: ${e?.message ?? e}`)
+    }
+  }
+
+  // Rehash only after this invocation copied projection state or merged `.agents`
+  // children. A later bootstrap that skips copy would otherwise stamp subsequent
+  // local edits as owned hashes and let SessionStart auto-repair overwrite them
+  // instead of leaving a local-conflict. The `.agents` arm is what repairs a
+  // worktree seeded before the merge existed: the merge restores the ignored
+  // children, and reconcile then clears a `delivery` marker that earlier drops
+  // already invalidated.
+  const unadopted: string[] = []
+  if (copiedProjections || copied.some((p) => p === '.agents' || p.startsWith('.agents/'))) {
+    try {
+      const reconciled = reconcileCopiedProjectionState(wtPath, consumerRoot, { branchChanged })
+      if (reconciled.updated > 0) {
+        log(
+          `  clade-substrate: reconciled ${reconciled.updated} projection state file(s) to worktree disk`,
+        )
+      }
+      for (const rel of reconciled.skipped) {
+        unadopted.push(rel)
+        log(
+          `  clade-substrate: ${rel} changed on this branch — left unadopted (sync-rules --check will report it)`,
+        )
+      }
+    } catch (e) {
+      if (strict) throw e
+      console.error(`note: projection-state reconcile skipped: ${e?.message ?? e}`)
+    }
+  }
+  return { copied, unadopted }
+}
+
+function moveTree(src: string, dst: string) {
+  mkdirSync(dirname(dst), { recursive: true })
+  try {
+    renameSync(src, dst)
+  } catch (e) {
+    if (e?.code !== 'EXDEV') throw e
+    cpSync(src, dst, { recursive: true })
+    rmSync(src, { recursive: true, force: true })
+  }
+}
+
+function pruneCompletedSubstrateBackups(backup: string, log: (line: string) => void) {
+  const marker = '.refresh-complete'
+  try {
+    mkdirSync(backup, { recursive: true })
+    writeFileSync(join(backup, marker), '')
+    for (const entry of readdirSync(dirname(backup), { withFileTypes: true })) {
+      const previous = join(dirname(backup), entry.name)
+      if (!entry.isDirectory() || previous === backup || !existsSync(join(previous, marker)))
+        continue
+      rmSync(previous, { recursive: true })
+      log(`  refresh-substrate: pruned completed backup ${previous}`)
+    }
+  } catch (error) {
+    console.error(`warn: refresh-substrate backup pruning failed: ${error?.message ?? error}`)
+  }
+}
+
+/**
+ * TD-1140: re-seed a linked worktree's gitignored clade substrate from main.
+ *
+ * `seedWorktreeCladeSubstrate` never overwrites, so it only helps a worktree that
+ * has no substrate yet. A worktree forked before a clade upgrade and rebased onto
+ * the upgrade commit keeps the old ownership ledger while its tracked projection
+ * files move forward; `sync-rules --check` then reads every refreshed file as a
+ * local edit. This moves the stale substrate aside (into the worktree's own git
+ * dir, never the working tree) and runs the same seed + reconcile that `add` runs,
+ * so one ownership rule covers fork time and rebase time.
+ *
+ * Only gitignored paths main can supply are moved: a tracked `.agents/constitution/`
+ * stays put, only the ignored `.agents/<child>` entries are refreshed, and a path main
+ * lacks is kept rather than lost. Projection paths the branch changed itself
+ * (`merge-base..HEAD`) are left unadopted so sync-rules reports them instead of
+ * overwriting them. On a seed failure newly created substrate is removed and every
+ * moved tree is restored; if a restore
+ * itself fails, the error names the paths and the backup directory.
+ */
+export function refreshWorktreeCladeSubstrate(
+  consumerRoot: string,
+  wtPath: string,
+  {
+    dryRun = false,
+    log = console.log,
+    seed = seedWorktreeCladeSubstrate,
+    remove = rmSync,
+  }: {
+    dryRun?: boolean
+    log?: (line: string) => void
+    /** Test seam: the seed step, so the restore path can be exercised. */
+    seed?: typeof seedWorktreeCladeSubstrate
+    /** Test seam: deterministic rollback removal failures, including under root. */
+    remove?: typeof rmSync
+  } = {},
+) {
+  if (realpathSync(consumerRoot) === realpathSync(wtPath)) {
+    throw new Error(
+      `refresh-substrate is for linked worktrees; ${wtPath} is the main checkout, whose substrate is the source`,
+    )
+  }
+  if (!existsSync(join(consumerRoot, '.clade', 'projections'))) {
+    throw new Error(
+      `refresh-substrate: ${consumerRoot} has no .clade/projections — run write-mode sync-rules in main first`,
+    )
+  }
+  const ignoredIn = (root: string, rel: string) =>
+    spawnSync('git', ['check-ignore', '-q', rel], { cwd: root }).status === 0
+  // Move a path only when main can supply its replacement: seed skips a missing or
+  // non-ignored source, so moving it anyway would leave the worktree without that
+  // substrate (a missing `.clade/runtime` is the TD-1037 failure itself).
+  const suppliable = (rel: string) =>
+    existsSync(join(wtPath, rel)) &&
+    ignoredIn(wtPath, rel) &&
+    existsSync(join(consumerRoot, rel)) &&
+    ignoredIn(consumerRoot, rel)
+  const moves: string[] = []
+  const kept: string[] = []
+  const substratePaths = [
+    '.clade/projections',
+    '.clade/runtime',
+    '.clade/rules',
+    '.codex',
+    // `.clade/bin/*` shim 的執行期依賴閉包（vendor/signals 等）與 substrate 同
+    // 生命週期：缺的進 absent 由 seed 補、舊的走 suppliable→move-aside 重種。
+    // 單位由 main 的 bin import 決定且互不巢狀（cladeBinShimSeedPaths）——
+    // `.clade/vendor` 根與 `vendor/ledger`（runtime 訊號歷史）不會出現在清單裡。
+    ...cladeBinShimSeedPaths(consumerRoot, wtPath),
+  ]
+  const absent = substratePaths.filter((rel) => !existsSync(join(wtPath, rel)))
+  for (const rel of substratePaths) {
+    if (suppliable(rel)) moves.push(rel)
+    else if (existsSync(join(wtPath, rel)) && ignoredIn(wtPath, rel)) kept.push(rel)
+  }
+  const agentsDir = join(wtPath, '.agents')
+  const agentsSrc = join(consumerRoot, '.agents')
+  if (!existsSync(agentsDir)) absent.push('.agents')
+  else if (existsSync(agentsSrc)) {
+    for (const entry of readdirSync(agentsSrc)) {
+      const rel = `.agents/${entry}`
+      if (!existsSync(join(wtPath, rel))) absent.push(rel)
+    }
+  }
+  if (existsSync(agentsDir)) {
+    if (ignoredIn(wtPath, '.agents')) {
+      if (suppliable('.agents')) moves.push('.agents')
+      else kept.push('.agents')
+    } else
+      for (const entry of readdirSync(agentsDir)) {
+        const rel = `.agents/${entry}`
+        if (suppliable(rel)) moves.push(rel)
+        else if (ignoredIn(wtPath, rel)) kept.push(rel)
+      }
+  }
+  if (dryRun) {
+    for (const rel of moves) log(`  refresh-substrate (dry-run): would move aside ${rel}`)
+    for (const rel of kept)
+      log(`  refresh-substrate (dry-run): would keep ${rel} (main cannot supply it)`)
+    return { backup: null, moved: moves, kept, copied: [] as string[], unadopted: [] as string[] }
+  }
+  // Projection paths this branch changed itself must not be adopted by reconcile.
+  const mainHead = execFileSync('git', ['rev-parse', 'HEAD'], {
+    cwd: consumerRoot,
+    encoding: 'utf8',
+  }).trim()
+  const base = spawnSync('git', ['merge-base', 'HEAD', mainHead], {
+    cwd: wtPath,
+    encoding: 'utf8',
+  })
+  const branchChanged = new Set<string>(
+    base.status === 0
+      ? execFileSync('git', ['diff', '--name-only', '-z', base.stdout.trim(), 'HEAD'], {
+          cwd: wtPath,
+          encoding: 'utf8',
+        })
+          .split('\0')
+          .filter(Boolean)
+      : [],
+  )
+  const gitDir = execFileSync('git', ['rev-parse', '--absolute-git-dir'], {
+    cwd: wtPath,
+    encoding: 'utf8',
+  }).trim()
+  const backup = join(
+    gitDir,
+    'clade-substrate-backup',
+    `${new Date().toISOString().replace(/[:.]/g, '-')}-${randomUUID()}`,
+  )
+  const moved: string[] = []
+  let seeded: ReturnType<typeof seedWorktreeCladeSubstrate>
+  try {
+    for (const rel of moves) {
+      moveTree(join(wtPath, rel), join(backup, rel))
+      moved.push(rel)
+    }
+    seeded = seed(consumerRoot, wtPath, { strict: true, branchChanged, log })
+    // Ownership states only the worktree held (main has no such ledger) are put back
+    // unchanged: dropping them would turn every file they own into a local conflict.
+    if (moved.includes('.clade/projections')) {
+      const oldDir = join(backup, '.clade/projections')
+      for (const name of readdirSync(oldDir)) {
+        const dst = join(wtPath, '.clade/projections', name)
+        if (existsSync(dst)) continue
+        cpSync(join(oldDir, name), dst, { recursive: true })
+        log(`  refresh-substrate: kept worktree-only .clade/projections/${name}`)
+      }
+    }
+  } catch (e) {
+    // Restore every moved path even if one of them fails, and never let a restore
+    // failure hide the seed error.
+    const failed: string[] = []
+    for (const rel of absent) {
+      try {
+        remove(join(wtPath, rel), { recursive: true, force: true })
+      } catch (cleanupErr) {
+        failed.push(`${rel} (${cleanupErr?.message ?? cleanupErr})`)
+      }
+    }
+    for (const rel of moved) {
+      try {
+        remove(join(wtPath, rel), { recursive: true, force: true })
+        moveTree(join(backup, rel), join(wtPath, rel))
+      } catch (restoreErr) {
+        failed.push(`${rel} (${restoreErr?.message ?? restoreErr})`)
+      }
+    }
+    if (failed.length === 0) throw e
+    throw new Error(
+      `refresh-substrate: seed failed (${e?.message ?? e}) and restoring ${failed.join(', ')} also failed — the previous substrate is at ${backup}; move those paths back by hand`,
+      { cause: e },
+    )
+  }
+  pruneCompletedSubstrateBackups(backup, log)
+  log(`  refresh-substrate: previous substrate kept at ${backup}`)
+  return { backup, moved, kept, copied: seeded.copied, unadopted: seeded.unadopted }
+}
+
+async function cmdRefreshSubstrate(slug, opts) {
+  const consumerRoot = findConsumerRoot()
+  const wtPath = slug ? findCleanupWorktree(consumerRoot, makeSlugSafe(slug)).path : findRepoTop()
+  // --json: stdout carries exactly one JSON object; progress goes to stderr.
+  const result = refreshWorktreeCladeSubstrate(consumerRoot, wtPath, {
+    dryRun: opts.dryRun,
+    log: opts.json ? (line) => console.error(line) : console.log,
+  })
+  if (opts.json) {
+    console.log(JSON.stringify({ worktree: wtPath, ...result }))
+    return
+  }
+  console.log(
+    opts.dryRun
+      ? `refresh-substrate (dry-run): ${result.moved.length} gitignored substrate path(s) in ${wtPath} would be re-seeded from ${consumerRoot}`
+      : `refresh-substrate: ${wtPath} re-seeded from ${consumerRoot} (moved ${result.moved.length}, copied ${result.copied.length}); run 'node scripts/sync-rules.ts --check' there to confirm`,
+  )
+}
+
+/**
+ * TD-187: copy the gitignored env files consumer-meta declares in dev.envSyncPolicy.filesToCopy
+ * (e.g. .env.local) from main into a new worktree, so the dev server starts with DB credentials,
+ * tunnel keys, etc. Warn-only on failure unless strict.
+ *
+ * The policy is read from main (consumerRoot), the same place the files come from. The worktree's
+ * own consumer-meta is never consulted: a branch older than the policy carries an empty or missing
+ * filesToCopy.
+ */
+export function copyEnvSyncFiles(
+  consumerRoot: string,
+  wtPath: string,
+  { strict = false, log = console.log }: { strict?: boolean; log?: (msg: string) => void } = {},
+) {
+  const consumerMetaPath = join(consumerRoot, '.claude', 'consumer-meta.json')
+  if (!existsSync(consumerMetaPath)) return
+  try {
+    const meta = JSON.parse(readFileSync(consumerMetaPath, 'utf8'))
+    const filesToCopy = meta?.dev?.envSyncPolicy?.filesToCopy ?? []
+    if (filesToCopy.length === 0) {
+      log(
+        `  env-bootstrap: policy read from ${consumerMetaPath}; dev.envSyncPolicy.filesToCopy is empty, nothing copied`,
+      )
+      return
+    }
+    log(`  env-bootstrap: policy read from ${consumerMetaPath}`)
+    let copied = 0
+    for (const f of filesToCopy) {
+      const src = join(consumerRoot, f)
+      const dst = join(wtPath, f)
+      if (existsSync(src) && !existsSync(dst)) {
+        mkdirSync(dirname(dst), { recursive: true })
+        copyFileSync(src, dst)
+        copied++
+      }
+    }
+    if (copied > 0) {
+      log(`  env-bootstrap: copied ${copied} file(s) from main (${filesToCopy.join(', ')})`)
+    }
+    // The copy above deliberately carries dev credentials, but tunnel keys
+    // are the one class that cannot be shared — see TUNNEL_ENV_KEYS.
+    const risk = detectSharedTunnelRisk(wtPath, consumerRoot)
+    if (risk) {
+      console.error(
+        `note: ${risk.file} carries tunnel keys and this consumer has no dev.perWorktreeTunnel.\n` +
+          `      Starting a tunnel here claims main's hostname. Either opt into\n` +
+          `      dev.perWorktreeTunnel (consumer-meta.json) or keep the tunnel on main only.`,
+      )
+    }
+  } catch (e) {
+    if (strict) throw e
+    console.error(`note: env-bootstrap skipped: ${e.message ?? e}`)
+  }
+}
+
+export function bootstrapWorktreeRuntime(
+  consumerRoot: string,
+  wtPath: string,
+  { strict = false } = {},
+) {
+  const log = strict ? console.error : console.log
+  setupBriefExclude(wtPath)
+
+  // TD-321: `.clade/bin/` 整個在 consumer .gitignore 內，而 `git worktree` fork 只帶
+  // tracked 檔案 —— 新 worktree 因此沒有 clade-gate，`pnpm test`（直接呼叫
+  // `.clade/bin/clade-gate`，無 fallback）立刻以 "not found" 失敗，訊息指不到根因。
+  // 寫入者是 propagate.ts，而它只寫 consumer main root，永遠不會碰 worktree，所以在
+  // fork 當下從 main 複製一份（含 exec bit）。Warn-only：consumer 沒有 .clade/bin 就跳過。
+  try {
+    const binSrcDir = join(consumerRoot, '.clade', 'bin')
+    if (existsSync(binSrcDir)) {
+      const binDstDir = join(wtPath, '.clade', 'bin')
+      let copied = 0
+      for (const entry of readdirSync(binSrcDir)) {
+        const src = join(binSrcDir, entry)
+        const dst = join(binDstDir, entry)
+        // 逐檔判 gitignore，不是判整個 `.clade/`：多數 consumer 把 `.clade/bin/*`
+        // **tracked** 進 git（worktree fork 自帶，本來就不缺），只 ignore
+        // `.clade/runtime/` 之類。對非 ignored 的檔照複製會留下使用者從沒寫過的
+        // untracked 檔，接著 merge-back / cleanup 的 uncommitted-files gate 就擋在
+        // 那上面。per-entry try 讓 dangling symlink 只跳過自己，不吃掉其餘檔。
+        try {
+          if (!statSync(src).isFile() || existsSync(dst)) continue
+          const rel = relative(consumerRoot, src)
+          if (spawnSync('git', ['check-ignore', '-q', rel], { cwd: consumerRoot }).status !== 0) {
+            continue
+          }
+          mkdirSync(binDstDir, { recursive: true })
+          copyFileSync(src, dst)
+          chmodSync(dst, statSync(src).mode & 0o777)
+          copied++
+        } catch (entryErr) {
+          if (strict) throw entryErr
+          console.error(`note: .clade/bin/${entry} copy skipped: ${entryErr?.message ?? entryErr}`)
+        }
+      }
+      if (copied > 0) log(`  clade-bin: copied ${copied} executable(s) from main`)
+    }
+  } catch (e) {
+    if (strict) throw e
+    console.error(`note: .clade/bin copy skipped: ${e?.message ?? e}`)
+  }
+
+  seedWorktreeCladeSubstrate(consumerRoot, wtPath, { strict, log })
+
+  // TD-614: link gitignored runtime files (consumers.local …) from main root.
+  {
+    const linked = linkGitignoredRuntimeFiles(consumerRoot, wtPath, undefined, strict)
+    if (linked.length > 0) {
+      log(
+        `  runtime-link: symlinked ${linked.join(', ')} from main (gitignored, fleet audits read it)`,
+      )
+    }
+  }
+
+  copyEnvSyncFiles(consumerRoot, wtPath, { strict, log })
+
+  // Dev-port slot for this worktree (TD-434). Must run before the "ready"
+  // announce so the port shows up alongside the cd hint.
+  // 分配器對 sibling 紀錄腐壞、鎖被佔等狀況是 throw——但 worktree 此時已經
+  // fork 出來了，在這裡炸掉等於吃掉後面整段 setup。照 add 的 warn-only 慣例
+  // 記 note 放行，槽位留下次 `wt-helper dev`（ensure 路徑）再配。
+  let devPortRecord = null
+  let devPortSkipped = false
+  try {
+    devPortRecord = allocateWorktreeDevPorts(consumerRoot, wtPath)
+  } catch (e) {
+    if (strict) throw e
+    devPortSkipped = true
+    console.error(`note: dev-port allocation skipped: ${e?.message ?? e}`)
+  }
+  if (devPortRecord) {
+    const shown = devPortRecord.ports.map((p) => `${p.alias}=${p.port}`).join(' ')
+    log(`  dev-port: offset +${devPortRecord.offset} → ${shown} (run 'wt-helper dev')`)
+    // Warn while a slot is still gettable, not once the band is already full:
+    // by then the worktree that needed the warning is the one that cannot get a
+    // slot, and its work stalls at whatever step needed a dev server.
+    const declared = readDeclaredDevPorts(consumerRoot)
+    const capacity = devPortCapacity(declared)
+    const held = devPortHolders(consumerRoot).length
+    if (capacity > 0 && held >= capacity - 1) {
+      console.error(
+        `note: dev-port capacity ${held}/${capacity} after this allocation — the next worktree gets none.\n` +
+          `      Land a finished one ('wt-helper merge-back <slug>') to keep a slot available.`,
+      )
+    }
+  } else if (!devPortSkipped && readDeclaredDevPorts(consumerRoot).length > 0) {
+    if (strict)
+      throw new Error(devPortExhaustedReport(consumerRoot, readDeclaredDevPorts(consumerRoot)))
+    console.error(
+      `note: 'wt-helper dev' will refuse to start in this worktree.\n` +
+        devPortExhaustedReport(consumerRoot, readDeclaredDevPorts(consumerRoot))
+          .split('\n')
+          .map((l) => `      ${l}`)
+          .join('\n'),
+    )
+  }
+
+  // Per-worktree resource provisioning (isolated dev DB clone + sidecar).
+  // Runs after the env-file copy above so the bootstrap script can read the
+  // credentials it needs. No-op for consumers without wt-env-bootstrap.ts.
+  // `ensure` 沒 throw 不等於 REST 可用：容量不足時 consumer 可以回 `created`＋`sidecarDeferred`
+  // 而不失敗。這幾行是建樹的人唯一看得到的狀態，NEVER 退回只印 dbName → url（deferred 時
+  // url 是 undefined，印出來的 `→ undefined` 看不出這棵樹沒有 REST）。
+  const envBootstrap = runWtEnvBootstrap(wtPath, 'ensure')
+  for (const line of describeEnsureResult(envBootstrap, wtPath)) log(`  ${line}`)
+}
+
+function processStatFields(value: string): string[] | undefined {
+  const close = value.lastIndexOf(') ')
+  if (close === -1) return undefined
+  const fields = value
+    .slice(close + 2)
+    .trim()
+    .split(/\s+/)
+  return fields.length >= 18 ? fields : undefined
+}
+
+function processStatIsKernelThread(value: string): boolean {
+  const fields = processStatFields(value)
+  if (!fields) return false
+  try {
+    return (BigInt(fields[6]) & 0x20_0000n) !== 0n
+  } catch {
+    return false
+  }
+}
+
+function processStatIsExited(value: string): boolean {
+  const fields = processStatFields(value)
+  if (!fields || !['Z', 'X', 'x'].includes(fields[0])) return false
+  return fields[17] === '1'
+}
+
+// The credentials under which a process could modify the tree: an entry's
+// owner can always chmod it writable, other-write bits grant every uid access,
+// and group-write bits grant access to processes carrying that gid (the group
+// bits also reflect the POSIX ACL mask). Collected in one walk so the probe
+// can answer per-process writability instead of treating any group/other bit
+// as writable by every foreign uid — that over-approximation made unrelated
+// daemons (systemd-resolve, containerized postgres, pid 1) wedge cleanup on
+// any tree containing a group-writable file.
+// A fully sealed directory cannot be traversed by any non-root UID — not even
+// its owner — so nothing beneath it is reachable by a foreign writer
+// regardless of the permissions recorded inside; its own uid is still
+// recorded, since that owner can reopen it.
+function treeWritableCredentials(root: string, ownerUid: number) {
+  const uids = new Set<number>()
+  const gids = new Set<number>()
+  let other = false
+  const see = (st: { uid: number; gid: number; mode: number }) => {
+    if (st.uid !== ownerUid) uids.add(st.uid)
+    if (st.mode & 0o002) other = true
+    if (st.mode & 0o020) gids.add(st.gid)
+  }
+  const stack = [root]
+  while (stack.length) {
+    const dir = stack.pop()!
+    let st
+    try {
+      st = lstatSync(dir)
+    } catch {
+      // An entry that cannot be inspected might be other-writable.
+      other = true
+      continue
+    }
+    see(st)
+    if ((st.mode & 0o777) === 0) continue
+    let entries
+    try {
+      entries = readdirSync(dir, { withFileTypes: true })
+    } catch {
+      other = true
+      continue
+    }
+    for (const e of entries) {
+      const p = join(dir, e.name)
+      try {
+        st = lstatSync(p)
+      } catch {
+        other = true
+        continue
+      }
+      if (st.isSymbolicLink()) continue
+      see(st)
+      if (st.isDirectory()) stack.push(p)
+    }
+  }
+  return { uids, gids, other }
+}
+
+// Writability is recomputed from the live tree on every probe, so permission
+// changes cannot preserve a stale answer. A directory sealed to mode 000 by
+// an interrupted run reads as non-foreign-writable by construction — no
+// non-root UID can open beneath it.
+// A maps pathname is everything after the fifth field; splitting on runs of
+// whitespace would corrupt paths that themselves contain repeated spaces.
+function mapsPathname(line: string): string {
+  const match = line.match(/^\s*(?:\S+\s+){5}(.*)$/)
+  return match ? match[1] : ''
+}
+
+export function probeLiveWriterCwd(path: string) {
+  const target = resolve(path)
+  if (!existsSync(target)) return
+  if (!existsSync('/proc'))
+    throw new Error('exclusive writer ownership control unavailable; /proc is missing')
+  const ownerUid = statSync(target).uid
+  const writableCreds = treeWritableCredentials(target, ownerUid)
+  const writableByProc = (uid: number, procGids: ReadonlySet<number>) =>
+    writableCreds.other ||
+    writableCreds.uids.has(uid) ||
+    [...procGids].some((g) => writableCreds.gids.has(g))
+  // Classify a process whose task state we cannot read. A foreign-uid process
+  // is a writer signal only when the tree grants ITS credential write access;
+  // otherwise its state is outside the enforceable boundary. Root-owned
+  // processes can write regardless of permission bits and cannot be observed
+  // by an unprivileged prober — that residual is inherent to userspace
+  // probing, not waived by choice, so they are exempt rather than a
+  // fail-closed block that can never clear. A same-uid process whose state is
+  // unreadable is non-dumpable (systemd --user, tailscaled, container
+  // helpers): its cwd/fd/maps are unobservable to us either way, so it is the
+  // same inherent blind spot, not a writer signal. Uid-unknown processes fail
+  // closed unless positively identified as kernel threads or single-thread
+  // exits.
+  const unreadableDisposition = (pid: string): 'gone' | 'benign' | 'exempt' | 'block' => {
+    if (!existsSync(`/proc/${pid}`)) return 'gone'
+    // /proc/<pid> directory ownership reports root for non-dumpable
+    // processes, mislabeling an actual same-UID writer as foreign. The
+    // status file's filesystem UID (the credential file access checks use)
+    // stays readable for them; the same file carries fsgid and the
+    // supplementary group list the writability check needs.
+    let uid: number | undefined
+    const procGids = new Set<number>()
+    try {
+      const status = readFileSync(`/proc/${pid}/status`, 'utf8')
+      const uidLine = status.match(/^Uid:\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)/m)
+      if (uidLine) uid = Number(uidLine[4])
+      const gidLine = status.match(/^Gid:\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)/m)
+      if (gidLine) procGids.add(Number(gidLine[4]))
+      const groupsLine = status.match(/^Groups:\s*(.*)$/m)
+      for (const g of (groupsLine?.[1] ?? '').trim().split(/\s+/)) if (g) procGids.add(Number(g))
+    } catch {
+      // Fall through to the directory owner estimate.
+    }
+    if (uid === undefined)
+      try {
+        uid = statSync(`/proc/${pid}`).uid
+      } catch {
+        // Keep uid unknown; without it the process fails closed below.
+      }
+    if (uid !== undefined) {
+      if (uid === ownerUid) return 'exempt'
+      // Root bypasses permission bits and an unprivileged prober cannot read
+      // its cwd/fd/maps at all — blocking on it wedged every cleanup on pid 1.
+      if (uid === 0) return 'exempt'
+      if (!writableByProc(uid, procGids)) return 'benign'
+    }
+    let kernelThread = false
+    let exited = false
+    try {
+      const processStat = readFileSync(`/proc/${pid}/stat`, 'utf8')
+      kernelThread = processStatIsKernelThread(processStat)
+      exited = processStatIsExited(processStat)
+    } catch {
+      // Missing or malformed process state grants neither exemption.
+    }
+    if (kernelThread || exited) return 'exempt'
+    return 'block'
+  }
+  const occupies = (p: string) => p === target || p.startsWith(`${target}/`)
+  for (const pid of readdirSync('/proc')) {
+    if (!/^\d+$/.test(pid)) continue
+    // Threads can unshare their cwd and fd tables (CLONE_FS off), so every
+    // task under the pid needs its own links inspected.
+    let tasks: string[]
+    try {
+      tasks = readdirSync(`/proc/${pid}/task`)
+    } catch {
+      const d = unreadableDisposition(pid)
+      if (d === 'block')
+        throw new Error(
+          `exclusive writer ownership control unavailable; unreadable task list for pid ${pid}`,
+        )
+      continue
+    }
+    for (const tid of tasks) {
+      const taskDir = `/proc/${pid}/task/${tid}`
+      let cwd: string
+      try {
+        cwd = readlinkSync(`${taskDir}/cwd`)
+      } catch {
+        if (!existsSync(taskDir)) continue
+        const d = unreadableDisposition(pid)
+        if (d === 'block')
+          throw new Error(
+            `exclusive writer ownership control unavailable; unreadable cwd for pid ${pid} tid ${tid}`,
+          )
+        continue
+      }
+      if (occupies(cwd)) throw new Error(`live writer cwd occupies ${path}`)
+      let fds: string[]
+      try {
+        fds = readdirSync(`${taskDir}/fd`)
+      } catch {
+        if (!existsSync(taskDir)) continue
+        const d = unreadableDisposition(pid)
+        if (d === 'block')
+          throw new Error(
+            `exclusive writer ownership control unavailable; unreadable fd table for pid ${pid} tid ${tid}`,
+          )
+        continue
+      }
+      for (const fd of fds) {
+        let dest: string
+        try {
+          dest = readlinkSync(`${taskDir}/fd/${fd}`)
+        } catch {
+          continue
+        }
+        // A deleted descriptor still occupies the tree: the holder keeps an
+        // inode alive whose bytes never entered the inventory — closing it
+        // before the post-removal scan would leave those bytes nowhere.
+        if (occupies(dest.replace(/ \(deleted\)$/, '')))
+          throw new Error(`live writer open handle occupies ${path}`)
+      }
+      // A shared writable mapping survives its descriptor being closed, so a
+      // writer that mmap'd a tree file would pass the fd scan — check maps.
+      let maps: string
+      try {
+        maps = readFileSync(`${taskDir}/maps`, 'utf8')
+      } catch {
+        if (!existsSync(taskDir)) continue
+        const d = unreadableDisposition(pid)
+        if (d === 'block')
+          throw new Error(
+            `exclusive writer ownership control unavailable; unreadable maps for pid ${pid} tid ${tid}`,
+          )
+        continue
+      }
+      for (const line of maps.split('\n')) {
+        const mapped = mapsPathname(line)
+        if (!mapped) continue
+        if (occupies(mapped.replace(/ \(deleted\)$/, '')))
+          throw new Error(`live writer shared mapping occupies ${path}`)
+      }
+    }
+  }
+}
+
+// After a successful removal the target is gone, but a process that held a
+// cwd or fd into the tree still shows it — as `<path> (deleted)` when the
+// entry was unlinked, or as the trash path when the tree was renamed rather
+// than deleted. Detecting those handles cannot restore bytes written during
+// removal; it turns silent loss into a loud retention note so the
+// preservation archive's cutoff is known to be earlier than the last write.
+// `extraRoots` carries the destinations a rename-based removal moved bytes
+// to (trash tree and trashed metadata dirs) plus their original paths, so a
+// still-open handle into any of them is reported too.
+function probeDeletedHandles(path: string, extraRoots: string[] = []) {
+  if (!existsSync('/proc'))
+    throw new Error('exclusive writer ownership control unavailable; /proc is missing')
+  const target = resolve(path)
+  const quarantinePrefix = join(dirname(target), `.clade-removing-${basename(target)}-`)
+  const held = (dest: string) => {
+    const deleted = dest.endsWith(' (deleted)')
+    const p = deleted ? dest.slice(0, -' (deleted)'.length) : dest
+    if (p === target || p.startsWith(`${target}/`)) return true
+    if (deleted && p.startsWith(quarantinePrefix)) return true
+    return extraRoots.some((pre) => p.startsWith(pre))
+  }
+  for (const pid of readdirSync('/proc')) {
+    if (!/^\d+$/.test(pid)) continue
+    let tasks: string[]
+    try {
+      tasks = readdirSync(`/proc/${pid}/task`)
+    } catch {
+      continue
+    }
+    for (const tid of tasks) {
+      const taskDir = `/proc/${pid}/task/${tid}`
+      let cwd: string | undefined
+      try {
+        cwd = readlinkSync(`${taskDir}/cwd`)
+      } catch {
+        // Unreadable or gone; post-removal detection cannot cover it.
+      }
+      if (cwd && held(cwd))
+        throw new Error(
+          `writer held cwd into removed tree ${path}; archive may predate final writes`,
+        )
+      let fds: string[]
+      try {
+        fds = readdirSync(`${taskDir}/fd`)
+      } catch {
+        continue
+      }
+      for (const fd of fds) {
+        let dest: string
+        try {
+          dest = readlinkSync(`${taskDir}/fd/${fd}`)
+        } catch {
+          continue
+        }
+        if (held(dest))
+          throw new Error(
+            `writer held open handle into removed tree ${path}; archive may predate final writes`,
+          )
+      }
+      let maps: string | undefined
+      try {
+        maps = readFileSync(`${taskDir}/maps`, 'utf8')
+      } catch {
+        // Unreadable or gone; post-removal detection cannot cover it.
+      }
+      if (maps)
+        for (const line of maps.split('\n')) {
+          const mapped = mapsPathname(line)
+          if (mapped && held(mapped))
+            throw new Error(
+              `writer held shared mapping into removed tree ${path}; archive may predate final writes`,
+            )
+        }
+    }
+  }
+}
+
+function withProbedExclusiveWriterOwnership<T>(_main: string, path: string, operation: () => T): T {
+  probeLiveWriterCwd(path)
+  const result = operation()
+  if (existsSync(path)) probeLiveWriterCwd(path)
+  return result
+}
+
+/**
+ * linked worktree 的 git hook 目錄。
+ *
+ * `core.hooksPath` 存在共用的 `.git/config`；husky 寫的是相對路徑（`.husky/_`），
+ * 所以每棵 worktree 都要有自己的那個目錄，而它是 gitignored 的生成物——checkout
+ * 不會帶。pnpm 在 `Already up to date` 時不跑 `prepare`，於是 `wt-helper add` 開的樹
+ * 靜默沒有 hook：2026-09-24 實測一個 PR 的 16 筆 commit 沒有一筆跑過 commit-msg，
+ * 其中 5 筆 header 非法。缺目錄時跑一次 `pnpm run prepare`；跑完仍缺就回 `missing`
+ * 讓呼叫端出聲，NEVER 靜默放行。
+ */
+export function ensureWorktreeGitHooks(wtPath: string): {
+  state: 'not-applicable' | 'present' | 'installed' | 'missing'
+  hooksPath?: string
+  detail?: string
+} {
+  const cfg = spawnSync('git', ['-C', wtPath, 'config', '--get', 'core.hooksPath'], {
+    encoding: 'utf8',
+  })
+  const hooksPath = cfg.status === 0 ? cfg.stdout.trim() : ''
+  if (!hooksPath || hooksPath.startsWith('/') || hooksPath.startsWith('~')) {
+    return { state: 'not-applicable' }
+  }
+  const dir = join(wtPath, hooksPath)
+  if (existsSync(dir)) return { state: 'present', hooksPath }
+  let hasPrepare = false
+  try {
+    const pkg = JSON.parse(readFileSync(join(wtPath, 'package.json'), 'utf8'))
+    hasPrepare = typeof pkg?.scripts?.prepare === 'string'
+  } catch {}
+  if (!hasPrepare) {
+    return { state: 'missing', hooksPath, detail: 'package.json 沒有 prepare script，無從生成' }
+  }
+  const run = spawnSync('pnpm', ['run', 'prepare'], {
+    cwd: wtPath,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+    timeout: 60_000,
+  })
+  if (existsSync(dir)) return { state: 'installed', hooksPath }
+  // pnpm 不存在（ENOENT）或 timeout 被 SIGTERM 時 status 是 null，真因只在 error／signal。
+  const why = run.error
+    ? run.error.message
+    : run.signal
+      ? `killed by ${run.signal}（timeout 60s？）`
+      : ((run.stderr || run.stdout || '').trim().split('\n').slice(-1)[0] ?? '')
+  return {
+    state: 'missing',
+    hooksPath,
+    detail: `pnpm run prepare exited ${run.status}${why ? ` — ${why}` : ''}`,
+  }
+}
+
+export function destroyWorktreeRuntime(
+  consumerRoot: string,
+  wtPath: string,
+  beforePrivateMetadataRemoval?: () => void,
+) {
+  // Teardown runs the main checkout's shim, never the removed tree's own copy —
+  // see `WtEnvBootstrapOptions.scriptRoot`. A tree forked before a slug form
+  // existed cannot recognise its own branch, so it can never release itself.
+  teardownWorktreeSubmodules(wtPath, beforePrivateMetadataRemoval)
+  const result = runWtEnvBootstrap(wtPath, 'destroy', { scriptRoot: consumerRoot })
+  if (result?.status === 'orphan-recorded')
+    throw new Error('Worktree backing resources remain; retain and retry cleanup')
+}
+
+/**
+ * Detach clean submodules before removing a worktree. Git refuses to remove a
+ * worktree which contains a submodule, even when the superproject is clean.
+ * This helper deliberately omits force: a dirty or otherwise un-detachable
+ * submodule makes teardown fail closed and the caller retains the worktree.
+ */
+export function teardownWorktreeSubmodules(
+  wtPath: string,
+  beforePrivateMetadataRemoval?: () => void,
+) {
+  let before = ''
+  try {
+    before = execFileSync('git', ['submodule', 'status', '--recursive'], {
+      cwd: wtPath,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }).trim()
+  } catch (error) {
+    throw new Error(`submodule status failed; retain worktree: ${error.message ?? error}`, {
+      cause: error,
+    })
+  }
+  const paths = before
+    .split('\n')
+    // `submodule status` appends ` (<describe>)` for initialized modules;
+    // the path must match .gitmodules, not the decorated column.
+    .map((line) =>
+      line
+        .trim()
+        .replace(/^[-+U]?[0-9a-f]+\s+/, '')
+        .replace(/\s+\([^)]*\)$/, ''),
+    )
+    .filter(Boolean)
+  if (before) {
+    try {
+      execFileSync('git', ['submodule', 'deinit', '--all'], {
+        cwd: wtPath,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      })
+    } catch (error) {
+      throw new Error(`submodule teardown refused; retain worktree: ${error.message ?? error}`, {
+        cause: error,
+      })
+    }
+  }
+
+  let after = ''
+  try {
+    after = execFileSync('git', ['submodule', 'status', '--recursive'], {
+      cwd: wtPath,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }).trim()
+  } catch (error) {
+    throw new Error(
+      `submodule teardown verification failed; retain worktree: ${error.message ?? error}`,
+      { cause: error },
+    )
+  }
+  // `git submodule status` reports a successfully deinitialized module with a
+  // leading `-<sha>`. Only initialized (` `), dirty (`+`) or missing (`U`)
+  // entries mean teardown did not finish.
+  const remaining = after
+    .split('\n')
+    .filter(Boolean)
+    .filter((line) => !line.trim().startsWith('-'))
+  if (remaining.length)
+    throw new Error(`submodule teardown incomplete (${remaining.join(' / ')}); retain worktree`)
+  const configuredPaths = (() => {
+    try {
+      return execFileSync('git', ['config', '--file', '.gitmodules', '--get-regexp', '\\.path$'], {
+        cwd: wtPath,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      })
+        .trim()
+        .split('\n')
+        .filter(Boolean)
+        .map((line) => line.replace(/^\S+\s+/, ''))
+    } catch {
+      return []
+    }
+  })()
+  const allPaths = [...new Set([...paths, ...configuredPaths])]
+  for (const rel of allPaths) {
+    const directory = join(wtPath, rel)
+    if (!existsSync(directory)) continue
+    const stat = lstatSync(directory)
+    if (!stat.isDirectory() || stat.isSymbolicLink())
+      throw new Error(`submodule path is not a plain directory (${rel}); retain worktree`)
+    if (readdirSync(directory).length)
+      throw new Error(`deinitialized submodule still has local files (${rel}); retain worktree`)
+  }
+  detachWorktreeSubmodulesMetadata(wtPath, beforePrivateMetadataRemoval)
+  return { count: allPaths.length, paths: allPaths }
+}
+
+// Recent Git versions create a private module repository below the linked
+// worktree's administrative directory. `submodule deinit` clears the
+// checkout but can leave that metadata behind when the module was already
+// detached or when its nested module had a stale worktree pointer. Git then
+// refuses to move or remove the worktree even though every checkout is
+// gone. The metadata must leave the `modules` name, but unlinking it would
+// destroy a write that races teardown — rename it inside the same
+// administrative dir instead. Git's populated-submodule check must pass too:
+// a gitlink whose `.git` resolves to a live module repository still refuses
+// the move, while a *dangling* one breaks `git status` — so each checkout
+// `.git` is renamed aside (`.git.clade-detached`), keeping the submodule
+// unpopulated with every byte recoverable. The canonical modules under the
+// main repository are untouched. A prior teardown can leave a torn-down
+// generation behind when the worktree was retained and its submodules
+// reinitialized — collide once and the destination gains a suffix rather
+// than failing a clean retry.
+// The teardown journal sits inside the worktree's private Git dir —
+// operational metadata, durable with the tree and excluded from inventory
+// comparisons like `.clade-trashed-meta-*`. Every rename is recorded BEFORE
+// it executes: a crash mid-teardown leaves a journal that names exactly
+// what was detached, so restore never has to guess from filename prefixes
+// or rank torn-down generations by mtime.
+function teardownJournalPath(privateGitDir: string): string {
+  return join(privateGitDir, WT_TEARDOWN_JOURNAL_NAME)
+}
+
+// An fd whose last append could not be cut back to a clean line boundary.
+// Any further write would fuse a new record onto the torn tail, so appends
+// on a poisoned fd refuse outright — the teardown retains rather than
+// journal garbage.
+const poisonedJournalFds = new Set<number>()
+
+// A journal line is only durable once the fd is fsynced — a bare write can
+// lose the record to a machine crash while the rename it precedes still
+// persists, which is exactly the unrecorded-detach hole the journal exists
+// to close.
+function journalAppend(fd: number, line: string): void {
+  if (poisonedJournalFds.has(fd))
+    throw new Error('teardown journal fd is poisoned by an earlier torn append')
+  // writeSync may return early on a short write — a truncated record is
+  // worse than none because it still reads as a complete line after the
+  // newline of a later append. Loop until the whole line is durable. And
+  // if the append throws mid-record, the bytes already landed are a torn
+  // tail the NEXT append would fuse onto — cut the file back to the
+  // pre-append size before the error propagates. A truncate failure leaves
+  // no recoverable boundary: poison the fd so nothing appends after the
+  // tear.
+  const sizeBefore = fstatSync(fd).size
+  const buf = Buffer.from(`${line}\n`)
+  try {
+    let off = 0
+    while (off < buf.length) off += writeSync(fd, buf, off, buf.length - off)
+    fsyncSync(fd)
+  } catch (error) {
+    try {
+      ftruncateSync(fd, sizeBefore)
+    } catch {
+      poisonedJournalFds.add(fd)
+    }
+    throw error
+  }
+}
+
+// The OS reuses fd numbers — a poisoned fd that is closed and recycled
+// would wrongly refuse a later journal's appends, so closing drops the
+// poison record alongside the descriptor.
+function journalClose(fd: number): void {
+  poisonedJournalFds.delete(fd)
+  closeSync(fd)
+}
+
+// Opening for append must also repair a torn tail a crash could have left
+// mid-line — otherwise the first new record fuses onto the fragment the
+// same way a swallowed mid-session tear would. The journal is opened
+// O_NOFOLLOW and required to be a regular file: a pre-existing symlink (or
+// fifo/socket) would redirect the tail truncation and every appended
+// record into an unrelated file — the only writes this journal performs
+// are destructive-adjacent recovery records.
+function openJournalForAppend(path: string): number {
+  const fd = openSync(
+    path,
+    fsConstants.O_RDWR | fsConstants.O_APPEND | fsConstants.O_CREAT | fsConstants.O_NOFOLLOW,
+  )
+  try {
+    const stat = fstatSync(fd)
+    if (!stat.isFile()) throw new Error(`Teardown journal is not a regular file: ${path}`)
+    // A multiply-linked journal shares its inode with another name — the
+    // tail repair's ftruncate and every appended record would corrupt the
+    // file that other link names. Reject shared inodes before modifying.
+    if (stat.nlink > 1) throw new Error(`Teardown journal is multiply linked: ${path}`)
+    const size = stat.size
+    if (size === 0) return fd
+    const buf = Buffer.alloc(size)
+    let off = 0
+    while (off < size) off += readSync(fd, buf, off, size - off, off)
+    if (buf[size - 1] === 0x0a) return fd
+    const lastNl = buf.lastIndexOf(0x0a)
+    ftruncateSync(fd, lastNl + 1)
+    fsyncSync(fd)
+    return fd
+  } catch (error) {
+    try {
+      closeSync(fd)
+    } catch {
+      // The original error is the one that matters.
+    }
+    throw error
+  }
+}
+
+// A rename's durability is the parent directory's, not the file's — fsync
+// the dir so a power failure cannot persist a retirement marker while
+// losing the rename it retires.
+function fsyncDir(dir: string): void {
+  const fd = openSync(dir, 'r')
+  try {
+    fsyncSync(fd)
+  } finally {
+    closeSync(fd)
+  }
+}
+
+// A directory fsync persists entry names, not file contents — a rewritten
+// file needs its own fsync before a durable marker may retire its record.
+function fsyncFile(path: string): void {
+  const fd = openSync(path, 'r')
+  try {
+    fsyncSync(fd)
+  } finally {
+    closeSync(fd)
+  }
+}
+
+// `existsSync` follows the final symlink, so a dangling link reads as
+// absent — the wrong answer to "does this name hold an entry a rename
+// would clobber". `lstat` sees the entry itself.
+function lstatPresent(path: string): boolean {
+  try {
+    lstatSync(path)
+    return true
+  } catch {
+    return false
+  }
+}
+
+function detachWorktreeSubmodulesMetadata(
+  wtPath: string,
+  beforePrivateMetadataRemoval?: () => void,
+) {
+  const privateModules = resolve(
+    wtPath,
+    execFileSync('git', ['rev-parse', '--git-path', 'modules'], {
+      cwd: wtPath,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }).trim(),
+  )
+  const privateGitDir = resolve(
+    wtPath,
+    execFileSync('git', ['rev-parse', '--git-dir'], {
+      cwd: wtPath,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }).trim(),
+  )
+  // `worktree move`/`remove` refuse a worktree whose index has a gitlink
+  // resolving to a live module repository, so the checkout's `.git` must be
+  // unresolvable for the move instant — but `git status` fails on a
+  // *dangling* pointer. Renaming the file satisfies both: the submodule is
+  // cleanly unpopulated (status stays clean) and no bytes are unlinked.
+  const realRoot = realpathSync(wtPath)
+  // The journal fd is opened before any rename so an unwritable journal
+  // fails the teardown before a single pointer is detached — an
+  // unrecorded rename must never exist. The parent dir is fsynced too: a
+  // crash must not keep a detach while losing the journal's own dirent.
+  const journalFd = openJournalForAppend(teardownJournalPath(privateGitDir))
+  try {
+    fsyncDir(privateGitDir)
+    if (!existsSync(privateModules)) {
+      // A previous attempt may have renamed `modules` after a checkout
+      // `.git` detach raced and failed: that pointer still names
+      // `modules`, so the tree's `git status` fails on the dangling gitdir
+      // forever. The journal — not the name prefix — identifies which
+      // torn-down generation owns this teardown; a foreign
+      // `.clade-torn-down-modules*` sibling's `core.worktree` must never
+      // drive a detach the journal could not restore, and no record means
+      // no generation may be scanned without guessing.
+      const detached: string[] = []
+      const recordedDir = realDirectory(
+        recordedTornDownClaim(privateGitDir, readTeardownJournal(privateGitDir).tornDown),
+      )
+      if (recordedDir) detached.push(...detachCheckoutPointers(recordedDir, realRoot, journalFd))
+      return detached
+    }
+    const stat = lstatSync(privateModules)
+    if (!stat.isDirectory() || stat.isSymbolicLink() || dirname(privateModules) !== privateGitDir)
+      throw new Error(
+        `unexpected private submodule metadata path (${privateModules}); retain worktree`,
+      )
+    // A still-active `modules` record means an earlier torn-down
+    // generation is journaled as ours; a live `modules` alongside it
+    // means someone recreated the name. A fresh `modules` line would
+    // overwrite that ownership — later restores would then reattach this
+    // generation's pointers against the wrong repository. Retain before
+    // detaching anything.
+    const ownedGeneration = readTeardownJournal(privateGitDir).tornDown
+    if (ownedGeneration !== undefined)
+      throw new Error(
+        `torn-down modules generation ${ownedGeneration} is still journal-owned while a new modules exists; retain worktree`,
+      )
+    let tornDown = join(privateGitDir, '.clade-torn-down-modules')
+    // Physical occupation, not existence: a dangling symlink at the name
+    // is invisible to existsSync and would be clobbered by the rename.
+    if (lstatPresent(tornDown))
+      tornDown = join(privateGitDir, `.clade-torn-down-modules-${randomUUID().slice(0, 8)}`)
+    beforePrivateMetadataRemoval?.()
+    const detached = detachCheckoutPointers(privateModules, realRoot, journalFd)
+    try {
+      journalAppend(journalFd, `modules ${basename(tornDown)}`)
+      renameSync(privateModules, tornDown)
+    } catch (error) {
+      // A rename failure after partial `.git` detaches leaves the worktree
+      // retained — reattach so it stays functional for the owner.
+      reattachWorktreeSubmodules(wtPath, detached)
+      throw new Error(
+        `private submodule metadata teardown failed; retain worktree: ${error.message ?? error}`,
+        { cause: error },
+      )
+    }
+    if (existsSync(privateModules))
+      throw new Error('private submodule metadata remains; retain worktree')
+    return detached
+  } finally {
+    journalClose(journalFd)
+  }
+}
+
+// Every module repository's config names its checkout through
+// `core.worktree`; nested module repos appear under
+// `modules/<a>/modules/<b>` and are reached by recursion. `core.worktree`
+// is operator-controlled config data, so only checkouts resolved inside the
+// worktree are returned — the filesystem path, not the lexical one, so an
+// in-tree symlink cannot route the rename outside `wtPath`, and strict
+// containment keeps a malformed `core.worktree` equal to the worktree root
+// from ever touching the worktree's own `.git`. Containment alone does not
+// make the checkout THIS module's, though — a stale or malformed config
+// can name an unrelated in-tree checkout, and detaching its `.git` would
+// strand a repository we never owned. The checkout must point back: its
+// `.git` is a `gitdir:` pointer (or symlink) resolving to this module dir;
+// a real `.git` directory there is another repository, not our checkout.
+function moduleCheckoutDirs(modulesDir: string, realRoot: string): string[] {
+  const checkouts: string[] = []
+  const scan = (dir: string) => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue
+      const moduleDir = join(dir, entry.name)
+      const config = join(moduleDir, 'config')
+      if (existsSync(config)) {
+        let worktree = ''
+        try {
+          worktree = execFileSync('git', ['config', '--file', config, '--get', 'core.worktree'], {
+            encoding: 'utf8',
+            stdio: ['ignore', 'pipe', 'pipe'],
+          }).trim()
+        } catch {
+          // A module repo without core.worktree has no live checkout.
+        }
+        if (worktree) {
+          try {
+            const realCheckout = realpathSync(resolve(moduleDir, worktree))
+            if (!realCheckout.startsWith(`${realRoot}/`)) {
+              // Escapes the worktree — never ours to detach.
+            } else {
+              const pointer = join(realCheckout, '.git')
+              const st = lstatSync(pointer)
+              let target: string | undefined
+              if (st.isSymbolicLink()) target = resolve(realCheckout, readlinkSync(pointer))
+              else if (st.isFile()) {
+                const line = readFileSync(pointer, 'utf8')
+                  .split('\n')
+                  .find((l) => l.startsWith('gitdir:'))
+                if (line) target = resolve(realCheckout, line.slice(7).trim())
+              }
+              // The checkout must point back at THIS module — and at the
+              // location git recorded for it: `modules/<rel>` beside the
+              // scanned root. Comparing the recorded path, not the live
+              // one, matters when the scan runs against a renamed
+              // generation — the checkout's `.git` still names the
+              // original `modules/` location even though the dir now sits
+              // at a torn-down name, so a realpath compare would dangle.
+              // A `.git` directory or an unparseable pointer is another
+              // repository, not our checkout.
+              const recorded = join(dirname(modulesDir), 'modules', relative(modulesDir, moduleDir))
+              if (target && target === recorded) checkouts.push(realCheckout)
+            }
+          } catch {
+            // A checkout that cannot be resolved has no `.git` to detach.
+          }
+        }
+      }
+      scan(moduleDir)
+    }
+  }
+  scan(modulesDir)
+  return checkouts
+}
+
+// A journaled `modules` record is operator-adjacent on-disk data: only a
+// plain basename under our naming convention may resolve inside the
+// private Git dir. Whether the claimed path exists and is a real
+// directory is the caller's check — reattach must probe the name even
+// when absent to decide retirement.
+function recordedTornDownClaim(
+  privateGitDir: string,
+  tornDown: string | undefined,
+): string | undefined {
+  if (
+    !tornDown ||
+    basename(tornDown) !== tornDown ||
+    !tornDown.startsWith('.clade-torn-down-modules')
+  )
+    return undefined
+  return join(privateGitDir, tornDown)
+}
+
+// Only a real directory is the recorded repository — a symlink or file
+// squatting on the claimed name is foreign data no rename may promote.
+function realDirectory(path: string | undefined): string | undefined {
+  if (!path) return undefined
+  try {
+    const stat = lstatSync(path)
+    if (stat.isDirectory() && !stat.isSymbolicLink()) return path
+  } catch {
+    // Unstatable — not a usable directory.
+  }
+  return undefined
+}
+
+// Rename each listed checkout's `.git` aside so the worktree no longer
+// counts as containing populated submodules; returns the detached paths
+// relative to the worktree root so the caller can journal exactly which
+// renames to undo on restore — reattachment must never guess from filename
+// prefixes, or a pre-existing `.git.clade-detached` would be renamed over
+// a foreign checkout. A checkout that keeps its `.git` stays populated —
+// the move refuses, which retains rather than loses. Checkouts already
+// cleared by `deinit` have no `.git` left to detach.
+function detachCheckoutPointers(modulesDir: string, realRoot: string, journalFd: number): string[] {
+  const detached: string[] = []
+  for (const checkout of moduleCheckoutDirs(modulesDir, realRoot)) {
+    const pointer = join(checkout, '.git')
+    try {
+      if (lstatPresent(pointer)) {
+        let name = `${pointer}.clade-detached`
+        if (lstatPresent(name)) name = `${pointer}.clade-detached-${randomUUID().slice(0, 8)}`
+        // Record BEFORE rename, durably — and let a failed append skip the
+        // rename outright: an unjournaled detach is unrecoverable
+        // ownership, so the checkout keeps its `.git`, the tree stays
+        // populated, the move refuses — retains not loses. A pathological
+        // newline in the recorded path would corrupt the line-based
+        // journal, so the same fail-closed skip covers it.
+        const rel = relative(realRoot, name)
+        if (rel.includes('\n')) continue
+        journalAppend(journalFd, `detach ${rel}`)
+        renameSync(pointer, name)
+        detached.push(rel)
+      }
+    } catch {
+      // An unstatable or racing checkout, a failed journal append, or a
+      // failed rename all keep `.git` in place — populated means the move
+      // refuses, which retains rather than loses.
+    }
+  }
+  return detached
+}
+
+// Undo a completed or partial submodule detach. The teardown journal inside
+// the private Git dir is the source of truth: the LAST `modules` line names
+// the torn-down directory this teardown created (never a guess by mtime or
+// prefix order among retained generations), and every `detach` line names a
+// checkout `.git` rename to undo — unioned with `detached`, the caller's
+// own list. Only recorded names are restored, so a pre-existing
+// `.git.clade-detached` file is never mistaken for our own. Best-effort:
+// anything that cannot be renamed back keeps its detached name as the
+// recovery source.
+export function reattachWorktreeSubmodules(wtPath: string, detached: string[]): void {
+  try {
+    const privateGitDir = resolve(
+      wtPath,
+      execFileSync('git', ['rev-parse', '--git-dir'], {
+        cwd: wtPath,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      }).trim(),
+    )
+    const realRoot = realpathSync(wtPath)
+    const journalPath = join(privateGitDir, WT_TEARDOWN_JOURNAL_NAME)
+    // The journal fold is shared with teardown. The caller's `detached`
+    // list is merged through the same rule — an entry whose last journal
+    // record is `restored` stays retired even when a stale caller still
+    // names it, so a journaled `detachedPointers` from an older run can
+    // never reclaim an owner's own `.git.clade-detached` aside. A caller
+    // entry the journal never recorded still replays: the batch journal
+    // is the fallback when the teardown journal itself is lost.
+    const active = readTeardownJournal(privateGitDir)
+    for (const rel of detached) if (!active.retired.has(rel)) active.detached.add(rel)
+    // Markers retire ownership; they only matter while a journal exists, so
+    // the fd opens lazily on the first write and is fsynced per line.
+    let journalFd: number | undefined
+    const mark = (line: string) => {
+      try {
+        if (journalFd === undefined) {
+          if (!existsSync(journalPath)) return
+          journalFd = openJournalForAppend(journalPath)
+        }
+        journalAppend(journalFd, line)
+      } catch {
+        // A failed marker leaves the record active; replay is idempotent.
+      }
+    }
+    try {
+      const modulesName = join(privateGitDir, 'modules')
+      // Restore the recorded module repository name first so each
+      // reattached `.git` resolves immediately. Only the journaled name
+      // counts — a missing or lost journal means no generation can be
+      // picked without guessing, and an mtime-ranked pick could promote an
+      // unrelated retained generation into the live `modules` name.
+      const recorded = recordedTornDownClaim(privateGitDir, active.tornDown)
+      const recordedDir = realDirectory(recorded)
+      if (!lstatPresent(modulesName)) {
+        try {
+          if (recordedDir) renameSync(recordedDir, modulesName)
+          // The goal state now holds — `modules` is back — or the recorded
+          // generation is gone for good (trashed with its metadata root,
+          // or never created). Either way the record could only ever fire
+          // on a foreign dir later appearing at the name: retire it. The
+          // marker must not outlive the state it retires — an earlier pass
+          // may have completed the rename but died before fsyncing, so
+          // prove the directory durable first whether or not this pass
+          // renamed.
+          if (existsSync(modulesName) || !recorded || !lstatPresent(recorded)) {
+            fsyncDir(privateGitDir)
+            mark('modules-restored')
+          }
+        } catch {
+          // Raced away or durability unproven — the record stays active
+          // and a later replay is idempotent.
+        }
+      } else if (active.tornDown && !(recorded && lstatPresent(recorded))) {
+        // `modules` already back and the recorded generation gone — the
+        // recorded rename completed earlier but its marker was lost to a
+        // crash. That earlier pass may have died before fsyncing the
+        // rename's parent, so prove the present state durable BEFORE
+        // retiring the record — a marker that outlives the rename it
+        // retires drops recovery ownership over a torn-down repository.
+        fsyncDir(privateGitDir)
+        mark('modules-restored')
+      }
+      // `.git` reattachment only runs when `modules` resolves and no
+      // torn-down generation still holds the recorded repository:
+      // restoring a pointer without its module repository would dangle,
+      // and attaching one beside a live torn-down generation could wire
+      // the checkout into a foreign `modules` dir.
+      const unresolvedClaim = Boolean(recorded && lstatPresent(recorded))
+      // `modules` must be a real directory — `existsSync` follows links,
+      // so a symlink squatting on the name would resolve `modulesReal`
+      // into a foreign repository and authorize pointer reconciliation
+      // and `core.worktree` rewrites inside it.
+      let modulesIsDir = false
+      try {
+        modulesIsDir = lstatSync(modulesName).isDirectory()
+      } catch {
+        // Absent or unreadable — nothing to reconcile into.
+      }
+      if (!modulesIsDir || unresolvedClaim) return
+      // `core.worktree` inside the module repo still names the original
+      // checkout path — the tree may now sit at a quarantine or nested
+      // rollback location, so the restored `.git` pointer would wire the
+      // submodule to a stale or foreign recreation. The restored `.git`
+      // file itself names its module repo through `gitdir:` — never infer
+      // the config path from `rel`, because module repos key by submodule
+      // name and nested repos add `modules/` segments. And only rewrite
+      // when the recorded path resolves elsewhere: an unchanged value
+      // keeps the config's bytes identical to the preserved archive.
+      const modulesReal = realpathSync(modulesName)
+      // `false` means reconciliation could not finish but a later replay
+      // still might — the caller must keep the journal record live rather
+      // than retire a potentially dangling pointer. Every other exit is
+      // terminal: reconciled, or foreign data replay can never improve.
+      const reconcileWorktree = (rel: string): boolean => {
+        const checkout = dirname(join(wtPath, rel))
+        const pointer = join(checkout, '.git')
+        // A symlinked `.git` would route the rebase write outside the
+        // tree — only a plain file is ours to rewrite.
+        try {
+          const st = lstatSync(pointer)
+          if (!st.isFile() || st.isSymbolicLink()) return true
+        } catch {
+          return true
+        }
+        const gitdir = readFileSync(pointer, 'utf8')
+          .match(/^gitdir:\s*(.+)$/m)?.[1]
+          ?.trim()
+        if (!gitdir) return true
+        // The recorded gitdir is `<admin>/modules/<chain>`; the admin root
+        // is stable across tree moves — only the value's resolution from
+        // the checkout breaks — so the owning module repo comes from the
+        // recorded chain, never from re-resolving the recorded path. The
+        // chain is read off that admin anchor, not off a `/modules/`
+        // segment a parent path could also contain.
+        const chain = recordedModuleChain(gitdir, checkout, basename(privateGitDir), modulesName)
+        if (!chain) return true
+        let moduleDir: string
+        try {
+          moduleDir = realpathSync(join(modulesName, chain))
+        } catch {
+          // Chain no longer resolves — the module repository may return on
+          // a later pass, so the record stays live for retry.
+          return false
+        }
+        if (moduleDir !== modulesReal && !moduleDir.startsWith(`${modulesReal}/`)) return true
+        // The extracted chain is a hint; the module's own recorded
+        // worktree is the check — it must name this checkout's in-tree
+        // path (its tail stays stable across moves), or a coincidental
+        // chain would wire the pointer into a foreign module repo. A
+        // missing config or worktree value leaves nothing to reconcile.
+        const config = join(moduleDir, 'config')
+        let recordedWorktree = ''
+        try {
+          recordedWorktree = execFileSync(
+            'git',
+            ['config', '--file', config, '--get', 'core.worktree'],
+            {
+              encoding: 'utf8',
+              stdio: ['ignore', 'pipe', 'pipe'],
+            },
+          ).trim()
+        } catch {
+          // No recorded worktree — nothing to reconcile.
+        }
+        if (!recordedWorktree.replaceAll('\\', '/').endsWith(`/${dirname(rel)}`)) return true
+        // A nested rollback leaves the tree deeper than teardown recorded
+        // it — rebase a pointer that no longer resolves to its repo so it
+        // works from the current depth; a still-correct pointer keeps its
+        // bytes.
+        let resolved: string | undefined
+        try {
+          resolved = realpathSync(resolve(checkout, gitdir))
+        } catch {
+          // Unresolvable from here — rebase it.
+        }
+        if (resolved !== moduleDir) {
+          // The pointer is the checkout's only link to its module repo, so
+          // it may never be rewritten by truncate-then-write: an
+          // interruption between the two leaves an empty pointer the next
+          // replay cannot reconcile yet still retires. A same-directory
+          // temp file, fsynced and renamed over, is atomic — a crash keeps
+          // either the old pointer or the new one, never a torn half.
+          const tmp = `${pointer}.clade-tmp-${randomUUID().slice(0, 8)}`
+          try {
+            // The rename replaces the pointer inode, so a fresh temp file
+            // would lose the original's mode and any acl/xattrs — dropping
+            // them can broaden access and makes the relocation comparator
+            // reject cleanup's own rewrite as metadata drift. Copy the
+            // pointer onto the temp name with metadata preserved before
+            // rewriting its bytes; fall back to mode-only when the
+            // preserving copy cannot run (non-regular pointer or a
+            // filesystem without acl/xattr support).
+            const st = lstatSync(pointer)
+            let preserved = false
+            if (st.isFile()) {
+              try {
+                execFileSync('cp', ['--preserve=all', '--no-dereference', '--', pointer, tmp], {
+                  stdio: ['ignore', 'ignore', 'pipe'],
+                })
+                preserved = true
+              } catch {
+                // Preservation unsupported here — keep mode below.
+              }
+            }
+            writeFileSync(tmp, `gitdir: ${relative(checkout, moduleDir)}\n`)
+            if (!preserved) chmodSync(tmp, st.mode & 0o777)
+            fsyncFile(tmp)
+            renameSync(tmp, pointer)
+          } finally {
+            try {
+              unlinkSync(tmp)
+            } catch {
+              // Renamed away or never created — nothing to sweep.
+            }
+          }
+        }
+        // Whether the pointer was just renamed or matches because an
+        // earlier pass rewrote it and died before the fsync, the record
+        // retires only once the name on disk is durable.
+        fsyncDir(checkout)
+        const physical = realpathSync(checkout)
+        let alreadyCurrent = false
+        try {
+          alreadyCurrent = realpathSync(resolve(moduleDir, recordedWorktree)) === physical
+        } catch {
+          // The recorded path no longer resolves — reconcile it.
+        }
+        if (!alreadyCurrent) {
+          execFileSync('git', ['config', '--file', config, 'core.worktree', physical], {
+            stdio: ['ignore', 'pipe', 'pipe'],
+          })
+        }
+        // The rewrite must be durable before the record retires — a
+        // `restored` marker that outlives a rolled-back config write
+        // permanently leaves core.worktree naming the stale path — and a
+        // matching value may still be an earlier pass's unfsynced write,
+        // so the proof runs either way. A dir fsync persists the rename,
+        // not the bytes — the file too.
+        fsyncFile(config)
+        fsyncDir(moduleDir)
+        return true
+      }
+      for (const rel of active.detached) {
+        // Journaled paths are caller-supplied data: only a
+        // `.clade-detached` name whose parent resolves strictly inside the
+        // worktree is ours.
+        if (!basename(rel).startsWith('.git.clade-detached')) continue
+        const source = join(wtPath, rel)
+        let parent: string
+        try {
+          parent = realpathSync(dirname(source))
+        } catch {
+          continue
+        }
+        if (!parent.startsWith(`${realRoot}/`)) continue
+        const target = join(dirname(source), '.git')
+        try {
+          if (!lstatPresent(source)) {
+            // The recorded object is gone — restored by an earlier pass
+            // whose marker was lost, or trashed with the tree. The name
+            // can only reappear as foreign data, so the record must not
+            // stay live to claim it: retire it. Prove the absence durable
+            // first — that earlier pass may have renamed it and died
+            // before the parent fsync, and a surviving marker must never
+            // outlive a rename a power loss could still roll back. When
+            // the parent itself is gone there is nothing left to persist.
+            if (lstatPresent(dirname(source))) fsyncDir(dirname(source))
+            // A reconcile that cannot finish retires nothing — the record
+            // stays live so a later pass can still rewire the pointer.
+            if (reconcileWorktree(rel)) mark(`restored ${rel}`)
+          } else if (!lstatPresent(target)) {
+            renameSync(source, target)
+            // Same ordering as `modules-restored`: the directory fsync
+            // proves the rename durable before the marker can retire it —
+            // and an unfinished reconcile keeps the record live instead.
+            if (reconcileWorktree(rel)) {
+              fsyncDir(dirname(target))
+              mark(`restored ${rel}`)
+            }
+          }
+        } catch {
+          // One unruly record must not block the rest — the journal still
+          // owns it, so a later restore retries.
+        }
+      }
+    } finally {
+      if (journalFd !== undefined) journalClose(journalFd)
+    }
+  } catch {
+    // Reattach is a best-effort recovery step inside an error path — a
+    // failure here must never mask the original error; anything left
+    // detached keeps its `.clade-detached`/torn-down name for inspection.
+  }
+}
+
+// Batch cleanup never unlinks tree bytes: an initialized submodule checkout
+// rides into durable trash with the rest of the tree, so release only
+// detaches — each checkout `.git` is renamed aside and the private module
+// repository leaves the `modules` name, and `worktree move` then sees a
+// worktree with no populated submodules. `deinit`'s unlink of the checkout
+// is reserved for callers that still run `git worktree remove`.
+export function releaseWorktreeRuntime(
+  consumerRoot: string,
+  wtPath: string,
+  beforePrivateMetadataRemoval?: () => void,
+): string[] {
+  const detached = detachWorktreeSubmodulesMetadata(wtPath, beforePrivateMetadataRemoval)
+  try {
+    const result = runWtEnvBootstrap(wtPath, 'destroy', { scriptRoot: consumerRoot })
+    if (result?.status === 'orphan-recorded')
+      throw new Error('Worktree backing resources remain; retain and retry cleanup')
+  } catch (error) {
+    // A teardown failure after the detach leaves the worktree retained —
+    // put the submodule names back so it stays functional for the owner.
+    reattachWorktreeSubmodules(wtPath, detached)
+    throw error
+  }
+  return detached
+}
+
+export function cleanupRemovedWorktreeRuntime(consumerRoot: string, wtPath: string) {
+  // 新舊檔名都走 lib 的定位＋ownership 驗證；同 basename 的姊妹樹紀錄在裡面 retain。
+  releaseWorktreeDevPorts(consumerRoot, wtPath)
+  cleanupCodebaseMemoryIndex(wtPath)
+}
+
+// TD-793: `.nuxt/types` is a `nuxt prepare` product reached through pnpm's
+// postinstall lifecycle. Most fleet consumers chain it behind `&&` after
+// earlier steps, so a mid-chain failure exits install with the artifact never
+// generated — while the old output only printed the install exit line and
+// still declared `Worktree ready.`. The receiving agent then met thousands of
+// auto-import errors and read them as a broken task, not an absent
+// prerequisite (perno 2026-08-29: 1,867 errors → task marked blocked; a manual
+// `pnpm prepare` made the same typecheck pass).
+//
+// Warn-only by contract: an install failure still hands over a usable tree,
+// so this MUST NOT flip the ready state into a failure — it names the exact
+// remediation command instead of staying silent.
+export function nuxtTypeArtifactRemediation(wtPath: string): string | null {
+  const pkgPath = join(wtPath, 'package.json')
+  if (!existsSync(pkgPath)) return null
+  let pkg: { dependencies?: Record<string, string>; devDependencies?: Record<string, string> }
+  try {
+    pkg = JSON.parse(readFileSync(pkgPath, 'utf8'))
+  } catch {
+    return null
+  }
+  const deps = { ...pkg?.dependencies, ...pkg?.devDependencies }
+  if (!('nuxt' in deps)) return null
+  if (existsSync(join(wtPath, '.nuxt', 'types'))) return null
+  return 'type artifacts `.nuxt/types` absent — run `pnpm exec nuxt prepare` (or re-run `pnpm install`) in this worktree before typecheck'
+}
+
+/**
+ * `add --checkout <branch>` 的前置：fetch origin/<branch>，回本地同名 branch 在不在。
+ * origin 沒有該 branch 一律 throw。本地同名 branch 的 HEAD ≠ origin/<branch> 時：只是落後
+ * （HEAD 是 origin/<branch> 的祖先，沒有獨有 commit）放行——`add` 開完樹會快轉到 origin；
+ * 有本地獨有 commit 或已分岔 throw，那是別人的 WIP，NEVER 在這裡覆寫。
+ * 該 branch 已在別的 worktree（含主 checkout）檢出時 `git worktree add` 必失敗，這裡先 throw 並點名那棵樹。
+ */
+export function planCheckoutBranch(
+  consumerRoot: string,
+  branch: string,
+  run: (args: string[], opts?: GitRunOptions) => string = git,
+): { localExists: boolean } {
+  if (!branch.trim() || /\s|^-/u.test(branch)) {
+    throw new Error(`--checkout 需要一個 branch 名稱（收到 "${branch}"）`)
+  }
+  try {
+    run(['fetch', '--quiet', 'origin', `+refs/heads/${branch}:refs/remotes/origin/${branch}`], {
+      cwd: consumerRoot,
+    })
+  } catch (error) {
+    throw new Error(
+      `--checkout ${branch}：fetch origin 失敗（origin 沒有這個 branch，或網路／權限問題）：${(error as Error).message.split('\n')[0]}`,
+      { cause: error },
+    )
+  }
+  const remote = run(['rev-parse', '--verify', `refs/remotes/origin/${branch}`], {
+    cwd: consumerRoot,
+  })
+  let local: string | null = null
+  try {
+    local = run(['rev-parse', '--verify', `refs/heads/${branch}`], { cwd: consumerRoot })
+  } catch {}
+  if (local === null) return { localExists: false }
+  const checkedOutAt = checkedOutWorktree(consumerRoot, branch, run)
+  if (checkedOutAt) {
+    throw new Error(
+      `--checkout ${branch}：這個 branch 已在 ${checkedOutAt} 檢出，無法再開第二棵樹。` +
+        `沿用那棵樹（在裡面 git pull --ff-only），或讓持有者收掉它／主 checkout 切回別的 branch 後重試。`,
+    )
+  }
+  if (local === remote) return { localExists: true }
+  let behindOnly = false
+  try {
+    run(['merge-base', '--is-ancestor', local, remote], { cwd: consumerRoot })
+    behindOnly = true
+  } catch {}
+  if (!behindOnly) {
+    throw new Error(
+      `--checkout ${branch}：本地已有同名 branch 且 HEAD（${local.slice(0, 8)}）有 origin/${branch}（${remote.slice(0, 8)}）沒有的 commit：拒絕開樹。` +
+        `那些未推的 commit 先由持有者推上去或收掉，NEVER 在這裡覆寫。`,
+    )
+  }
+  return { localExists: true }
+}
+
+/** 回 `branch` 目前被檢出的 worktree 路徑（含主 checkout）；沒人檢出或判不出回 null。 */
+function checkedOutWorktree(
+  consumerRoot: string,
+  branch: string,
+  run: (args: string[], opts?: GitRunOptions) => string,
+): string | null {
+  let out: string
+  try {
+    out = run(['worktree', 'list', '--porcelain'], { cwd: consumerRoot })
+  } catch {
+    return null
+  }
+  let path: string | null = null
+  for (const line of out.split('\n')) {
+    if (line.startsWith('worktree ')) path = line.slice('worktree '.length)
+    else if (line === `branch refs/heads/${branch}`) return path
+  }
+  return null
+}
+
+/**
+ * 開樹前保證這個 consumer 的 gitignored 投影（`.clade/vendor`…）齊全：peer 的 consumer checkout 只靠 git
+ * 拿到 tracked 內容，`.clade/vendor` 只有 propagate／`pnpm hub:vendor` 會寫，缺了的話 consumer 自己的
+ * `scripts/wt-helper.ts` 在 module 載入就 ERR_MODULE_NOT_FOUND（W-2026-10-07-zenbook-consumer-projection-gap）。
+ * 缺或過舊就在這裡補；補不齊以 `placement_refused:` 開頭拒絕並說原因，NEVER 帶著壞投影開出一棵跑不動的樹。
+ *
+ * 只在 clade home 的 wt-helper（`vendor/scripts/` 底下、旁邊有 `scripts/sync-vendor.ts`）跑：自動加派、
+ * `ssh peer 'cd <consumer> && node ~/offline/clade/vendor/scripts/wt-helper.ts add'` 走的就是這條。
+ * consumer 端投影出去的 wt-helper 沒有 sync-vendor 可呼叫，也不帶這份 helper，直接略過。
+ */
+function requireConsumerProjection(consumerRoot: string) {
+  const cladeHome = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..')
+  if (resolve(consumerRoot) === cladeHome) return
+  const helper = join(cladeHome, 'vendor', 'scripts', 'lib', 'consumer-projection.ts')
+  if (!existsSync(join(cladeHome, 'scripts', 'sync-vendor.ts')) || !existsSync(helper)) return
+  // 子行程而不是 import：helper 是 clade home 專用，不隨 wt-helper 投影到 consumer。
+  const r = spawnSync(
+    process.execPath,
+    [helper, '--root', consumerRoot, '--apply', '--json', '--clade-home', cladeHome],
+    { encoding: 'utf8', timeout: 10 * 60_000, maxBuffer: 16 * 1024 * 1024 },
+  )
+  if (r.status === 0) return
+  let reason = (r.stderr || r.stdout || `exit ${r.status}`).trim().split('\n').slice(-3).join(' | ')
+  try {
+    const parsed: unknown = JSON.parse(r.stdout)
+    const results =
+      parsed !== null && typeof parsed === 'object' ? Reflect.get(parsed, 'results') : null
+    const first: unknown = Array.isArray(results) ? results[0] : null
+    if (first !== null && typeof first === 'object') {
+      const status = Reflect.get(first, 'status')
+      const detail = Reflect.get(first, 'detail')
+      if (typeof status === 'string' && typeof detail === 'string') reason = `${status}: ${detail}`
+    }
+  } catch {}
+  throw new Error(
+    `placement_refused: ${consumerRoot} 的 .clade/vendor 投影不可用（${reason}）\n  修復：node ${helper} --root ${consumerRoot} --apply`,
+  )
+}
+
+async function cmdAdd(slug, opts: WtOptions = {}) {
+  if (!slug) {
+    throw new Error(ADD_USAGE)
+  }
+  // TD-664 Phase 4 — `--task-summary` 從選配改必填。
+  // 選配的宣告欄位就是永遠不會被填的欄位：實測 17 個 claim 裡 16 個 task_summary 是 null，
+  // 與 expected_paths 全 [] 是同一個機制在同一個地方失效兩次。而 claim 的整個用途是讓別的
+  // session 判得出「這棵樹在做什麼、該不該等」——欄位是 null 時它退化成一個沒有內容的佔位。
+  // NEVER 改回選配、NEVER 加 --no-task-summary 之類的逃生口：那等於把這條打回原狀。
+  if (!opts.taskSummary || !opts.taskSummary.trim()) {
+    throw new Error(
+      `--task-summary <text> is required (TD-664 Phase 4).\n` +
+        `  它會寫進 .clade/claims/<id>.json 的 task_summary，是別的 session 判「這棵樹在做什麼」的唯一來源。\n` +
+        `  一句話講清楚這棵樹要做什麼，例如：--task-summary "TD-667 gate 判讀分離 environment/真失敗"\n` +
+        ADD_USAGE,
+    )
+  }
+  // 磁碟低水位准入：一棵新樹 ~0.9G＋install，/ 低於 block 級時不開（W-2026-10-01-disk-low-water-guard）。
+  // 只擋 add；cleanup／merge-back／batch 是釋放空間的那一側，永遠不呼叫。
+  enforceDiskAdmission('wt-helper add')
+  const cleanSlug = makeSlugSafe(slug)
+  const consumerRoot = findConsumerRoot()
+  requireConsumerProjection(consumerRoot)
+  // Pre-clean stale .git/index.lock if any — see docs/tech-debt.md TD-145.
+  const lockStatus = ensureNoStaleIndexLock(consumerRoot)
+  if (lockStatus.cleaned) {
+    console.error(`⚠ rm'd stale .git/index.lock — proceeding`)
+  }
+  const name = basename(consumerRoot)
+  const checkoutBranch = opts.checkout?.trim() || null
+  if (opts.checkout !== undefined && !checkoutBranch) {
+    throw new Error(`--checkout 需要一個 branch 名稱\n${ADD_USAGE}`)
+  }
+  if (checkoutBranch && (opts.base || opts.precheckBaseline !== undefined)) {
+    throw new Error(
+      `--checkout 不能與 --base／--precheck-baseline 併用（起點就是 origin/${checkoutBranch}）\n${ADD_USAGE}`,
+    )
+  }
+  const branch = checkoutBranch ?? `session/${timestampPrefix()}-${cleanSlug}`
+  const wtPath = join(dirname(consumerRoot), `${name}-wt`, cleanSlug)
+
+  if (existsSync(wtPath)) {
+    throw new Error(`Worktree path already exists: ${wtPath}`)
+  }
+  const checkoutPlan = checkoutBranch ? planCheckoutBranch(consumerRoot, checkoutBranch) : null
+
+  // Fork base MUST 等於 merge-back 的 land 目標（見 resolveLandingBase 的 doc comment）。
+  // `--base` 只覆寫成 integration/… — 任意 ref 會繞過 landing-base 判定。
+  let baseRef = checkoutBranch ? `origin/${checkoutBranch}` : resolveLandingBase(consumerRoot)
+  if (opts.base && String(opts.base).trim()) {
+    const raw = String(opts.base).trim()
+    const localName = raw.startsWith('origin/') ? raw.slice('origin/'.length) : raw
+    if (!localName.startsWith('integration/')) {
+      throw new Error(
+        `--base only accepts integration/… (local or origin/integration/…). Other refs would bypass landing-base.\n${ADD_USAGE}`,
+      )
+    }
+    baseRef = raw
+  }
+  try {
+    git(['rev-parse', '--verify', baseRef], { cwd: consumerRoot })
+  } catch {
+    throw new Error(`Base branch "${baseRef}" not found in ${consumerRoot}`)
+  }
+
+  // Pre-fork baseline guard (only when --precheck-baseline given).
+  // Strategies: commit (selective stage + commit baseline on main),
+  // stash  (push -u stash on main → apply inside new worktree),
+  // warn   (stop with report — caller decides).
+  // Unmerged paths are triaged by classifyUnmergedSafety: stale UU (no
+  // markers + no in-progress op state) auto-resolves via `git add`; real
+  // conflicts or mid-operation state still stop with diagnostics.
+  // Pre-gen session_id so the pre-fork baseline stash carries it in the name;
+  // the same id is later passed to writeClaim() so stash + claim share identity.
+  // Phase 7 (Q8): stash-reconcile namespace tags map back to a specific session.
+  const preGenSessionId = genSessionId()
+  let pendingStashName = null
+  let pendingBaselineRef = null
+  // TD-144: single ISO timestamp shared across all baseline ref pins for this
+  // cmdAdd invocation. Computed once so commit-strategy pre-fork snapshot,
+  // stash-strategy post-stash pin, and clean-main marker all land at the same
+  // ref name when relevant.
+  const baselineIso = new Date().toISOString().replace(/[:.]/g, '-')
+  // Tracks whether any code path already pinned `refs/wt-baseline/<slug>/<iso>`
+  // so the trailing "always pin" safety net doesn't double-pin (and overwrite
+  // a richer snapshot with a HEAD marker).
+  let baselineRefPinned = false
+  if (opts.precheckBaseline !== undefined) {
+    let dirty = detectMainDirty(consumerRoot)
+    if (dirty.conflicted.length > 0) {
+      const { safe, unsafe } = classifyUnmergedSafety(consumerRoot, dirty.conflicted)
+      if (unsafe.length > 0) {
+        const preview = unsafe
+          .slice(0, 10)
+          .map((u) => `  ${u.status}  ${u.path}  (${u.reason})`)
+          .join('\n')
+        const more = unsafe.length > 10 ? `\n  ... and ${unsafe.length - 10} more` : ''
+        throw new Error(
+          `Pre-fork baseline guard: main has ${unsafe.length} unsafe unmerged path(s):\n` +
+            preview +
+            more +
+            `\n\nReasons: 'markers' = file contains <<<<<<< conflict markers (real conflict);` +
+            ` 'merge-head' / 'rebase-head' / 'cherry-pick-head' = repo is mid-operation` +
+            ` (.git/MERGE_HEAD or equivalent exists). Resolve manually before fork;` +
+            ` wt-helper refuses to auto-handle these — any action risks data loss.`,
+        )
+      }
+      if (safe.length > 0) {
+        console.log(
+          `Pre-fork baseline: auto-resolving ${safe.length} stale unmerged path(s)` +
+            ` (no markers, no in-progress op): ${safe.map((s) => s.path).join(', ')}`,
+        )
+        git(['add', '--', ...safe.map((s) => s.path)], { cwd: consumerRoot, stdio: 'inherit' })
+        // Re-run detectMainDirty so downstream sees the resolved paths as
+        // modified (now staged adds) instead of conflicted.
+        dirty = detectMainDirty(consumerRoot)
+      }
+    }
+    // Pre-fork in-flight feature audit (warn-only, first pass).
+    // See wt skill baseline-guard.md § Stash strategy: when main has a
+    // large number of tracked modifications before fork, baseline strategy
+    // (especially `stash`) can sweep an in-flight feature stack into the
+    // pinned `refs/wt-baseline/*` ref. If merge-back later fails and the
+    // agent goes "Path X" (reset worktree branch + squash + cleanup), the
+    // baseline files vanish from main silently.
+    //
+    // Threshold default 50 staged+unstaged tracked changes; override via
+    // WT_PREFORK_AUDIT_THRESHOLD env var. Opt-out via --skip-prefork-audit
+    // flag (for tests). Never blocks — only emits a warning + mitigation hint.
+    if (!opts.skipPreforkAudit) {
+      const thresholdRaw = process.env.WT_PREFORK_AUDIT_THRESHOLD
+      const threshold = thresholdRaw !== undefined ? Number(thresholdRaw) : 50
+      const safeThreshold = Number.isFinite(threshold) && threshold >= 0 ? threshold : 50
+      // P2 (pitfall 2026-06-01): count untracked too. An in-flight batch is
+      // often mostly untracked (new migration / archive dir / new files), which
+      // a tracked-only count misses. Block policy stays warn-only by design
+      // (see wt skill baseline-guard.md 'audit must not
+      // block'); the unambiguous archive/migration markers handle the hard STOP.
+      const trackedCount = dirty.modified.length
+      const untrackedCount = dirty.untracked.length
+      const totalDirtyCount = trackedCount + untrackedCount
+      if (totalDirtyCount >= safeThreshold) {
+        const sample = dirty.modified
+          .slice(0, 20)
+          .map((m) => `  ${m.status}  ${m.path}`)
+          .join('\n')
+        const more = totalDirtyCount > 20 ? `\n  ... and ${totalDirtyCount - 20} more` : ''
+        console.warn('')
+        console.warn(
+          `⚠️  Pre-fork audit: main has ${totalDirtyCount} staged+unstaged+untracked change(s) ` +
+            `(${trackedCount} tracked, ${untrackedCount} untracked; threshold ${safeThreshold}).`,
+        )
+        console.warn(
+          `    These may be in-flight feature code; baseline strategy (especially 'stash') could`,
+        )
+        console.warn(
+          `    sweep them into refs/wt-baseline/*, where they vanish from main permanently if`,
+        )
+        console.warn(`    merge-back later fails and you 'reset --hard' the worktree branch.`)
+        console.warn(`    Risky paths (sample, up to 20):`)
+        console.warn(sample + more)
+        console.warn(`    Mitigation:`)
+        console.warn(`      • Commit in-flight feature work to main BEFORE forking, OR`)
+        console.warn(
+          `      • Note the pinned ref printed below (refs/wt-baseline/<slug>/<ISO>) and use`,
+        )
+        console.warn(`        'wt-helper rescue --show <ref>' to inspect/recover if needed.`)
+        console.warn(
+          `    See the wt skill's baseline-guard.md (§ Stash strategy 的隱性風險) for full root cause.`,
+        )
+        console.warn(
+          `    Override threshold via WT_PREFORK_AUDIT_THRESHOLD; silence via --skip-prefork-audit.`,
+        )
+        console.warn('')
+      }
+    }
+
+    const dirtyCount = dirty.modified.length + dirty.untracked.length
+    if (dirtyCount > 0) {
+      // Phase 3 (Q5) audit: classify dirty paths so user sees ownership
+      // before strategy selection. Other-session paths force STOP — we don't
+      // know how to safely fork on top of someone else's WIP.
+      const allDirtyPaths = [
+        ...dirty.modified.map((m) => m.path),
+        ...dirty.untracked.map((u) => u.path),
+      ]
+      const preForkCls = classifyDirtyPaths(consumerRoot, allDirtyPaths)
+      if (preForkCls.otherSession.length > 0) {
+        const preview = preForkCls.otherSession
+          .slice(0, 10)
+          .map(
+            (o) =>
+              `  ${o.path}  ← session ${o.session_id} / change ${o.change_id ?? '(none)'} / branch ${o.branch ?? '(none)'}`,
+          )
+          .join('\n')
+        const more =
+          preForkCls.otherSession.length > 10
+            ? `\n  ... and ${preForkCls.otherSession.length - 10} more`
+            : ''
+        throw new Error(
+          `Pre-fork baseline STOP: ${preForkCls.otherSession.length} dirty path(s) belong to another active session:\n` +
+            preview +
+            more +
+            `\n\nForking on top of another session's WIP would mix unrelated work into the new branch's baseline. ` +
+            `Wait for the other session to merge-back or coordinate before re-running.\n\n` +
+            `Override only if the other claim is stale:\n` +
+            `  node scripts/claim-helper.ts drop <session-id>\n` +
+            `  node scripts/wt-helper.ts add ${cleanSlug} ...`,
+        )
+      }
+      const strategy = opts.baselineStrategy || 'warn'
+      if (strategy === 'commit') {
+        const scopePaths = String(opts.baselineScopePaths || '')
+          .split(',')
+          .map((s) => s.trim())
+          .filter(Boolean)
+        if (scopePaths.length === 0) {
+          const dirtyPreview = [
+            ...dirty.modified.map((m) => `  ${m.status}  ${m.path}`),
+            ...dirty.untracked.map((u) => `  ??  ${u.path}`),
+          ]
+            .slice(0, 10)
+            .join('\n')
+          throw new Error(
+            `Pre-fork baseline guard: --baseline-strategy=commit requires --baseline-scope-paths <comma-list>.\n` +
+              `Dirty files (${dirtyCount}):\n${dirtyPreview}`,
+          )
+        }
+        const changeLabel = opts.precheckBaseline || cleanSlug
+        const message = preForkBaselineCommitMessage(changeLabel)
+        // TD-144: snapshot full dirty state (including non-scoped paths and
+        // untracked) BEFORE the selective commit consumes the scoped paths.
+        // Without this, any non-scoped path that gets `worktree add`'d into
+        // the new wt is unrecoverable if user later runs PTB-unsafe ops.
+        try {
+          const pin = pinPreForkBaseline(consumerRoot, cleanSlug, baselineIso, {
+            label: changeLabel,
+          })
+          baselineRefPinned = true
+          console.log(
+            `Pre-fork baseline: pinned ${pin.type} snapshot as '${pin.baselineRef}' (rescue via 'wt-helper rescue --show').`,
+          )
+        } catch (e) {
+          console.error(`warn: pre-fork baseline pin failed (proceeding): ${e?.message ?? e}`)
+        }
+        console.log(
+          `Pre-fork baseline: selective commit ${scopePaths.length} path(s) → "${message}"`,
+        )
+        assertNoPublishInFlight('add --baseline-strategy commit', {
+          ...opts,
+          targetRoot: consumerRoot,
+        })
+        gitSelectiveCommit(consumerRoot, scopePaths, message)
+      } else if (strategy === 'stash') {
+        // P1 (pitfall 2026-06-01-prefork-baseline-stash-sweeps-unclaimed-main-work, TD-181):
+        // `git stash push -u` bulk-captures ALL main dirty into the worktree +
+        // refs/wt-baseline/*, silently sweeping another session's live work (or a
+        // verified-but-uncommitted archive batch) out of main. Unclaimed dirty is
+        // invisible to the otherSession STOP above (main sessions never write a
+        // claim; claims expire after 24h), so the only safe default is to NOT
+        // capture anything — the fork starts clean from HEAD and does not need
+        // main's WIP. Capture is opt-in (--include-unrelated-dirty for all), never
+        // the silent default.
+        const scopePaths = String(opts.baselineScopePaths || '')
+          .split(',')
+          .map((s) => s.trim())
+          .filter(Boolean)
+        if (scopePaths.length > 0) {
+          // No safe scoped stash: `git stash push -u -- <pathspec>` leaks the full
+          // tracked working tree (the -u snapshot ignores pathspec — see
+          // pitfall-git-stash-pathspec-scope-leak). Route scoped capture through
+          // the commit strategy, which does a proven selective commit.
+          throw new Error(
+            `Pre-fork baseline guard: --baseline-strategy=stash does not support --baseline-scope-paths ` +
+              `(git stash -u ignores pathspec and would leak the full tracked tree — see ` +
+              `pitfall-git-stash-pathspec-scope-leak; there is no safe scoped stash).\n` +
+              `For scoped capture, re-run with the commit strategy (selectively commits only the scoped paths):\n` +
+              `  node scripts/wt-helper.ts add ${cleanSlug} --precheck-baseline${opts.precheckBaseline ? ` ${opts.precheckBaseline}` : ''} --baseline-strategy commit --baseline-scope-paths ${scopePaths.join(',')}\n` +
+              `To carry ALL main dirty into the worktree instead, re-run stash with --include-unrelated-dirty.`,
+          )
+        }
+        if (!opts.includeUnrelatedDirty) {
+          // DEFAULT: capture nothing. Leave every main dirty path untouched; the
+          // worktree forks clean from HEAD. This is the fail-safe that closes the
+          // incident — unclaimed dirty is never silently swept.
+          const preview = [
+            ...dirty.modified.map((m) => `  ${m.status}  ${m.path}`),
+            ...dirty.untracked.map((u) => `  ??  ${u.path}`),
+          ]
+            .slice(0, 10)
+            .join('\n')
+          const more = dirtyCount > 10 ? `\n  ... and ${dirtyCount - 10} more` : ''
+          console.log(
+            `Pre-fork baseline: stash strategy leaves main's ${dirtyCount} dirty file(s) in place; ` +
+              `the worktree forks clean from HEAD (no bulk-capture).`,
+          )
+          console.log(preview + more)
+          console.log(
+            `  To carry specific WIP into the worktree: --baseline-strategy commit --baseline-scope-paths <comma>.\n` +
+              `  To carry ALL main dirty (only when it genuinely belongs to this fork): re-run with --include-unrelated-dirty.`,
+          )
+          // No pendingStashName → nothing applied to the worktree; main untouched.
+        } else {
+          // Explicit opt-in: bulk-capture ALL main dirty. The caller affirms the
+          // dirty belongs to this fork.
+          const iso = baselineIso
+          const stashName =
+            opts.baselineStashName || `wt-baseline/${cleanSlug}/${preGenSessionId}/${iso}`
+          const baselineRef = `refs/wt-baseline/${cleanSlug}/${iso}`
+          console.log(
+            `Pre-fork baseline: --include-unrelated-dirty → stash ${dirtyCount} file(s) as '${stashName}'`,
+          )
+          assertNoPublishInFlight('add --baseline-strategy stash', {
+            ...opts,
+            targetRoot: consumerRoot,
+          })
+          git(['stash', 'push', '-u', '-m', stashName], {
+            cwd: consumerRoot,
+            stdio: 'inherit',
+          })
+          pendingStashName = stashName
+          pendingBaselineRef = baselineRef
+        }
+      } else if (strategy === 'warn') {
+        const preview = [
+          ...dirty.modified.map((m) => `  ${m.status}  ${m.path}`),
+          ...dirty.untracked.map((u) => `  ??  ${u.path}`),
+        ]
+          .slice(0, 20)
+          .join('\n')
+        const more = dirtyCount > 20 ? `\n  ... and ${dirtyCount - 20} more` : ''
+        throw new Error(
+          `Pre-fork baseline guard: main has ${dirtyCount} dirty file(s) and --baseline-strategy=warn:\n` +
+            preview +
+            more +
+            `\n\nPick a strategy and re-run with --baseline-strategy commit|stash, or commit/stash manually before fork.`,
+        )
+      } else {
+        throw new Error(
+          `Pre-fork baseline guard: unknown --baseline-strategy "${strategy}" (expected commit|stash|warn)`,
+        )
+      }
+    }
+  }
+
+  console.log(`Creating worktree: ${wtPath}`)
+  console.log(`Branch: ${branch}`)
+  git(
+    checkoutPlan?.localExists
+      ? ['worktree', 'add', wtPath, branch]
+      : checkoutBranch
+        ? ['worktree', 'add', '--track', '-b', branch, wtPath, baseRef]
+        : ['worktree', 'add', '-b', branch, wtPath, baseRef],
+    {
+      cwd: consumerRoot,
+      stdio: 'inherit',
+    },
+  )
+
+  // Fast-forward to the remote tracking branch of the landing base (TD-592:
+  // was hardcoded to origin/main; now uses the consumer root's current branch).
+  const remoteBase = baseRef.startsWith('origin/') ? baseRef : `origin/${baseRef}`
+  let hasRemoteBase = false
+  try {
+    git(['rev-parse', '--verify', remoteBase], { cwd: wtPath })
+    hasRemoteBase = true
+  } catch {}
+  if (hasRemoteBase) {
+    try {
+      git(['merge', '--ff-only', remoteBase], { cwd: wtPath, stdio: 'inherit' })
+    } catch {
+      console.error(
+        `warn: could not fast-forward merge ${remoteBase}; worktree may need manual sync`,
+      )
+    }
+  }
+
+  // Apply pre-fork baseline stash inside the freshly-created worktree (stash
+  // strategy). Before dropping from `git stash list`, pin the stash commit
+  // under `refs/wt-baseline/<slug>/<iso>` so the object stays reachable even
+  // after worktree cleanup. Without this pin, the stash becomes unreachable
+  // and the 47+ baseline files live only in the worktree's working tree —
+  // `wt-helper cleanup` then permanently destroys them (incident: TDMS
+  // 2026-05-17, kpi-prod-design-review-refresh). `wt-helper rescue` lists
+  // these refs for recovery.
+  if (pendingStashName) {
+    try {
+      git(['stash', 'apply', 'stash@{0}'], { cwd: wtPath, stdio: 'inherit' })
+      // Reset worktree index so the baseline files land as unstaged modifications
+      // (or untracked, for -u stash entries). git-stash-apply restores the stash's
+      // staged state, including untracked files brought in via `-u`. Without this
+      // reset, a subsequent `git add -- <single-file>` won't unstage the baseline
+      // files, leading to scope leak in the next commit (TDMS 2026-05-18 incident:
+      // fix-devlogin-loopback commit picked up 46 files / 7472 insertions).
+      // See pitfall-wt-helper-baseline-staged-index.
+      git(['reset', 'HEAD', '--'], { cwd: wtPath, stdio: 'inherit' })
+      const stashSha = git(['rev-parse', 'stash@{0}'], { cwd: consumerRoot })
+      git(['update-ref', pendingBaselineRef, stashSha], { cwd: consumerRoot })
+      // TD-144: mark baseline ref as pinned so the trailing safety net (below)
+      // doesn't overwrite this richer stash-format commit with a HEAD marker.
+      baselineRefPinned = true
+      git(['stash', 'drop', 'stash@{0}'], { cwd: consumerRoot, stdio: 'inherit' })
+      console.log(
+        `Pre-fork baseline: stash '${pendingStashName}' applied to worktree; pinned as '${pendingBaselineRef}' (permanently reachable — use 'wt-helper rescue' to inspect/restore).`,
+      )
+
+      // Audit baseline content (BOTH untracked tree AND tracked modifications) for
+      // non-LOCKED-projection paths. These are likely in-flight feature code (e.g. a
+      // work item in deferred-to-user phase). If merge-back later fails with
+      // conflicts and the agent goes "Path X" (reset worktree branch to subagent commit
+      // + squash + cleanup), these files vanish from main's working tree silently —
+      // main HEAD never had them, so typecheck/runtime don't catch it.
+      //
+      // Two scan targets:
+      //   • Untracked tree from `<ref>^3` parent (git-stash -u packs untracked into ^3).
+      //   • Tracked mods from `<ref>^1..<ref>` diff (^1 = HEAD-at-stash-time; the diff
+      //     surfaces files modified in working tree at stash time, which the stash
+      //     commit carries forward).
+      //
+      // See wt skill baseline-guard.md § Stash strategy (2026-05-18 TDMS
+      // fix-vending-dispatch-dialog incident, 53-file vending feature stack lost from
+      // main). Original audit only inspected `^3` — tracked-file feature drift slipped
+      // through silently.
+      try {
+        const baselinePaths = new Set()
+
+        try {
+          const untrackedTree = git(['ls-tree', '-r', `${pendingBaselineRef}^3`, '--name-only'], {
+            cwd: consumerRoot,
+          })
+          untrackedTree
+            .split('\n')
+            .filter(Boolean)
+            .forEach((p) => baselinePaths.add(p))
+        } catch (untrackedErr) {
+          // ^3 parent may not exist if stash had no untracked content (`-u` saw no
+          // untracked files). Silently swallow benign "Not a valid object name" /
+          // "unknown revision"; surface other errors.
+          const msg = untrackedErr?.message ?? String(untrackedErr)
+          if (!/Not a valid object name|unknown revision/.test(msg)) {
+            console.error(`note: baseline untracked-tree scan skipped: ${msg}`)
+          }
+        }
+
+        try {
+          const trackedDiff = git(
+            ['diff', '--name-only', `${pendingBaselineRef}^1`, pendingBaselineRef],
+            { cwd: consumerRoot },
+          )
+          trackedDiff
+            .split('\n')
+            .filter(Boolean)
+            .forEach((p) => baselinePaths.add(p))
+        } catch (trackedErr) {
+          // ^1 parent should always exist (the HEAD at stash-creation time), but tolerate
+          // edge cases (e.g. shallow clone, dangling ref) and surface non-benign errors.
+          const msg = trackedErr?.message ?? String(trackedErr)
+          if (!/Not a valid object name|unknown revision/.test(msg)) {
+            console.error(`note: baseline tracked-diff scan skipped: ${msg}`)
+          }
+        }
+
+        const nonProjection = [...baselinePaths].filter(
+          (p) => !isLockedProjectionPathFor(consumerRoot, p),
+        )
+        if (nonProjection.length > 0) {
+          const sample = nonProjection.slice(0, 5).join(', ')
+          const more = nonProjection.length > 5 ? `, ... +${nonProjection.length - 5} more` : ''
+          console.warn('')
+          console.warn(
+            `⚠️  Pre-fork baseline contains ${nonProjection.length} non-LOCKED-projection file(s) (untracked + tracked-modified).`,
+          )
+          console.warn(`    These may be in-flight feature code (not just clade projection drift).`)
+          console.warn(`    Sample: ${sample}${more}`)
+          console.warn(`    If merge-back later fails with overwrite / conflict errors:`)
+          console.warn(
+            `      • NEVER run 'git reset --hard <subagent-commit>' (Path X) before auditing baseline.`,
+          )
+          console.warn(
+            `      • Audit untracked: git ls-tree -r ${pendingBaselineRef}^3 --name-only`,
+          )
+          console.warn(
+            `      • Audit tracked mods: git diff --name-only ${pendingBaselineRef}^1 ${pendingBaselineRef}`,
+          )
+          console.warn(
+            `      • Recovery (untracked): git checkout ${pendingBaselineRef}^3 -- <paths>`,
+          )
+          console.warn(
+            `      • Recovery (tracked mods): git checkout ${pendingBaselineRef} -- <paths>`,
+          )
+          console.warn(
+            `    See the wt skill's baseline-guard.md (§ Stash strategy 的隱性風險) for full root cause.`,
+          )
+          console.warn('')
+        }
+      } catch (auditErr) {
+        // Outer guard: if both scans throw unexpectedly, surface but never block.
+        const msg = auditErr?.message ?? String(auditErr)
+        console.error(`note: baseline content audit skipped: ${msg}`)
+      }
+    } catch (e) {
+      console.error(
+        `warn: stash apply to worktree failed; stash '${pendingStashName}' preserved in 'git stash list' for manual recovery.`,
+      )
+      console.error(`error detail: ${e?.message ?? e}`)
+    }
+  }
+
+  // TD-144 safety net: guarantee EVERY fork path leaves at least one pinned
+  // `refs/wt-baseline/<slug>/<iso>` ref. The commit-strategy and stash-strategy
+  // branches pin earlier (and set baselineRefPinned). For the remaining paths
+  // (main-clean fork, no --precheck-baseline at all, or a strategy that didn't
+  // pin), call the helper now — it detects clean vs dirty and pins HEAD or a
+  // snapshot accordingly. Without this, PTB-unsafe ops on the new wt have no
+  // rescue anchor.
+  if (!baselineRefPinned) {
+    try {
+      const pin = pinPreForkBaseline(consumerRoot, cleanSlug, baselineIso, { label: cleanSlug })
+      baselineRefPinned = true
+      console.log(
+        `Pre-fork baseline: pinned ${pin.type} marker as '${pin.baselineRef}' (rescue via 'wt-helper rescue --show').`,
+      )
+    } catch (e) {
+      console.error(`warn: pre-fork baseline pin (safety net) failed: ${e?.message ?? e}`)
+    }
+  }
+
+  // Write session claim so publish / propagate / /commit / other wt-helper
+  // invocations can see this worktree is active. expected_paths starts empty;
+  // SessionStart heartbeat hook refreshes; cleanup / successful merge-back
+  // drops the claim. See rules/core/session-claims.md.
+  try {
+    // `--expected-paths` had a field and a reader and no flag: `opts.expectedPaths` was never
+    // assigned by the arg parser, so every claim ever written here got `[]`. That is the other
+    // half of "22/22 empty" — the half that no amount of discipline would have fixed (TD-794 刀 4).
+    //
+    // `--baseline-scope-paths` seeds it when `--expected-paths` is absent: that flag already
+    // names the files this worktree is being opened to carry, so reusing it adds zero obligation.
+    const expectedPaths = String(opts.expectedPaths ?? opts.baselineScopePaths ?? '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean)
+    const claim = writeClaim(consumerRoot, {
+      session_id: preGenSessionId,
+      agent: opts.agent ?? 'claude-code',
+      consumer: basename(consumerRoot),
+      worktree_path: wtPath,
+      branch,
+      change_id: cleanSlug,
+      expected_paths: expectedPaths,
+      task_summary: opts.taskSummary ?? null,
+    })
+    console.log(`  Claim: ${claim.session_id} (.clade/claims/${claim.session_id}.json)`)
+    if (claim.work_id) console.log(`  Work:  ${claim.work_id}`)
+    warnOnClaimOverlap(consumerRoot, expectedPaths, wtPath)
+  } catch (e) {
+    console.error(`note: claim write skipped: ${e.message ?? e}`)
+  }
+
+  bootstrapWorktreeRuntime(consumerRoot, wtPath)
+
+  // announce only after env files + per-worktree resources are in place —
+  // "ready" must not print while the worktree still lacks its database.
+  console.log('')
+  console.log('Worktree ready.')
+  console.log(`  Path: ${wtPath}`)
+  console.log(`  Branch: ${branch}`)
+  console.log(`  Handoff: ${JSON.stringify({ cwd: wtPath, branch })}`)
+  // TD-684 — /wt is one of the entry points where a piece of work is named, and `--task-summary`
+  // is already required (TD-664 Phase 4), so the naming material is guaranteed to exist. Without
+  // this the spine records the worktree's whole span series under an `orphan-` id and /flow shows
+  // it as unclaimed residue.
+  //
+  // Fail-open by construction: the spine module is clade-home-only (wt-helper itself is projected
+  // into every consumer, `vendor/scripts/flow/` is not), so the import is dynamic and every
+  // failure path is a warn. NEVER let this gate worktree creation — the tree is already on disk.
+  const ambientWorkId = process.env.CLADE_WORK_ID?.trim()
+  let associatedWorkId = ambientWorkId ?? null
+  if (ambientWorkId) {
+    console.error(`export CLADE_WORK_ID=${ambientWorkId}`)
+  } else {
+    try {
+      const { openWork } = await import(new URL('./flow/emit.ts', import.meta.url).href)
+      const workSlug = String(opts.taskSummary ?? '')
+        .toLowerCase()
+        .replace(/[^a-z0-9-]+/g, '-')
+        .replace(/^-+|-+$/g, '')
+        .slice(0, 48)
+        .replace(/-+$/, '')
+      /*
+       * TD-787 — OPENING A WORKTREE IS TRANSPORT, NOT A PIECE OF WORK.
+       *
+       * This branch minted 33 of clade's 42 named work items, each a ROOT card whose origin was
+       * `wt:<slug>` — the tree it was created in, never the thing it was created FOR. So the board
+       * filled with cards named after transport, and "is TD-709 fixed?" had nothing to join on.
+       *
+       * `--origin td:TD-NNN` is the one flag that makes this card the WORK's card. Without it the
+       * card is still minted (a worktree already exists on disk; telemetry NEVER gates it) but it
+       * is MARKED, and the正路 is printed. NEVER widen this to accept `wt:` as an origin scheme:
+       * `wt:` records the transport, which is exactly the semantics this TD exists to remove.
+       */
+      /*
+       * The scheme is checked against the SAME list `flow open --origin` checks (`REF_SCHEMES`),
+       * imported rather than restated: a second copy of the whitelist drifts, and a typo'd scheme
+       * folds into a work item whose origin can never be joined against anything.
+       *
+       * A bad scheme degrades to 未歸屬 with a loud line. NEVER let it abort: the worktree is
+       * already on disk, and a telemetry mint that takes the transport down inverts the contract.
+       */
+      const { parseRef, REF_SCHEMES } = await import(
+        new URL('./flow/answer.ts', import.meta.url).href
+      )
+      let origin = String(opts.origin ?? '').trim() || null
+      if (origin && !parseRef(origin)?.scheme) {
+        console.error(
+          `note: --origin ${origin} 的 scheme 不在 ${REF_SCHEMES.join(' | ')} 之內，當成未歸屬處理`,
+        )
+        origin = null
+      }
+      const unattributed = origin === null
+      const { work_id } = openWork({
+        slug: workSlug || cleanSlug,
+        actor: opts.agent ?? 'claude-code',
+        origin,
+        title: opts.taskSummary ?? null,
+        payload: unattributed
+          ? { unattributed: true, worktree_slug: cleanSlug }
+          : { worktree_slug: cleanSlug },
+        cwd: consumerRoot,
+      })
+      associatedWorkId = work_id
+      console.log(`  Work: ${work_id}${unattributed ? '（未歸屬）' : ` (${origin})`}`)
+      // TD-915: the claim was written above, before this id existed. Bind it now so the worktree
+      // itself remembers which card it serves — `merge-back --work-done` reads it from here, not
+      // from an ambient variable that dies with this Bash call.
+      //
+      // ONLY an attributed card is bound. The 未歸屬 card is named after this transport (TD-787);
+      // binding it would make merge-back treat it as authoritative — refusing the real card's
+      // ambient id as a "mismatch", and filing `work.done` against the transport card otherwise.
+      if (!unattributed)
+        try {
+          const bind = bindClaimWorkId(consumerRoot, preGenSessionId, work_id)
+          if (bind.status === 'conflict') {
+            console.error(
+              `note: claim ${preGenSessionId} is already bound to ${bind.work_id}; left as is (not rebinding to ${work_id})`,
+            )
+          }
+        } catch (e) {
+          console.error(`note: claim work_id bind skipped: ${e?.message ?? e}`)
+        }
+      if (unattributed) {
+        console.error(
+          `note: 這個 worktree 不屬於任何已知工作（沒有 CLADE_WORK_ID、也沒有 --origin），卡片標為「未歸屬」。\n` +
+            `      正路：node vendor/scripts/flow/flow.ts open <slug> --origin td:TD-NNN，export CLADE_WORK_ID 之後再 wt add；\n` +
+            `      或這次就帶 wt-helper.ts add <slug> --task-summary '<一句話>' --origin td:TD-NNN`,
+        )
+      }
+      console.error(`export CLADE_WORK_ID=${work_id}`)
+    } catch (e) {
+      console.error(`note: flow work open skipped (fail-open): ${e?.message ?? e}`)
+    }
+  }
+  // Register the carrier only after worktree creation and flow/claim receipts have
+  // succeeded. This is an annotation, never a second lifecycle authority: inventory
+  // uses it to explain why this path/branch existed after the session disappears.
+  try {
+    const { appendInventoryEvent, assetIdFor } = await import(
+      new URL('./work-inventory-store.ts', import.meta.url).href
+    )
+    const head = git(['rev-parse', 'HEAD'], { cwd: wtPath })
+    const observationKey = `worktree:${resolve(wtPath)}:${branch}`
+    appendInventoryEvent(consumerRoot, {
+      operation_id: `worktree-register:${preGenSessionId}`,
+      asset_id: assetIdFor(observationKey, head),
+      observation_key: observationKey,
+      work_id: associatedWorkId,
+      session_id: preGenSessionId,
+      kind: 'resource.registered',
+      payload: {
+        kind: 'worktree',
+        path: resolve(wtPath),
+        branch,
+        head,
+        purpose: opts.taskSummary ?? null,
+        purpose_confidence: opts.taskSummary ? 'confirmed' : 'unknown',
+        // worktree 根治 C1：誰開（dispatch）與預期怎麼落地，事件驅動回收與 C6 的 owner 判定要用。
+        dispatch_id: process.env.CLADE_DISPATCH_ID?.trim() || null,
+        landing: normalizeLanding(opts.landing ?? process.env.CLADE_WT_LANDING),
+      },
+      sources: [
+        {
+          source: `${consumerRoot}/.clade/claims/${preGenSessionId}.json`,
+          kind: 'claim',
+          value: opts.taskSummary ?? null,
+          confidence: opts.taskSummary ? 'confirmed' : 'unknown',
+        },
+        ...(associatedWorkId
+          ? [
+              {
+                source: `${consumerRoot}/.clade/flow/events.jsonl`,
+                kind: 'flow' as const,
+                value: associatedWorkId,
+                confidence: 'confirmed' as const,
+              },
+            ]
+          : []),
+      ],
+    })
+  } catch (e) {
+    console.error(`note: work-asset registration skipped (fail-open): ${e?.message ?? e}`)
+  }
+  console.log('')
+  console.log(
+    'The orchestrator continues directly or dispatches this cwd through the session handoff transport.',
+  )
+
+  // Auto-install deps + set verify-deps-before-run=install in worktree .npmrc.
+  //
+  // git worktree doesn't share node_modules. Without install here, the first
+  // `pnpm dev` sees "node_modules out of sync" (warn) or crashes on missing
+  // modules. Additionally, worktree package.json diverges from main over time
+  // (version bumps, script additions) — pnpm 10 verify-deps-before-run treats
+  // ANY package.json change as "structure changed" and warns on every script.
+  //
+  // Two-pronged fix:
+  //   1. Install deps now (initial sync)
+  //   2. Set verify-deps-before-run=install in worktree .npmrc so future
+  //      desync auto-repairs instead of warning. Main keeps =warn (avoids
+  //      postinstall on ctrl+c). Worktree accepts the occasional ~14s
+  //      auto-install as better UX than persistent WARN on every command.
+  if (existsSync(join(wtPath, 'package.json'))) {
+    try {
+      /**
+       * argv 先成形，log 由它產生——**NEVER 手寫這一行**。
+       *
+       * 它原本是手寫字串 `'  deps: pnpm install --prefer-offline …'`，漏了
+       * `--frozen-lockfile` 並以 `…` 結尾。2026-08-27 實測後果：五個 agent 讀過這一行、
+       * 五個都據此判定「開 worktree 會改寫全 repo lockfile」、零個去讀下一行的 argv，
+       * 其中一個把它一般化成判準寫進 ledger，另一個據此對四個 pane 發了錯誤的凍結範圍。
+       *
+       * 而那個 `…` 是誠實的省略號——它確實表示「還有更多」。**只是沒有人會去追一個 `…`**：
+       * 它讀起來像省略了不重要的細節，而被省略的正好是唯一改變語義的那個 flag。
+       * 誠實的省略與有害的省略在字面上同形，差別只在被省略的那一項重不重要，
+       * 而那件事只有已經知道答案的人判得出來。
+       *
+       * 通則：**一個描述自己在做什麼的 log，MUST 由它描述的那個東西產生。** 手寫的那一刻
+       * 兩者就開始漂，而漂了不會有任何訊號——它看起來仍然像那件事本身的權威描述。
+       */
+      const installArgs = ['install', '--prefer-offline', '--frozen-lockfile']
+      console.log(`  deps: pnpm ${installArgs.join(' ')}`)
+      const inst = spawnSync('pnpm', installArgs, {
+        cwd: wtPath,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: 120_000,
+      })
+      if (inst.status === 0) {
+        console.log('  deps: done')
+      } else {
+        const stderr = inst.stderr?.toString().trim().split('\n')[0] ?? ''
+        console.error(`  deps: pnpm install exited ${inst.status} — ${stderr}`)
+        console.error('  deps: worktree may need manual `pnpm install` before dev server works')
+      }
+    } catch (e) {
+      console.error(`  deps: skipped (${e.message ?? e})`)
+    }
+
+    const hooks = ensureWorktreeGitHooks(wtPath)
+    if (hooks.state === 'installed') console.log(`  hooks: ${hooks.hooksPath} installed`)
+    else if (hooks.state === 'missing') {
+      console.error(
+        `  hooks: ⚠️ ${hooks.hooksPath} 不存在，這棵樹的 git commit 不會跑 pre-commit／commit-msg`,
+      )
+      console.error(`  hooks: ${hooks.detail}`)
+    }
+
+    // Flip verify-deps-before-run to install (worktree-only).
+    //
+    // SoT 是 `pnpm-workspace.yaml`（TD-723）。`.npmrc` 那條**只在 yaml 沒有這個 key 時**
+    // 才走 —— 遷移期的 consumer 還停在舊檔，而 pnpm 10 兩邊都讀。yaml 有 key 時 NEVER
+    // 再翻 `.npmrc`：pnpm 11 根本不讀它，翻了只會製造一個永遠對不上的第二來源。
+    try {
+      const yamlPath = join(wtPath, 'pnpm-workspace.yaml')
+      const yamlLine = /^verifyDepsBeforeRun:[ \t]*warn[ \t]*$/m
+      const yamlText = existsSync(yamlPath) ? readFileSync(yamlPath, 'utf8') : null
+      const yamlHasKey = yamlText !== null && /^verifyDepsBeforeRun:/m.test(yamlText)
+
+      if (yamlHasKey) {
+        if (yamlLine.test(yamlText)) {
+          writeFileSync(yamlPath, yamlText.replace(yamlLine, 'verifyDepsBeforeRun: install'))
+          console.log('  deps: pnpm-workspace.yaml verifyDepsBeforeRun → install (worktree-only)')
+        }
+      } else {
+        const npmrcPath = join(wtPath, '.npmrc')
+        if (existsSync(npmrcPath)) {
+          const content = readFileSync(npmrcPath, 'utf8')
+          if (content.includes('verify-deps-before-run=warn')) {
+            writeFileSync(
+              npmrcPath,
+              content.replace('verify-deps-before-run=warn', 'verify-deps-before-run=install'),
+            )
+            console.log('  deps: .npmrc verify-deps-before-run → install (worktree-only)')
+          }
+        }
+      }
+    } catch {}
+  }
+
+  // TD-793: after any install outcome, say out loud when a Nuxt consumer's
+  // type artifacts never materialised — silence here is what made the defect
+  // indistinguishable from a broken task.
+  const typeArtifactNote = nuxtTypeArtifactRemediation(wtPath)
+  if (typeArtifactNote) console.error(`  deps: ${typeArtifactNote}`)
+
+  // Auto-trigger codebase-memory index_repository (fast mode, detached) so
+  // search_graph / trace_path / get_code_snippet work immediately in the new
+  // worktree. Failures (missing binary, mcp unreachable) are silently swallowed
+  // per pitfall-consumer-mcp-codebase-memory-missing.
+  await maybeIndexRepository(wtPath).catch(() => {
+    // Unreachable — helper never rejects — but defend against future contract drift.
+  })
+}
+
+async function cmdDetectMainDirty(opts) {
+  const consumerRoot = findConsumerRoot()
+  const dirty = detectMainDirty(consumerRoot)
+  if (opts.json) {
+    console.log(JSON.stringify(dirty, null, 2))
+    return
+  }
+  const total = dirty.modified.length + dirty.untracked.length + dirty.conflicted.length
+  if (total === 0) {
+    console.log('main worktree clean')
+    return
+  }
+  console.log(`main worktree has ${total} dirty path(s):`)
+  for (const c of dirty.conflicted) {
+    console.log(`  conflicted ${c.status}  ${c.path}`)
+  }
+  for (const m of dirty.modified) {
+    console.log(`  modified   ${m.status}  ${m.path}`)
+  }
+  for (const u of dirty.untracked) {
+    console.log(`  untracked       ${u.path}`)
+  }
+}
+
+// `landed` 預設關：landedState 每棵未 merged 的樹要付一次 `git diff --binary` ＋ 最多三次
+// `git apply --check` ＋ 可能一次 `git log`，只有 `list` 的讀者要它。`reclaim-stale` 只看
+// staleness、`handoff-scan` 經 `list --no-landed-state` 呼叫——都不付這個成本（TD-863 0-A r1）。
+function enrichWorktree(
+  consumerRoot,
+  w,
+  { landed: withLanded = false, now = Date.now() }: { landed?: boolean; now?: number } = {},
+) {
+  const branchName = w.branch.replace('refs/heads/', '')
+  let lastCommitSec = 0
+  try {
+    lastCommitSec = parseInt(
+      git(['log', '-1', '--format=%ct', branchName], { cwd: consumerRoot }),
+      10,
+    )
+  } catch {}
+  const lastCommitMs = Number.isFinite(lastCommitSec) ? lastCommitSec * 1000 : 0
+  const daysOld = lastCommitMs ? Math.floor((now - lastCommitMs) / 86_400_000) : null
+  const merged = mergedBranches(consumerRoot).has(branchName)
+  let briefStatus = null
+  let taskSummary = null
+  try {
+    const briefPath = join(w.path, 'WORKTREE-BRIEF.md')
+    if (existsSync(briefPath)) {
+      const content = readFileSync(briefPath, 'utf8')
+      const statusMatch = content.match(/^status:\s*(.+)$/m)
+      if (statusMatch) briefStatus = statusMatch[1].trim()
+      const taskMatch = content.match(/^# Task\s*\n+(.+)/m)
+      if (taskMatch) taskSummary = taskMatch[1].trim()
+    }
+  } catch {}
+  // Three-layer staleness judgment (TD-563):
+  //   stale  — merged to main, OR brief status indicates done (archived/completed/done)
+  //   live   — brief status is active/in-progress AND last commit < 30min ago
+  //   unknown — everything else (ask user in attended; package in unattended)
+  const STALE_STATUSES = new Set(['archived', 'completed', 'done', 'landed', 'merged'])
+  const LIVE_STATUSES = new Set(['active', 'in-progress', 'wip', 'dispatched', 'pending'])
+  const THIRTY_MIN_MS = 30 * 60 * 1000
+
+  let staleness = 'unknown'
+  if (merged || (briefStatus && STALE_STATUSES.has(briefStatus.toLowerCase()))) {
+    staleness = 'stale'
+  } else if (
+    briefStatus &&
+    LIVE_STATUSES.has(briefStatus.toLowerCase()) &&
+    lastCommitMs &&
+    now - lastCommitMs < THIRTY_MIN_MS
+  ) {
+    staleness = 'live'
+  }
+
+  // 具名欄位，不要收成 Record<string, unknown>：list enrich 的 branch 是字串，
+  // smoke 會呼叫 endsWith；收成 unknown 會讓 vendor typecheck 在那一行爆掉。
+  const row: {
+    path: string
+    branch: string
+    lastCommit: string | null
+    daysOld: number | null
+    mergedToMain: boolean
+    briefStatus: string | null
+    taskSummary: string | null
+    staleness: string
+    landedState?: LandedState
+    landedReason?: string | null
+    supersededBy?: string[]
+    dirty?: number | null
+  } = {
+    path: w.path,
+    branch: branchName,
+    lastCommit: lastCommitMs ? new Date(lastCommitMs).toISOString() : null,
+    daysOld,
+    mergedToMain: merged,
+    briefStatus,
+    taskSummary,
+    staleness,
+  }
+  if (withLanded) {
+    const landed = merged
+      ? { landedState: 'in-history' as LandedState, supersededBy: [], reason: undefined }
+      : classifyLandedState(consumerRoot, branchName)
+    row.landedState = landed.landedState
+    row.landedReason = landed.reason ?? null
+    row.supersededBy = landed.supersededBy
+    // landedState 只描述 branch tip 的 commit；session worktree 裡未 commit 的檔它看不到。
+    // 所以「清樹不丟內容」要兩個欄位一起讀：landedState ∈ {in-history, in-base} 且 dirty === 0。
+    row.dirty = countWorktreeDirty(w.path)
+  }
+  return row
+}
+
+/**
+ * session worktree 內的 user WIP 筆數（含 untracked）；讀不到回 null。
+ *
+ * 剔除可忽略漂移（投影殘留、tool-managed drift）——與 cleanup 的 uncommitted gate 同一份判準。
+ * 裸 porcelain 行數在這裡是錯的單位：`pnpm install` 的 bootstrap 會在每棵樹種下上千筆投影
+ * 寫入，`dirty === 0` 才算可回收的清單因此一棵都收不到，而 cleanup 本身對這些樹是放行的。
+ */
+function countWorktreeDirty(wtPath): number | null {
+  return countUserDirty(wtPath)
+}
+
+async function cmdList(opts) {
+  const consumerRoot = findConsumerRoot()
+  const wts = sessionWorktrees(consumerRoot)
+  const enriched = wts.map((w) =>
+    enrichWorktree(consumerRoot, w, { landed: !opts.noLandedState }),
+  ) as any[]
+
+  if (opts.json) {
+    console.log(JSON.stringify(enriched, null, 2))
+    return
+  }
+
+  if (enriched.length === 0) {
+    console.log('No session worktrees.')
+    return
+  }
+  const holderBySlug = new Map(devPortHolders(consumerRoot).map((h) => [h.slug, h.offset]))
+  for (const w of enriched) {
+    const ageLabel = w.daysOld === null ? '?' : `${w.daysOld}d`
+    const landedTag =
+      w.landedState === undefined
+        ? ''
+        : `, ${w.landedState}${w.landedReason ? ` (${w.landedReason})` : ''}${w.dirty ? `, dirty ${w.dirty}` : w.dirty === null ? ', dirty ?' : ''}`
+    const mergedTag = w.mergedToMain ? `, merged${w.dirty ? `, dirty ${w.dirty}` : ''}` : landedTag
+    const offset = holderBySlug.get(basename(w.path))
+    // Which worktrees hold a dev-port offset is the one thing this listing was
+    // missing when the band ran dry: without it the reader picks a cleanup
+    // target by age or status and frees nothing, because most worktrees created
+    // after the band filled never held a slot at all.
+    const portTag = offset === undefined ? '' : `, dev-port +${offset}`
+    console.log(`${w.branch}  (${ageLabel} ago${mergedTag}${portTag})`)
+    console.log(`  ${w.path}`)
+    if (w.taskSummary) {
+      const statusTag = w.briefStatus ? ` [${w.briefStatus}]` : ''
+      console.log(`  ${w.taskSummary}${statusTag}`)
+    }
+    for (const c of (w.supersededBy ?? []).slice(0, 5)) console.log(`  superseded by ${c}`)
+  }
+
+  const declared = readDeclaredDevPorts(consumerRoot)
+  if (declared.length > 0) {
+    const capacity = devPortCapacity(declared)
+    const held = holderBySlug.size
+    const suffix = held >= capacity ? ' — exhausted; land one to free a slot' : ''
+    console.log(`\ndev-port slots: ${held}/${capacity} held${suffix}`)
+  }
+}
+
+// `landed: false` is the hook/board budget mode: only the ancestry check (one shared
+// `git branch --merged`) decides landed; patch-equivalence is reported as `unchecked`.
+export function collectWorktreeBacklog(
+  consumerRoot: string,
+  { landed: withLanded = true }: { landed?: boolean } = {},
+): WorktreeBacklog {
+  const now = Date.now()
+  const claims = readActiveClaimsObserved(consumerRoot)
+  if (claims.status === 'unknown')
+    return {
+      exceeded: false,
+      entries: [],
+      diagnostics: [`worktree backlog unknown: ${claims.reason}`],
+    }
+  const report: WorktreeBacklog = { exceeded: false, entries: [], diagnostics: [] }
+  const localHelper = ['scripts/wt-helper.ts', 'vendor/scripts/wt-helper.ts'].find((path) =>
+    existsSync(join(consumerRoot, path)),
+  )
+  const helper = `node ${shellQuote(localHelper ?? join(WT_HELPER_DIR, 'wt-helper.ts'))}`
+  for (const worktree of sessionWorktrees(consumerRoot)) {
+    if (claims.value.some((claim) => claim.worktree_path === worktree.path)) continue
+    try {
+      const row = enrichWorktree(consumerRoot, worktree, { landed: withLanded, now })
+      const landedState = withLanded
+        ? row.landedState
+        : row.mergedToMain
+          ? 'in-history'
+          : 'unchecked'
+      const ahead = branchAheadCount(consumerRoot, row.branch)
+      if (landedState === 'unknown' || ahead === null) {
+        report.diagnostics.push(
+          `worktree backlog unknown at ${row.path}: ${row.landedReason ?? 'ahead unreadable'}`,
+        )
+        continue
+      }
+      const landed = ['in-history', 'in-base', 'in-worktree', 'superseded'].includes(landedState)
+      // daysOld is rounded for display; the >7d boundary uses the actual timestamp.
+      const stale =
+        row.lastCommit !== null &&
+        now - Date.parse(row.lastCommit) > WORKTREE_STALE_DAYS * 86_400_000
+      if (!landed && !(ahead > 0 && stale)) continue
+      const slug = basename(row.path)
+      const action = landed
+        ? `${helper} cleanup ${shellQuote(slug)} --dry-run${landedState === 'in-worktree' ? '；先正式 commit main，保留來源' : ''}`
+        : `${helper} merge-back ${shellQuote(slug)} --patch --dry-run；batch 已認領時走 batch status`
+      report.entries.push({
+        path: row.path,
+        branch: row.branch,
+        slug,
+        landedState: landedState,
+        daysOld: row.daysOld,
+        ahead,
+        // Budget mode skips the per-tree status/superseded probes; null means "not read".
+        dirty: row.dirty ?? null,
+        supersededBy: row.supersededBy ?? [],
+        action,
+      })
+    } catch (error) {
+      report.diagnostics.push(
+        `worktree backlog unknown at ${worktree.path}: ${errorMessage(error)}`,
+      )
+    }
+  }
+  report.exceeded = report.entries.length > WORKTREE_BACKLOG_LIMIT
+  return report
+}
+
+export async function cmdBacklog(opts: { json?: boolean; noLandedState?: boolean } = {}) {
+  const report = collectWorktreeBacklog(findConsumerRoot(), { landed: !opts.noLandedState })
+  for (const diagnostic of report.diagnostics) console.error(diagnostic)
+  if (opts.json) console.log(JSON.stringify(report, null, 2))
+  else process.stdout.write(formatWorktreeBacklog(report))
+}
+
+async function cmdPrune() {
+  const consumerRoot = findConsumerRoot()
+  const wts = sessionWorktrees(consumerRoot)
+  const claims = readActiveClaimsObserved(consumerRoot)
+  if (claims.status === 'unknown') throw new Error(`prune retained: ${claims.reason}`)
+  const candidates = wts.filter((w) => {
+    if (w.locked || claims.value.some((claim) => claim.worktree_path === w.path)) return false
+    const state = classifyLandedState(consumerRoot, w.branch.replace('refs/heads/', '')).landedState
+    return state === 'in-history' || state === 'in-base'
+  })
+
+  if (candidates.length === 0) {
+    console.log('No merged session worktrees to prune.')
+    return
+  }
+
+  for (const c of candidates) {
+    const branchName = c.branch.replace('refs/heads/', '')
+    const ans = (await prompt(`Remove worktree ${c.path} (branch ${branchName})? [y/N] `))
+      .trim()
+      .toLowerCase()
+    if (ans === 'y' || ans === 'yes') {
+      try {
+        probeLiveWriterCwd(c.path)
+        await cmdCleanup(basename(c.path), {})
+      } catch (e) {
+        console.error(`skip ${c.path}: ${e instanceof Error ? e.message : String(e)}`)
+        continue
+      }
+    } else {
+      console.log(`Skipped ${c.path}`)
+    }
+  }
+}
+
+/**
+ * Reclaim dev-port slots held by stale worktrees (TD-563).
+ *
+ * Iterates dev-port holders, checks each worktree's staleness via enrichWorktree,
+ * and deletes the dev-port JSON record for stale ones. Does NOT remove the
+ * worktree directory unless `--remove-landed` is given: then an in-history source
+ * is also passed through cleanup after claim, writer, lock and WIP checks (TD-863).
+ * Agents run the bare form automatically when the port pool is full, so the
+ * default MUST stay slot-only. Live and unknown holders are retained.
+ * --dry-run changes neither slots nor trees.
+ */
+async function cmdReclaimStale({ dryRun = false, removeLanded = false } = {}) {
+  const consumerRoot = findConsumerRoot()
+  const declared = readDeclaredDevPorts(consumerRoot)
+  if (declared.length === 0) {
+    console.log('No dev-port declarations found for this consumer.')
+    return
+  }
+
+  const holders = devPortHolders(consumerRoot)
+  if (holders.length === 0) {
+    console.log('No dev-port slots are held.')
+    return
+  }
+
+  const wts = sessionWorktrees(consumerRoot)
+  const wtBySlug = new Map(wts.map((w) => [basename(w.path), w]))
+
+  let freed = 0
+  const unknown = []
+  // `--dry-run` 是全域認得的旗標，TD-1142 的未知旗標檢查不會擋它；這裡不接的話它被靜默吞掉、照樣 unlink。
+  const release = (h, why) => {
+    if (dryRun) {
+      console.log(`  would free +${h.offset}  ${h.slug}  (${why})`)
+      freed++
+      return
+    }
+    try {
+      if (releaseWorktreeDevPorts(consumerRoot, h.wtPath) > 0) {
+        console.log(`  freed +${h.offset}  ${h.slug}  (${why})`)
+        freed++
+      }
+    } catch (e) {
+      // 釋放端的新失敗形狀（鎖被佔、紀錄半途被改）不能靜默吞掉——留著不說的話
+      // 槽位看起來還被佔著卻沒人知道為什麼。
+      console.error(`  retain ${h.slug}: dev-port release failed: ${e?.message ?? e}`)
+    }
+  }
+  for (const h of holders) {
+    const w = wtBySlug.get(h.slug)
+    if (!w) {
+      // Holder has no matching worktree entry (orphan record) — reclaim
+      release(h, 'orphan — no matching worktree')
+      continue
+    }
+
+    const enriched = enrichWorktree(consumerRoot, w)
+    if (enriched.staleness === 'stale' && !removeLanded) {
+      release(h, enriched.mergedToMain ? 'merged' : `status: ${enriched.briefStatus}`)
+    } else if (enriched.staleness === 'stale') {
+      const claims = readActiveClaimsObserved(consumerRoot)
+      if (
+        claims.status === 'unknown' ||
+        claims.value.some((claim) => claim.worktree_path === w.path)
+      ) {
+        console.log(`  retain ${h.slug}: active claim or unreadable claims`)
+        continue
+      }
+      try {
+        if (w.locked) throw new Error('worktree is locked')
+        probeLiveWriterCwd(w.path)
+      } catch (error) {
+        console.error(`  retain ${h.slug}: ${errorMessage(error)}`)
+        continue
+      }
+      release(h, enriched.mergedToMain ? 'merged' : `status: ${enriched.briefStatus}`)
+      if (enriched.mergedToMain) {
+        try {
+          // Automatic removal needs stronger admission than an informational staleness verdict.
+          if (countWorktreeDirty(w.path) !== 0)
+            throw new Error('source has WIP or unreadable status')
+          await cmdCleanup(h.slug, { dryRun })
+        } catch (error) {
+          console.error(`  retain ${h.slug}: ${errorMessage(error)}`)
+        }
+      }
+    } else if (enriched.staleness === 'live') {
+      // Active session — do not touch
+    } else {
+      unknown.push({ ...h, enriched })
+    }
+  }
+
+  if (unknown.length > 0) {
+    console.log(`\n${unknown.length} holder(s) with unknown staleness (not auto-reclaimed):`)
+    for (const u of unknown) {
+      console.log(
+        `  +${u.offset}  ${u.slug}  (status: ${u.enriched.briefStatus ?? 'none'}, ${u.enriched.daysOld ?? '?'}d old)`,
+      )
+    }
+  }
+
+  const capacity = devPortCapacity(declared, readWorktreeBand(consumerRoot))
+  const remaining = holders.length - freed
+  console.log(
+    dryRun
+      ? `\nDry run: would reclaim ${freed} slot(s); nothing released. ${holders.length}/${capacity} held.`
+      : `\nReclaimed ${freed} slot(s). ${remaining}/${capacity} still held.`,
+  )
+}
+
+// Unmerged XY status codes from `git status --porcelain` (per git-status(1)
+// "Short Format" → "Unmerged entries"). Used by both pre-fork baseline guard
+// and merge-back to refuse auto-handling of in-conflict paths.
+const UNMERGED_XY = new Set(['DD', 'AU', 'UD', 'UA', 'DU', 'AA', 'UU'])
+
+// Detect dirty paths in main's working tree (modified / untracked / unmerged).
+// Used by pre-fork baseline guard in cmdAdd + by `detect-main-dirty` subcommand
+// for callers (merge-back entry) that need to decide commit-vs-stash-vs-stop
+// before fork creates a worktree blind to main's working state.
+//
+// IMPORTANT: same parsing constraint as detectMergeBlockers — cannot use the
+// `git()` helper because it trims output, eating the leading space in porcelain
+// XY format (e.g., ` M README.md` → `M README.md`) and breaking column parsing.
+function detectMainDirty(consumerRoot) {
+  let statusRaw = ''
+  try {
+    statusRaw = execFileSync('git', ['status', '--porcelain'], {
+      cwd: consumerRoot,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+  } catch {
+    return { modified: [], untracked: [], conflicted: [] }
+  }
+
+  const modified = []
+  const untracked = []
+  const conflicted = []
+  for (const line of statusRaw.split('\n')) {
+    if (line.length < 4) continue
+    const status = line.slice(0, 2)
+    const path = line.slice(3)
+    if (UNMERGED_XY.has(status)) {
+      conflicted.push({ path, status })
+    } else if (status === '??') {
+      untracked.push({ path })
+    } else {
+      modified.push({ path, status })
+    }
+  }
+  return { modified, untracked, conflicted }
+}
+
+// Classify each unmerged path as safe-resolvable or unsafe. Stale UU (index
+// residue from a prior merge/rebase that was never finalized) has no conflict
+// markers in the file and no in-progress operation state — `git add` to mark
+// resolved is data-safe. Real conflicts (markers in file) or mid-operation
+// state (.git/MERGE_HEAD / REBASE_HEAD / CHERRY_PICK_HEAD, plus the
+// rebase-merge/ and rebase-apply/ directories git uses for interactive and
+// am-based rebases) require user intervention; auto-resolving them risks
+// data loss.
+//
+// Returns: { safe: [{ path, status }], unsafe: [{ path, status, reason }] }
+// where reason ∈ 'markers' | 'merge-head' | 'rebase-head' | 'cherry-pick-head'
+export function classifyUnmergedSafety(consumerRoot, conflicted) {
+  if (!Array.isArray(conflicted) || conflicted.length === 0) {
+    return { safe: [], unsafe: [] }
+  }
+
+  // Resolve the actual .git dir (handles main worktree, submodule, linked
+  // worktree). For the consumerRoot we expect a main repo, but be defensive.
+  let gitDir = join(consumerRoot, '.git')
+  try {
+    const raw = git(['rev-parse', '--git-dir'], { cwd: consumerRoot })
+    gitDir = resolve(consumerRoot, raw)
+  } catch {}
+
+  let inProgressReason = null
+  if (existsSync(join(gitDir, 'MERGE_HEAD'))) {
+    inProgressReason = 'merge-head'
+  } else if (
+    existsSync(join(gitDir, 'REBASE_HEAD')) ||
+    existsSync(join(gitDir, 'rebase-merge')) ||
+    existsSync(join(gitDir, 'rebase-apply'))
+  ) {
+    inProgressReason = 'rebase-head'
+  } else if (existsSync(join(gitDir, 'CHERRY_PICK_HEAD'))) {
+    inProgressReason = 'cherry-pick-head'
+  }
+
+  if (inProgressReason) {
+    return {
+      safe: [],
+      unsafe: conflicted.map((c) => ({ path: c.path, status: c.status, reason: inProgressReason })),
+    }
+  }
+
+  // Match a conflict marker line. Git always writes markers as a row of seven
+  // identical chars; the start/end variants have a trailing space + label,
+  // and the middle separator is the bare seven `=` row. Use multiline-anchored
+  // regex so we match whole lines only and avoid catching `<<<<<<<` embedded in
+  // prose.
+  const MARKER_RE = /^(?:<{7}(?: .*)?|={7}|>{7}(?: .*)?)$/m
+  const safe = []
+  const unsafe = []
+  for (const c of conflicted) {
+    const abs = join(consumerRoot, c.path)
+    let hasMarkers = false
+    try {
+      const content = readFileSync(abs, 'utf8')
+      hasMarkers = MARKER_RE.test(content)
+    } catch {
+      // File missing (DD/DU/UD state) → conservative: treat as having
+      // markers so cmdAdd refuses auto-resolve.
+      hasMarkers = true
+    }
+    if (hasMarkers) {
+      unsafe.push({ path: c.path, status: c.status, reason: 'markers' })
+    } else {
+      safe.push({ path: c.path, status: c.status })
+    }
+  }
+  return { safe, unsafe }
+}
+
+// Stage a specific path list + commit ONLY those paths. `git add -- <paths>`
+// first so untracked scope-in files get included (commit --only rejects bare
+// untracked pathspecs); then `git commit --only -- <paths>` commits exactly
+// those paths and restores the prior index afterward. Crucially the bare
+// `git commit -m` previously used here committed the WHOLE index, so any
+// OTHER-session WIP already pre-staged in main's index got folded into the
+// pre-fork baseline commit (perno per-client-module-isolation hit this: main's
+// index had badge-wt salary/overtime staged). `--only` isolates exactly
+// scopePaths, aligning with rules/core/commit.md «Ad-hoc commit 必走
+// git commit --only». Used by pre-fork baseline guard's `commit` strategy.
+//
+// Caller responsibility: pass a commitlint-compliant message (the baseline
+// caller in this file emits `🧹 chore(baseline): pre-fork sync for <change>`,
+// which clears emoji-conventional gates). pre-commit / commit-msg hooks run
+// normally — baseline content is user-edited working tree, lint/test/fmt over
+// it are legitimate gates.
+function gitSelectiveCommit(consumerRoot, scopePaths, message) {
+  if (!Array.isArray(scopePaths) || scopePaths.length === 0) {
+    throw new Error('gitSelectiveCommit: scopePaths must be a non-empty array')
+  }
+  git(['add', '--', ...scopePaths], { cwd: consumerRoot, stdio: 'inherit' })
+  // `-m message` MUST precede the `--` separator. Anything after `--` is a
+  // pathspec, so `commit --only -- <paths> -m <msg>` makes git treat `-m` and
+  // the message as filenames ("pathspec '-m' did not match"). Order: flags →
+  // `--` → paths.
+  git(['commit', '--only', '-m', message, '--', ...scopePaths], {
+    cwd: consumerRoot,
+    stdio: 'inherit',
+  })
+}
+
+// Detect files in main's working tree that would block `git merge --squash <branch>`:
+// any branch-modified path that is either staged/unstaged-modified or untracked in main.
+//
+// IMPORTANT: cannot use the `git()` helper here — it trims output which would eat
+// the leading space in porcelain format (e.g., ` M README.md` → `M README.md`),
+// breaking the column-precise XY/space/path parsing.
+function detectMergeBlockers(consumerRoot, branchName) {
+  let branchFiles = []
+  try {
+    const base = resolveLandingBase(consumerRoot)
+    const out = git(['diff', '--name-only', `${base}...${branchName}`], { cwd: consumerRoot })
+    branchFiles = out.split('\n').filter(Boolean)
+  } catch {
+    return []
+  }
+  if (branchFiles.length === 0) return []
+
+  let statusRaw = ''
+  try {
+    statusRaw = execFileSync('git', ['status', '--porcelain'], {
+      cwd: consumerRoot,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+  } catch {
+    return []
+  }
+
+  const modifiedSet = new Set()
+  const untrackedSet = new Set()
+  for (const line of statusRaw.split('\n')) {
+    if (line.length < 4) continue
+    const status = line.slice(0, 2)
+    const path = line.slice(3)
+    if (status === '??') untrackedSet.add(path)
+    else modifiedSet.add(path)
+  }
+
+  const blockers = []
+  for (const f of branchFiles) {
+    if (modifiedSet.has(f)) blockers.push({ path: f, type: 'modified' })
+    else if (untrackedSet.has(f)) blockers.push({ path: f, type: 'untracked' })
+  }
+  return blockers
+}
+
+// Detect uncommitted files in a session worktree's working tree. These would
+// be permanently destroyed by `git worktree remove --force` — distinct from
+// detectUnlandedFiles which only checks committed branch HEAD vs main. Gate
+// added after TDMS 2026-05-17 incident where 47 baseline files lived only in
+// the worktree's working tree (applied from stash, never committed) and
+// vanished on cleanup.
+function detectUncommittedWorktreeFiles(wtPath): Observed<UncommittedFiles> {
+  let statusRaw = ''
+  try {
+    statusRaw = execFileSync('git', ['status', '--porcelain', '-z'], {
+      cwd: wtPath,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+  } catch (error) {
+    return toUnknown(`uncommitted status unreadable at ${wtPath}: ${errorMessage(error)}`)
+  }
+  // `-z`：路徑不 quote（不帶 -z 時非 ASCII 路徑會變成 "\351\251\227…"，--discard-pathspec 與
+  // isIgnorableWorktreeDrift 都比不中）。rename／copy 在 -z 下是 `XY new\0orig\0`，
+  // 這裡照舊組回 `orig -> new`，下游以 ' -> ' 拆。
+  const modified = []
+  const untracked = []
+  const fields = statusRaw.split('\0')
+  for (let i = 0; i < fields.length; i++) {
+    const field = fields[i]
+    if (field.length < 4) continue
+    const status = field.slice(0, 2)
+    let path = field.slice(3)
+    if (status.includes('R') || status.includes('C')) path = `${fields[++i]} -> ${path}`
+    if (status === '??') untracked.push({ path })
+    else modified.push({ path, status })
+  }
+  return known({ modified, untracked })
+}
+
+/**
+ * `main..<branch>` 的 commit 數。查不到（branch 不存在 / git 失敗）回 `null` —— 呼叫端
+ * 只在**嚴格等於 0** 時才放行 gate，錯誤絕不 fail-open。
+ */
+function branchAheadCount(consumerRoot, branchName) {
+  try {
+    const base = resolveLandingBase(consumerRoot)
+    const out = git(['rev-list', '--count', `${base}..${branchName}`], { cwd: consumerRoot }).trim()
+    const n = Number.parseInt(out, 10)
+    return Number.isNaN(n) ? null : n
+  } catch {
+    return null
+  }
+}
+
+/** 未進 main 的 commit（`<sha> <subject>` 一行一條）。 */
+function unlandedCommits(consumerRoot, branchName) {
+  try {
+    const base = resolveLandingBase(consumerRoot)
+    return git(['log', '--oneline', '--no-decorate', `${base}..${branchName}`], {
+      cwd: consumerRoot,
+    })
+      .split('\n')
+      .filter(Boolean)
+  } catch {
+    return []
+  }
+}
+
+function detectUnlandedFiles(consumerRoot, branchName) {
+  // 0 ahead ⇒ branch 的每一個 commit 都已在 main 的 history 裡，cleanup 不可能讓任何
+  // commit 遺失。這是**可證的**，不是啟發式，所以整個 gate 直接跳過。
+  //
+  // 底下的判準是「branch 版本的檔案內容 vs main **工作區**」，它回答不了「會不會遺失
+  // commit」這題：main 之後只要往前走，那些被 main 改新的檔一律被報成「內容不在 main」，
+  // branch 是無辜的——它只是舊。實測 `mts-to-ts` / `round3` / `ts-migration` 三個 `0 ahead
+  // / userWip=0` 的 branch 全被擋，點名的 11 個檔正是同一 session 幾分鐘前在 main 改新的。
+  //
+  // 危害不是擋錯本身，是**訓練使用者對 `--force-discard-unland` 脫敏**：這個 flag 的語義
+  // 是「我接受 branch 的 commit 會永久遺失」，若每次收乾淨的 wt 都要打它，真正該被它擋下
+  // 的那次就不會有人停下來看。TD-302，同家族 TD-291 / TD-297。
+  if (branchAheadCount(consumerRoot, branchName) === 0) return []
+
+  // 檔案集 MUST 取 `merge-base..branch`（branch **自己**改過的檔），NEVER 取
+  // `main..branch`。後者是 main tip 與 branch tip 的兩點 diff —— branch 落後 main N 個
+  // commit 時，那 N 個 commit 動過的檔全部被算進來，而 branch 從沒碰過它們。實測 perno
+  // `app-drawer-form-footer`（behind 488 / ahead 1、自身只改 6 個檔）被報成 1900 個
+  // 「內容不在 main」，其中 1894 個是 main 自己往前走的結果。
+  //
+  // 這與上面 ahead===0 短路是同一個 TD-302 家族的缺陷：短路只擋掉 ahead===0 那一種，
+  // ahead>0 且 behind 很多的（也就是絕大多數長命 worktree）照樣被淹沒。
+  let branchFiles = []
+  try {
+    const landingBase = resolveLandingBase(consumerRoot)
+    const base = git(['merge-base', landingBase, branchName], { cwd: consumerRoot }).trim()
+    if (!base) return []
+    const out = git(['diff', '--name-only', `${base}...${branchName}`], { cwd: consumerRoot })
+    branchFiles = out.split('\n').filter(Boolean)
+  } catch {
+    return []
+  }
+  const unlanded = []
+  for (const f of branchFiles) {
+    try {
+      git(['diff', '--quiet', branchName, '--', f], { cwd: consumerRoot })
+    } catch {
+      unlanded.push(f)
+    }
+  }
+  return unlanded
+}
+
+// ── Squash-landing marker (refs/wt-landed/<slug>) ─────────────────────────
+//
+// `/wt` 的收尾是 `git merge --squash <branch>` —— squash **不建立 merge 邊**，所以 land
+// 完成後 `git branch --merged main` 仍然看不到這條 branch，`main..<branch>` 也仍然回報
+// N 個 commit「不在 main」。cleanup 的前兩道 gate 純看 ancestry，於是對**每一個**正常
+// land 完的 worktree 都誤報。
+//
+// 內容比對補不了這個洞：land 之後 main 通常還會再改（manual review fix、後續 commit），
+// 於是 branch 版本與 main 版本既非 byte-equal、三方合併也會在同一批行上衝突。2026-08-22
+// 於 perno 實測兩條**已確認 land** 的 branch：`git merge-tree --write-tree` 兩條都非
+// main^{tree}，逐檔三方吸收測試 14 個檔有 8 個 CONFLICT。「已 land」在 squash 之後是
+// **不可由內容反推**的，這不是實作不夠好，是資訊已經被 squash 丟掉了。
+//
+// 唯一能證明的辦法是在 squash 當下把事實記下來：wt-helper 自己執行了 squash，它知道吃
+// 進去的是哪一個 branch tip。marker 記那個 tip sha，cleanup 只在 **sha 仍逐字相符** 時
+// 採信 —— branch 之後又長出新 commit，marker 立刻失效，gate 恢復原本的擋法。
+//
+// NEVER 把 marker 讀成「main 已 commit」：`git merge --squash` 只 stage 不 commit，落地
+// 由呼叫端在 main 跑 /commit 收尾。marker 的語義嚴格是「wt-helper 已把這個 tip 的
+// changeset 併進 main 的 index」。這已經**嚴格強於現況**：cmdMergeBack 今天是無條件對
+// 自己的 cleanup 傳 force + forceDiscardUnland，連 tip 相不相符都沒驗。
+// ── Superseded declaration (cleanup --superseded-by, TD-1082) ─────────────
+//
+// detectAbsorbedByOtherPath 的反套判準刻意不放寬：main 對同一段做過後續修改，branch 的
+// hunk 就反套不回去，一律判 unlanded。這時「已被 main 後續演進取代」是人工判定，而它原本
+// 唯一的出口是 `--force --force-discard-unland`——lifecycle gate 禁止拿 `--force` 代替判斷，
+// 於是這類樹只能 retained。本宣告是那個判定的**載體**：逐檔要證據、不成立就整個不放行，
+// 成立時先把 branch tip 釘進 refs/wt-superseded/ 並寫事件，之後才移除。
+//
+// NEVER 拿它放寬 absorbed 判準本身，也 NEVER 部分放行（覆蓋 5/6 檔 = 不成立）。
+//
+// 每個條目（逗號分隔）：
+//   <commit>          main 上、不在 branch history 裡的 commit；它觸及的 unlanded 檔算被取代
+//   <file>=<commit>   同上但只套到 <file>，且該 commit MUST 觸及 <file>
+//   <file>=<path>     <file> 被 main 上的具名檔取代（例：後繼 brief）；<path> MUST 存在於 main
+function supersededRef(slug, tip) {
+  return `refs/wt-superseded/${slug}-${tip.slice(0, 12)}`
+}
+
+export function verifySupersededDeclaration(consumerRoot, branchName, unlanded, raw) {
+  const cwd = consumerRoot
+  const specs = String(raw ?? '')
+    .split(',')
+    .map((spec) => spec.trim())
+    .filter(Boolean)
+  const errors = []
+  const covered = new Map()
+  if (specs.length === 0) errors.push('--superseded-by 沒有任何條目')
+  const landingBase = resolveLandingBase(cwd)
+  const commitOf = (rev) => {
+    try {
+      return git(['rev-parse', '--verify', '--quiet', `${rev}^{commit}`], { cwd }).trim() || null
+    } catch {
+      return null
+    }
+  }
+  const isAncestor = (a, b) => {
+    try {
+      git(['merge-base', '--is-ancestor', a, b], { cwd })
+      return true
+    } catch {
+      return false
+    }
+  }
+  // 「main 上晚於 branch」：在 main（或 landing base）上，且不在 branch 自己的 history 裡。
+  const notLaterOnMain = (sha) => {
+    if (!isAncestor(sha, 'main') && !isAncestor(sha, landingBase))
+      return `${sha.slice(0, 9)} 不在 main／${landingBase} 上`
+    if (isAncestor(sha, branchName))
+      return `${sha.slice(0, 9)} 已在 ${branchName} 的 history 裡，不是晚於 branch 的演進`
+    return null
+  }
+  const touched = (sha) =>
+    new Set(
+      git(['diff-tree', '--no-commit-id', '--name-only', '-r', '-m', '--root', sha], { cwd })
+        .split('\n')
+        .filter(Boolean),
+    )
+  for (const spec of specs) {
+    const eq = spec.indexOf('=')
+    if (eq === -1) {
+      const sha = commitOf(spec)
+      if (!sha) {
+        errors.push(`${spec}：不是 commit（檔案被取代請寫 <file>=<path>）`)
+        continue
+      }
+      const bad = notLaterOnMain(sha)
+      if (bad) {
+        errors.push(bad)
+        continue
+      }
+      const files = touched(sha)
+      const hit = unlanded.filter((file) => files.has(file))
+      if (hit.length === 0) {
+        errors.push(`${sha.slice(0, 9)} 沒有觸及任何 unlanded 檔`)
+        continue
+      }
+      for (const file of hit) if (!covered.has(file)) covered.set(file, { by: sha, kind: 'commit' })
+      continue
+    }
+    const file = spec.slice(0, eq)
+    const target = spec.slice(eq + 1)
+    if (!unlanded.includes(file)) {
+      errors.push(`${file}：不在 unlanded 清單裡`)
+      continue
+    }
+    const sha = commitOf(target)
+    if (sha) {
+      const bad = notLaterOnMain(sha)
+      if (bad) errors.push(bad)
+      else if (!touched(sha).has(file)) errors.push(`${sha.slice(0, 9)} 沒有觸及 ${file}`)
+      else covered.set(file, { by: sha, kind: 'commit' })
+      continue
+    }
+    if (target === file) {
+      errors.push(`${file}=${target}：取代檔不能是它自己（main 改寫過它就給那個 commit）`)
+      continue
+    }
+    try {
+      git(['cat-file', '-e', `main:${target}`], { cwd })
+      covered.set(file, { by: target, kind: 'path' })
+    } catch {
+      errors.push(`${target}：不存在於 main`)
+    }
+  }
+  const uncovered = unlanded.filter((file) => !covered.has(file))
+  return {
+    ok: errors.length === 0 && uncovered.length === 0,
+    errors,
+    uncovered,
+    coverage: [...covered].map(([file, value]) => ({ file, ...value })),
+  }
+}
+
+// 移除前的憑證：ref 讓 branch 的 commit 在 `branch -D` 之後仍可達。寫不進去就 throw——
+// NEVER 降成 warn 照樣移除。
+function pinSupersededTip(consumerRoot, slug, branchName, reason) {
+  const cwd = consumerRoot
+  const tip = git(['rev-parse', '--verify', `${branchName}^{commit}`], { cwd }).trim()
+  const ref = supersededRef(slug, tip)
+  git(['update-ref', '-m', `wt-helper cleanup --superseded-by: ${reason}`, ref, tip], { cwd })
+  return { tip, ref }
+}
+
+// 事件記下誰據什麼宣告移除了樹：只在 `git worktree remove` 成功後寫，env cleanup 或移除
+// 失敗時不留一筆沒發生的 cleanup（重跑也不重複 append）。寫在 `branch -D` 之前——寫不進去
+// 就 throw，branch 留著，不會出現「已刪卻沒有事件」。
+function recordSupersededCleanup(consumerRoot, slug, branchName, pinned, declaration, reason) {
+  const cwd = consumerRoot
+  const { tip, ref } = pinned
+  const commonDir = resolve(cwd, git(['rev-parse', '--git-common-dir'], { cwd }).trim())
+  appendFileSync(
+    join(commonDir, 'wt-superseded.jsonl'),
+    `${JSON.stringify({
+      at: new Date().toISOString(),
+      slug,
+      branch: branchName,
+      tip,
+      ref,
+      reason,
+      coverage: declaration.coverage,
+    })}\n`,
+  )
+}
+
+function landedMarkerRef(slug) {
+  return `refs/wt-landed/${slug}`
+}
+
+function writeLandedMarker(consumerRoot, slug, sha) {
+  if (!sha) return false
+  try {
+    git(['update-ref', landedMarkerRef(slug), sha], { cwd: consumerRoot })
+    return true
+  } catch {
+    // marker 純屬加分證據，寫不進去不該讓 merge-back 失敗 —— 退回原本的 gate 行為即可。
+    return false
+  }
+}
+
+function deleteLandedMarker(consumerRoot, slug) {
+  try {
+    git(['update-ref', '-d', landedMarkerRef(slug)], { cwd: consumerRoot })
+  } catch {}
+}
+
+/** marker 存在且逐字等於 branch 現在的 tip 才回 true。取不到一律 false（fail-closed）。 */
+function isSquashLanded(consumerRoot, slug, branchName) {
+  let marked
+  try {
+    marked = git(['rev-parse', '--verify', `${landedMarkerRef(slug)}^{commit}`], {
+      cwd: consumerRoot,
+    }).trim()
+  } catch {
+    return false
+  }
+  let tip
+  try {
+    tip = git(['rev-parse', '--verify', `${branchName}^{commit}`], { cwd: consumerRoot }).trim()
+  } catch {
+    return false
+  }
+  return Boolean(marked) && marked === tip
+}
+
+// ── Merged-PR landing credential (TD-1103) ─────────────────────────────
+//
+// 三條本地憑證對「PR 在 GitHub 上 squash-merge」結構性失明：marker 只有 wt-helper
+// 自己 land 才寫、squash 不建 merge 邊（ancestry 恆 false）、main 後續動過同段
+// context 就讓 hunk 反套失敗（absorbed 恆 false）。伺服器端其實已記下落地事實
+// —— merged PR 的 `headRefOid` 就是當時送進 merge 的 branch tip —— 這一條把它
+// 讀回來。
+//
+// 命中條件（全中才算）：
+//   1. `gh pr list --head <branch> --state merged` 回傳至少一筆 record
+//   2. `baseRefName` 等於 landing base（resolveLandingBase，本 repo 即 main）
+//   3. `headRefOid` **逐字**等於 branch 現在的 tip —— merge 後 tip 前移（D 桶）
+//      自動不相等，不需要另寫規則擋。
+//   record 帶 `mergeCommit.oid` 且該 commit 與 `origin/<base>` 在本地都可解析時，
+//   加驗它是 origin/<base> 祖先（擋 base 被重寫的 case）；本地看不到就只靠
+//   server 端欄位採信 —— TD-1103 已把那組欄位本身列為 airtight。
+//
+// 只放行、NEVER 擋：gh 缺席／離線／rate limit／逾時／回傳殘缺一律 `unknown`，
+// 下游照舊走原本三道 gate —— 行為與沒有這條憑證時逐字相同（fail closed）。
+// probe 也只在三條本地憑證全失手時才跑：cleanup 的 gh／網路依賴因此只出現在
+// 「現況本就會 BLOCKED」的分支上，永不變成新的阻擋來源。
+
+const MERGED_PR_PROBE_TIMEOUT_MS = 15_000
+
+/**
+ * 預設 probe：`gh pr list` 找 `<branch>` 的 merged PR。回 `Observed` ——
+ * 任何失敗（gh 缺席、離線、rate limit、逾時、殘缺回傳）都是 `unknown`，
+ * NEVER throw。
+ */
+function defaultMergedPrProbe(consumerRoot, branchName) {
+  // repo identity 與 wt-batch 對齊：同一條 remote.origin.url → owner/repo 解析。
+  const repository = githubRepositoryFromRemote(consumerRoot)
+  if (!repository) return toUnknown('origin is not a GitHub remote (or unset)')
+  let raw
+  try {
+    raw = execFileSync(
+      'gh',
+      [
+        'pr',
+        'list',
+        '--repo',
+        repository,
+        '--head',
+        branchName,
+        '--state',
+        'merged',
+        '--json',
+        'number,headRefOid,baseRefName,mergeCommit',
+        '--limit',
+        '20',
+      ],
+      {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: MERGED_PR_PROBE_TIMEOUT_MS,
+      },
+    )
+  } catch (e) {
+    return toUnknown(`gh pr list failed: ${errorMessage(e)}`)
+  }
+  let rows
+  try {
+    rows = JSON.parse(raw)
+  } catch (e) {
+    return toUnknown(`gh pr list returned non-JSON: ${errorMessage(e)}`)
+  }
+  if (!Array.isArray(rows)) return toUnknown('gh pr list returned a non-array payload')
+  for (const r of rows) {
+    if (
+      typeof r?.number !== 'number' ||
+      typeof r?.headRefOid !== 'string' ||
+      typeof r?.baseRefName !== 'string'
+    ) {
+      return toUnknown('gh pr list returned an incomplete record')
+    }
+  }
+  return known(rows)
+}
+
+/**
+ * 便宜 belt：record 帶 `mergeCommit.oid`、且該 commit 與 `origin/<base>` 在本地都
+ * 可解析時，要求它是 origin/<base> 的祖先。本地看不到（merge 後還沒 fetch）就
+ * 跳過這層 —— server 端欄位本身已是 airtight 憑證，belt 只擋「base 被重寫」。
+ */
+function mergedPrCommitOnBase(consumerRoot, record, landingBase) {
+  const oid = record?.mergeCommit?.oid
+  if (typeof oid !== 'string' || !oid.trim()) return true
+  const sha = oid.trim()
+  const baseRef = `refs/remotes/origin/${landingBase}`
+  try {
+    git(['rev-parse', '--verify', `${sha}^{commit}`], { cwd: consumerRoot })
+    git(['rev-parse', '--verify', `${baseRef}^{commit}`], { cwd: consumerRoot })
+  } catch {
+    return true
+  }
+  try {
+    git(['merge-base', '--is-ancestor', sha, baseRef], { cwd: consumerRoot })
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * 「branch tip 是某個已 merge PR 的 head」的判定（TD-1103 第四條憑證）。
+ * 回 `Observed<{landed, pr?}>`；probe 可注入以便測試（比照 wt-batch 的
+ * `RemotePrProbe` 慣例）。只放行、NEVER 擋：任何讀不到都是 `unknown`。
+ */
+function detectMergedPrLanding(
+  consumerRoot,
+  branchName,
+  probe = defaultMergedPrProbe,
+): Observed<{ landed: boolean; pr?: number }> {
+  let tip
+  try {
+    tip = git(['rev-parse', '--verify', `${branchName}^{commit}`], { cwd: consumerRoot })
+      .trim()
+      .toLowerCase()
+  } catch {
+    return toUnknown(`branch tip unreadable: ${branchName}`)
+  }
+  const landingBase = resolveLandingBase(consumerRoot)
+  let obs
+  try {
+    obs = probe(consumerRoot, branchName)
+  } catch (e) {
+    return toUnknown(`merged-PR probe threw: ${errorMessage(e)}`)
+  }
+  if (obs.status !== 'known') return toUnknown(`merged-PR probe: ${obs.reason}`)
+  for (const r of obs.value) {
+    if (r.baseRefName !== landingBase) continue
+    if (typeof r.headRefOid !== 'string' || r.headRefOid.trim().toLowerCase() !== tip) continue
+    if (!mergedPrCommitOnBase(consumerRoot, r, landingBase)) continue
+    return known({ landed: true, pr: r.number })
+  }
+  return known({ landed: false })
+}
+
+/** Nearest ancestor holding a `.git` entry — the worktree's own top, not main's. */
+function findRepoTop(start = process.cwd()) {
+  let dir = resolve(start)
+  while (dir !== dirname(dir)) {
+    if (existsSync(join(dir, '.git'))) return dir
+    dir = dirname(dir)
+  }
+  throw new Error('Not inside a git repository (no .git found in any parent)')
+}
+
+/**
+ * Start the dev server on this worktree's allocated port.
+ *
+ * The port arrives as a CLI flag on a command this function spawns itself,
+ * which is the only layer that works: `.env.local` is read by Nuxt/Vite, not by
+ * the shell, so an env var there can never reach the `--port` argument baked
+ * into a consumer's `package.json` dev script. Bypassing that script is what
+ * keeps all 11 consumers' `package.json` untouched.
+ *
+ * Consumers whose dev entry does extra setup (env pinning, multiple targets)
+ * override the command via consumer-meta `dev.commands.worktreeSpawn`; it
+ * receives the port appended as `--port <N>`.
+ */
+async function cmdDev(alias, opts: WtOptions = {}) {
+  const repoTop = findRepoTop()
+  const consumerRoot = findConsumerRoot()
+  if (resolve(repoTop) === resolve(consumerRoot)) {
+    throw new Error(
+      `'wt-helper dev' is for worktrees; this is the main checkout (${consumerRoot}).\n` +
+        `Main holds the registry port and the dev tunnel — run 'pnpm dev' here.`,
+    )
+  }
+
+  // Worktrees created before TD-434 have no record; allocate on first use so
+  // they are not stranded on the shared port. `--dry-run` 只算不寫：預覽不能佔掉一格，
+  // 但分配不到時要報出跟實跑一樣的錯誤。
+  const record =
+    readWorktreeDevPorts(consumerRoot, repoTop) ??
+    (opts.dryRun
+      ? planWorktreeDevPorts(
+          consumerRoot,
+          repoTop,
+          readDeclaredDevPorts(consumerRoot),
+          readWorktreeBand(consumerRoot),
+        )
+      : allocateWorktreeDevPorts(consumerRoot, repoTop))
+  if (!record) {
+    throw new Error(
+      readDeclaredDevPorts(consumerRoot).length === 0
+        ? `This consumer declares no dev ports in .claude/consumer-meta.json — nothing to allocate.`
+        : devPortExhaustedReport(consumerRoot, readDeclaredDevPorts(consumerRoot)),
+    )
+  }
+
+  const entries = record.ports ?? []
+  const chosen = alias ? entries.find((p) => p.alias === alias) : entries[0]
+  if (!chosen) {
+    throw new Error(
+      `No dev port for alias '${alias}'. Declared: ${entries.map((p) => p.alias).join(', ') || '(none)'}`,
+    )
+  }
+
+  // `worktreeSpawn` carries the consumer's real invocation — its app subdir, its
+  // dotenv file, its fork mode. A worktree forked before the consumer declared
+  // that key has an older consumer-meta, and falling straight through to the
+  // bare Nuxt default silently drops all three: the server binds and answers
+  // 200, but every page 500s on missing env because the root dir and dotenv
+  // were never passed. Read main's copy before giving up, so an old worktree
+  // starts the same server a fresh one would.
+  //
+  // Silence is the whole problem here — a server that refuses to start is a
+  // five-second fix, one that starts wrong costs however long it takes someone
+  // to open a page and read the stack trace.
+  let spawnCmd = null
+  for (const root of [repoTop, findConsumerRoot()]) {
+    try {
+      const meta = JSON.parse(readFileSync(join(root, '.claude', 'consumer-meta.json'), 'utf8'))
+      const declared = meta?.dev?.commands?.worktreeSpawn
+      if (declared) {
+        if (resolve(root) !== resolve(repoTop)) {
+          console.error(
+            `note: this worktree's consumer-meta declares no dev.commands.worktreeSpawn — ` +
+              `using main's.\n` +
+              `      The worktree predates that key; its projected .claude is stale.`,
+          )
+        }
+        spawnCmd = declared
+        break
+      }
+    } catch {
+      // Missing or unparseable consumer-meta at this level — try the next.
+    }
+  }
+  spawnCmd ??= 'pnpm exec nuxt dev'
+
+  const full = `${spawnCmd} --port ${chosen.port}`
+  console.log(`wt-helper dev: ${chosen.alias} on ${chosen.port} (main uses ${chosen.mainPort})`)
+  const risk = detectSharedTunnelRisk(repoTop)
+  if (risk) {
+    console.error(
+      `⚠ ${risk.file} carries tunnel keys without dev.perWorktreeTunnel — the tunnel will\n` +
+        `  claim main's hostname and hijack its traffic. Comment those keys out for this\n` +
+        `  worktree, or opt into dev.perWorktreeTunnel in consumer-meta.json.`,
+    )
+  }
+  console.log(`  ${full}`)
+  if (opts.dryRun) return
+
+  const child = spawn(full, { cwd: repoTop, shell: true, stdio: 'inherit' })
+  await new Promise((resolvePromise) => {
+    child.on('exit', (code) => {
+      process.exitCode = code ?? 0
+      resolvePromise(undefined)
+    })
+  })
+}
+
+// Auto-generated commit messages MUST clear the fleet commitlint config
+// (`vendor/commitlint/commitlint.config.ts`) **and** clade's superset, which adds
+// `subject-has-chinese`. A subject that fails either one aborts the commit mid-flow
+// and leaves merge-back half-done (unfinished merge in the worktree, or fmt drift
+// still uncommitted) — the user then has to finish it by hand.
+//
+// Two constraints beyond the emoji-conventional header shape:
+//   1. subject MUST contain a Han character (clade-only rule, harmless elsewhere)
+//   2. header MUST stay within config-conventional's 100-char `header-max-length`,
+//      so anything unbounded (branch names, path lists) belongs in the body
+// Clamping the *assembled* subject is wrong: a long enough variable segment pushes
+// the Han characters past the cut and the result fails `subject-has-chinese`. Clamp
+// each unbounded segment instead, and keep the header's fixed part short enough that
+// the total can't reach 100 regardless.
+const COMMIT_SEGMENT_MAX = 40
+// config-conventional caps body lines at 100 too, so moving an unbounded value out
+// of the header is not enough on its own — every body line needs clamping as well.
+const COMMIT_BODY_LINE_MAX = 100
+
+function clampTo(value, max) {
+  const text = String(value ?? '')
+  return text.length <= max ? text : `${text.slice(0, max - 1)}…`
+}
+
+const clampCommitSegment = (value) => clampTo(value, COMMIT_SEGMENT_MAX)
+const clampCommitBodyLine = (value) => clampTo(value, COMMIT_BODY_LINE_MAX)
+
+export function preSyncCommitMessage(branchName) {
+  // Branch name is unbounded — body only.
+  return `🧹 chore: 合併 main 進 worktree 分支以在此解衝突\n\n${clampCommitBodyLine(branchName)}\n`
+}
+
+export function preForkBaselineCommitMessage(changeLabel) {
+  return `🧹 chore: fork worktree 前把 ${clampCommitSegment(changeLabel)} 的 baseline 落地`
+}
+
+export function fmtDriftCommitMessage(slug, paths) {
+  // Path list is unbounded — body only.
+  const body = paths.map(clampCommitBodyLine).join('\n')
+  return `🧹 chore: wt ${clampCommitSegment(slug)} 自動落地 ${paths.length} 個純格式漂移檔\n\n${body}\n`
+}
+
+// Merge main into the session worktree branch before merge-back squash, so
+// conflicts (if any) surface in the worktree's working tree rather than main's.
+// Legacy merge-back ran `git merge --squash <branch>` at main, contaminating
+// main on conflict (recovery required `merge --abort` + stash pop dance and
+// repeatedly destabilized publish/propagate flows). Pre-sync inverts direction:
+// `git merge origin/<landing-base>` inside <wtPath> isolates conflict resolution there.
+//
+// Strategy: merge (not rebase). Final merge-back is squash so wt commit-chain
+// shape is irrelevant; rebase would force per-commit replay on multi-phase wt
+// (e.g. 9-commit feature branches), strictly more painful than one merge pass.
+//
+// Returns { synced: false, behind: 0 } if wt is up-to-date with target.
+// Returns { synced: true, behind: N } on clean merge (creates a discrete
+// discrete pre-sync commit on the wt branch — see preSyncCommitMessage()).
+// Throws with structured guidance on conflict — does NOT auto-abort; leaves wt
+// in unmerged state so user can inspect markers, resolve, commit, re-run.
+// SoT for "which ref does the worktree flow treat as the landing target".
+// MUST stay the single source for BOTH pre-sync (aligns the wt branch to it)
+// and merge-back (fast-forwards local main to it before the squash). Two
+// independently-computed refs is precisely the asymmetry behind
+// pitfall-merge-back-presync-stages-origin-main-commits: pre-sync aligned the
+// branch to origin/main while the squash landed into a local main that was N
+// commits behind, so those N commits' files silently joined the staged scope.
+export function resolveSyncTargetRef(cwd, opts: { fetch?: boolean } = {}) {
+  // Resolve the consumer root's current branch so we sync against the real
+  // landing target, not a hardcoded 'main'. When the consumer root is on
+  // `feat/x`, the worktree must pre-sync to `origin/feat/x` — not
+  // `origin/main` (see TD-592, pitfall-merge-back-presync-stages-origin-main-commits).
+  const consumerRoot = findConsumerRoot(cwd)
+  const landingBase = resolveLandingBase(consumerRoot)
+  const remoteRef = `origin/${landingBase}`
+
+  let hasRemote = false
+  try {
+    git(['rev-parse', '--verify', remoteRef], { cwd })
+    hasRemote = true
+  } catch {}
+  if (!hasRemote) return landingBase
+  if (opts.fetch === false) return remoteRef
+  try {
+    git(['fetch', 'origin', landingBase], { cwd, stdio: 'inherit' })
+    return remoteRef
+  } catch (e) {
+    console.error(
+      `warn: pre-sync fetch origin ${landingBase} failed (${e.message ?? e}); falling back to local ${landingBase}`,
+    )
+    return landingBase
+  }
+}
+
+// Commits `<cwd HEAD>` is missing relative to `ref`. Returns 0 when ref is a
+// local branch (no remote info available) or the count cannot be read
+// (fail-open on measurement — the ff attempt below is what actually enforces
+// the invariant).
+function commitsBehindRef(cwd, ref) {
+  if (!ref.startsWith('origin/')) return 0
+  try {
+    return parseInt(git(['rev-list', '--count', `HEAD..${ref}`], { cwd }), 10) || 0
+  } catch {
+    return 0
+  }
+}
+
+// Commits on local main (HEAD at `consumerRoot`) that the branch lacks and that
+// pre-sync will not bring in — pre-sync merges `landingRef`, never local main
+// (TD-745). Unlike `commitsBehindRef` this is NOT fail-open: an unreadable count
+// throws, because the caller uses it to refuse a squash whose outcome it cannot
+// predict. `landingRef === 'main'` (no remote) makes it 0 by construction.
+function countCommitsMissingFromBranch(consumerRoot, branchName, landingRef) {
+  const exclude = [`^${branchName}`]
+  if (landingRef !== 'HEAD') exclude.push(`^${landingRef}`)
+  const out = git(['rev-list', '--count', 'HEAD', ...exclude], { cwd: consumerRoot })
+  return parseInt(out, 10) || 0
+}
+
+/**
+ * 把失敗的 `git merge --squash` 留在 main 上的殘骸還原（TD-619）。
+ *
+ * `git merge --abort` 對 squash merge **無效** —— squash 不寫 MERGE_HEAD，abort 直接
+ * 報 "no merge to abort"，而既有 code 把它 swallow 掉。於是衝突的 index（UU）與已
+ * stage 的部分會原地留在**共用的** main working tree 上：下一個在這棵樹上跑
+ * `publish.ts` 的 session 看到的是一棵髒樹，而重跑 merge-back 也只是在同一個殘骸上
+ * 再撞一次同一組衝突。「重跑永遠不會結束」的機制就在這裡。
+ *
+ * 只還原**這次 squash 自己動到的路徑**（staged 或 conflicted），逐條 reset 回 HEAD：
+ * merge-back 的 blocker gate 已保證這些路徑在 main 上原本是乾淨的（有 WIP 就先 stash
+ * 或直接拒絕），所以還原不會吃到任何人的東西。
+ * **NEVER 用 `git reset --hard`** —— 那會連別 session 在其他路徑上的 WIP 一起清掉。
+ */
+export function resetSquashResidue(consumerRoot: string, paths: string[]) {
+  const targets: string[] = [...new Set(paths.filter(Boolean))]
+  if (targets.length === 0) return []
+  const restored = []
+  for (const path of targets) {
+    try {
+      git(['reset', '-q', 'HEAD', '--', path], { cwd: consumerRoot })
+    } catch {
+      // 路徑在 HEAD 不存在（branch 新增的檔）時 reset 仍會把 index entry 清掉；
+      // 失敗只代表沒有 index entry 可清，繼續往下還原 working tree。
+    }
+    let inHead = true
+    try {
+      git(['cat-file', '-e', `HEAD:${path}`], { cwd: consumerRoot })
+    } catch {
+      inHead = false
+    }
+    try {
+      if (inHead) {
+        git(['checkout', '--force', 'HEAD', '--', path], { cwd: consumerRoot })
+      } else {
+        // 這次 squash 才創出來的檔：squash 前 main 沒有它（blocker gate 已排除
+        // 同路徑的 untracked user 檔），留著只會變成下一道 uncommitted gate 的絆索。
+        rmSync(join(consumerRoot, path), { force: true })
+      }
+      restored.push(path)
+    } catch (e) {
+      console.error(`note: squash residue at ${path} could not be reset: ${e?.message ?? e}`)
+    }
+  }
+  return restored
+}
+
+/**
+ * main 的 index 上現在有哪些 staged 路徑（TD-739 / TD-964）。回傳 `git diff --cached
+ * --name-status` 的逐列（`M\tpath` / `A\tpath` / `U\tpath` …），空陣列 = index 與 HEAD 一致。
+ *
+ * `git merge --squash` 讀寫的是**整個** index，不是本 branch 的那幾個路徑：squash 前已
+ * staged 的內容會跟 changeset 混成同一份 index（下一個 `/commit` 分不出來源），而 squash
+ * 失敗後的還原只能以 HEAD 為基準——index 上本來就有的東西沒有「還原回去」的依據。
+ * 所以 merge-back 只在空 index 上 squash；讀不到就拋出，呼叫端 **NEVER** 把失敗當成空。
+ */
+export function readMainStagedEntries(consumerRoot: string): string[] {
+  return git(['diff', '--cached', '--name-status', '--no-renames'], { cwd: consumerRoot })
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+}
+
+/**
+ * squash 前後兩份 `git status --porcelain` 的差集，兩個方向都列（`-` = 只在之前、
+ * `+` = 只在之後）。空陣列才可以說「main 已還原」（TD-754）。
+ */
+export function porcelainDrift(before: string, after: string): string[] {
+  const split = (s: string) => s.split('\n').filter((l) => l.trim().length > 0)
+  const b = new Set(split(before))
+  const a = new Set(split(after))
+  return [
+    ...[...b].filter((l) => !a.has(l)).map((l) => `- ${l}`),
+    ...[...a].filter((l) => !b.has(l)).map((l) => `+ ${l}`),
+  ]
+}
+
+/**
+ * squash 失敗後還原的結果說明（TD-754）。`drift` 是 `porcelainDrift` 的輸出，`squashScope` 是這次
+ * squash 可能動到的路徑（squash 改過的 index 列 ∪ branch changeset）。
+ *
+ * 前後快照是整棵樹的：squash 期間別 session 改了無關的檔，也會出現在 drift 裡。那些列 NEVER 附上
+ * `git checkout HEAD -- <path>` —— 照做就是丟掉別人未 stage 的 WIP。只有 scope 內的列給還原指令；
+ * scope 外的列逐條標「不是這次 squash 動的」。解析不出路徑的列留在 scope 內（寧可給人看，不靜默略過）。
+ */
+export function restoreDriftNote(drift: string[], squashScope: Set<string>): string {
+  if (drift.length === 0) {
+    return `main 已還原到 squash 之前的狀態（逐列比對 git status --porcelain 前後一致）。`
+  }
+  // 未追蹤目錄在預設的 porcelain 裡塌縮成一列 `?? dir/`：branch 新增在新目錄下的檔沒刪乾淨時，
+  // 精確比對永遠命中不了 scope，於是被標成「別人的」並附上 NEVER 刪除。目錄列展開成 scope 內
+  // 位於該目錄下的路徑；scope 內沒有任何路徑在它底下，才真的是範圍外。
+  const pathsOf = (row: string) => {
+    const m = /^[-+] .. (.+)$/.exec(row)
+    if (!m) return null
+    return m[1]
+      .split(' -> ')
+      .map((p) => p.trim())
+      .flatMap((p) => {
+        if (!p.endsWith('/')) return [p]
+        const under = [...squashScope].filter((s) => s.startsWith(p))
+        return under.length > 0 ? under : [p]
+      })
+  }
+  const ours: string[] = []
+  const foreign: string[] = []
+  for (const row of drift) {
+    const paths = pathsOf(row)
+    if (paths === null || paths.some((p) => squashScope.has(p))) ours.push(row)
+    else foreign.push(row)
+  }
+  const list = (rows: string[]) =>
+    rows
+      .slice(0, 15)
+      .map((l) => `  ${l}`)
+      .join('\n') + (rows.length > 15 ? `\n  … 另外 ${rows.length - 15} 列` : '')
+  let note = ''
+  if (ours.length > 0) {
+    const restorePaths = [...new Set(ours.flatMap((r) => pathsOf(r) ?? []))]
+    note +=
+      `main **沒有**完整還原到 squash 之前的狀態 —— 下列 ${ours.length} 列在這次 squash 的範圍內、與 squash 前不同：\n` +
+      list(ours) +
+      `\n  squash 前的樹在 HEAD（squash 前 index 已確認為空），只對上列路徑逐檔還原：` +
+      (restorePaths.length > 0
+        ? `git checkout HEAD -- ${restorePaths.join(' ')}`
+        : 'git checkout HEAD -- <path>') +
+      `；branch 新增的檔直接刪除。NEVER 用 git reset --hard（會連別人的 WIP 一起丟）。`
+  } else {
+    note += `這次 squash 範圍內的路徑已還原到 squash 之前的狀態（逐列比對 git status --porcelain）。`
+  }
+  if (foreign.length > 0) {
+    note +=
+      `\n  另有 ${foreign.length} 列在 squash 前後不同，但路徑**不在**這次 squash 的範圍內 —— 不是我們動的（多半是別 session 同時在改）：\n` +
+      list(foreign) +
+      `\n  NEVER 對這些路徑跑 git checkout／刪除：那是別人的 WIP。`
+  }
+  return note
+}
+
+/** main index 非空時的拒絕訊息。沒有旗標可以繞過：它擋的正是「唯一副本即將被帶走」。 */
+export function mainIndexNotEmptyMessage(slug: string, entries: string[], when: string) {
+  const preview = entries
+    .slice(0, 15)
+    .map((line) => {
+      const [status, ...rest] = line.split('\t')
+      return `  ${status.padEnd(3)} ${rest.join('\t')}`
+    })
+    .join('\n')
+  const more = entries.length > 15 ? `\n  … 另外 ${entries.length - 15} 個` : ''
+  return (
+    `merge-back STOP (${when}): main 的 index 已有 ${entries.length} 個 staged 路徑，不是這次 merge-back 放的：\n` +
+    preview +
+    more +
+    `\n\n` +
+    `\`git merge --squash\` 讀寫整個 index：這些內容會跟本 branch 的 changeset 混成同一份 index，\n` +
+    `squash 失敗時也沒有基準把它們還原（TD-739 / TD-754 / TD-964）。main 沒有被動過。\n` +
+    `它們可能是前一條 merge-back 還沒 commit 的內容（那時 index 是它唯一的副本），或別 session 的 WIP。\n\n` +
+    `處置：\n` +
+    `  1. 判持有者：clade home 跑 \`node vendor/scripts/flow/flow.ts who\`；其他 repo 問正在這棵樹上工作的 session\n` +
+    `  2. 前一條 merge-back 的殘留 → 照它印的指示跑完 /commit（\`git commit --only -- <它的 paths>\`）\n` +
+    `  3. 別 session 的 WIP → 請持有者 commit 或 unstage。NEVER 替它 unstage／reset／stash\n` +
+    `  4. \`git diff --cached --quiet\` 回 0 之後，原樣重跑：wt-helper merge-back ${slug}\n` +
+    `沒有旗標可以跳過這道檢查。`
+  )
+}
+
+/**
+ * `--work-done` 要記給哪張卡（TD-915）。
+ *
+ * worktree 開樹時就知道自己為哪張卡開（`wt-helper add` 把 work id 寫進 claim），而
+ * `CLADE_WORK_ID` 是活不過單次 Bash 呼叫的環境變數——merge-back 常在另一個 shell 跑，
+ * 撿到的 ambient 可能是別張卡。所以 claim 綁定優先；ambient 只在沒有綁定時當 fallback。
+ * 兩者都有而不同、或兩者都沒有、或 claim 讀不到，一律回 `error`：記錯卡的 `work.done` 只能事後
+ * `flow reopen` 追加撤回（TD-1115），舊行留在 stream 上、撤回前已被讀成完成——判不出就不記。
+ */
+export function resolveMergeBackWorkId(
+  consumerRoot: string,
+  worktreePath: string,
+  ambientRaw: string | undefined,
+  branchName?: string,
+): { workId: string; source: 'claim' | 'ambient' } | { error: string } {
+  const ambient = ambientRaw?.trim() || null
+  // Expired claims stay in: expiry only means the heartbeat went quiet, and a long-idle worktree's
+  // binding is still the card it was opened for. A leftover claim from an EARLIER worktree at the
+  // same path is excluded by branch instead (every `wt add` mints a fresh timestamped branch).
+  // An unparseable claim file still returns `unknown`: it could be this worktree's own binding, and
+  // guessing past it would fall back to ambient — the exact misfiling TD-915 exists to stop.
+  const claims = readActiveClaimsObserved(consumerRoot, { includeExpired: true })
+  if (claims.status === 'unknown') {
+    return {
+      error:
+        `讀不到 .clade/claims/（${claims.reason}），判不出這棵 worktree 綁的是哪張卡。\n` +
+        `  修好 claim 檔後重跑；或這次不帶 --work-done，land 完再手動：node vendor/scripts/flow/flow.ts done <work-id> --verification '<…>'`,
+    }
+  }
+  const stripHeads = (b: string) => b.replace(/^refs\/heads\//, '')
+  const samePath = (p) => {
+    if (!p) return false
+    if (p === worktreePath) return true
+    try {
+      return realpathSync(p) === realpathSync(worktreePath)
+    } catch {
+      return false
+    }
+  }
+  const bound = [
+    ...new Set(
+      claims.value
+        .filter((c) => samePath(c.worktree_path))
+        .filter((c) => !branchName || !c.branch || stripHeads(c.branch) === stripHeads(branchName))
+        .map((c) => (typeof c.work_id === 'string' ? c.work_id.trim() : ''))
+        .filter(Boolean),
+    ),
+  ]
+  if (bound.length > 1) {
+    return {
+      error:
+        `這棵 worktree 有 ${bound.length} 個 claim 各綁不同的卡（${bound.join(', ')}），判不出 done 該記給誰。\n` +
+        `  這次不帶 --work-done，land 完對正確那張手動：node vendor/scripts/flow/flow.ts done <work-id> --verification '<…>'`,
+    }
+  }
+  if (bound.length === 1) {
+    if (ambient && ambient !== bound[0]) {
+      return {
+        error:
+          `worktree 的 claim 綁的是 ${bound[0]}，這個 shell 的 CLADE_WORK_ID 卻是 ${ambient}。\n` +
+          `  ambient 活不過單次 Bash 呼叫，常是別張卡留下的（TD-915）；判不出 done 該記給誰，所以不記。\n` +
+          `  若這次確實是在收 ${bound[0]}：CLADE_WORK_ID=${bound[0]} 或 env -u CLADE_WORK_ID 重跑同一條指令\n` +
+          `  若這棵樹其實在做 ${ambient}：這次不帶 --work-done，land 完手動 flow done ${ambient}`,
+      }
+    }
+    return { workId: bound[0], source: 'claim' }
+  }
+  if (ambient) return { workId: ambient, source: 'ambient' }
+  return {
+    error:
+      `這棵 worktree 的 claim 沒有綁 work id，這個 shell 也沒有 CLADE_WORK_ID，判不出 done 該記給誰。\n` +
+      `  NEVER 為了有地方記而鑄一張新卡：在自己完成時才誕生的卡是一列沒人需要的 /flow。\n` +
+      `  有卡：CLADE_WORK_ID=<work-id> 重跑同一條指令；沒有卡：這次不帶 --work-done`,
+  }
+}
+
+/**
+ * 「branch 加的每一行，base 是不是都已經有了」的**諮詢用**量測（TD-619）。
+ *
+ * 這**不是**判定，是給人看的證據。真正的自動判定是 detectAbsorbedByOtherPath 的
+ * patch 反套 —— 那個嚴格到 context 被鄰行動過就失敗，於是「內容確實已在 main、只是
+ * 上下文變了」的實際形狀會落在它外面。那種情形只有人判得出來，所以這裡把人要看的
+ * 東西先算好：每個路徑上，branch 加了而 base 沒有的行有幾條。
+ *
+ * **NEVER 拿這個結果當自動收尾的依據**：行集合比對忽略順序與重複，`missing === 0`
+ * 不蘊含語義等價。它的用途只有一個 —— 讓 `--accept-landed` 不是盲按。
+ */
+export function summarizeAddedLinesPresence(
+  consumerRoot,
+  branchName,
+  mergeBase,
+  paths,
+  baseRef = 'HEAD',
+) {
+  const rows = []
+  for (const path of paths.slice(0, 50)) {
+    let added = []
+    try {
+      added = git(['diff', '--unified=0', mergeBase, branchName, '--', path], { cwd: consumerRoot })
+        .split('\n')
+        .filter((l) => l.startsWith('+') && !l.startsWith('+++'))
+        .map((l) => l.slice(1).trim())
+        .filter(Boolean)
+    } catch {
+      rows.push({ path, missing: null })
+      continue
+    }
+    if (added.length === 0) {
+      rows.push({ path, missing: 0 })
+      continue
+    }
+    let baseLines
+    try {
+      baseLines = new Set(
+        git(['show', `${baseRef}:${path}`], { cwd: consumerRoot })
+          .split('\n')
+          .map((l) => l.trim()),
+      )
+    } catch {
+      rows.push({ path, missing: added.length })
+      continue
+    }
+    rows.push({ path, missing: added.filter((l) => !baseLines.has(l)).length })
+  }
+  return rows
+}
+
+/**
+ * 「branch 的 changeset 已由別條路徑落進 base」的判定（TD-619）。
+ *
+ * 一條 session branch 的內容有時是被**別的 commit** 帶進 main 的（例：另一個 session
+ * 在自己的樹上重打同一批改動後先 land）。這種 branch 再跑 merge-back，
+ * `git merge --squash` 必定回報衝突——兩邊從同一個 base 各自動過同一段——而正確的
+ * 解法是「兩邊都取 main」，解完 index 是空的。舊行為只看「squash 有沒有衝突」，於是
+ * 每次重跑都重現同一組衝突，**沒有任何重跑次數會讓它結束**。
+ *
+ * 判準是 patch 層的「這份 changeset 是否已經套用在 base 上」：把
+ * `merge-base..branch` 的 diff **反向**試套到 base 的樹（`git apply --check -R`）。
+ * 全部 hunk 都反套得掉 ⟺ branch 加的每一行都已在 base、刪的每一行都已不在 base
+ * ⟺ 再 squash 一次不會多出任何東西。
+ *
+ * 為什麼不是「兩棵樹逐檔 byte-identical」：那個判準永遠不會在這裡成立。樹相同的
+ * branch 根本不會產生衝突（git 的 3-way merge 對兩邊同結果直接收斂），所以它只在
+ * 走不到這個分支的情況下為真，對真正的失敗型態零覆蓋。反套判準涵蓋它，並且多接住
+ * 「別條路徑帶進來的內容比 branch 更多」這個實際形狀。
+ *
+ * **NEVER 放寬成「衝突就自動取 ours」**：任何一個 hunk 反套不掉就回 absorbed:false，
+ * 交還給原本的衝突錯誤——真有內容只在此 branch 的情況永遠走不到捷徑這條路。
+ * 檢查跑在**臨時 index**（`GIT_INDEX_FILE` + `read-tree`）上，不碰 working tree 也
+ * 不碰真正的 index，所以呼叫時機與 main 當下的 dirty 狀態都不影響結果。
+ */
+export function detectAbsorbedByOtherPath(consumerRoot, branchName, baseRef = 'HEAD') {
+  const empty = { changedPaths: [], differing: [] }
+  let mergeBase
+  try {
+    mergeBase = git(['merge-base', baseRef, branchName], { cwd: consumerRoot }).trim()
+  } catch (e) {
+    return {
+      absorbed: false,
+      reason: 'merge-base-unreadable',
+      ...empty,
+      error: e?.message ?? String(e),
+    }
+  }
+  if (!mergeBase) return { absorbed: false, reason: 'merge-base-unreadable', ...empty }
+
+  const nameOnly = (args) =>
+    git(args, { cwd: consumerRoot })
+      .split('\n')
+      .map((l) => l.trim())
+      .filter(Boolean)
+
+  let changedPaths
+  try {
+    changedPaths = nameOnly(['diff', '--name-only', mergeBase, branchName])
+  } catch (e) {
+    return {
+      absorbed: false,
+      reason: 'changeset-unreadable',
+      ...empty,
+      error: e?.message ?? String(e),
+    }
+  }
+  if (changedPaths.length === 0) {
+    return { absorbed: true, reason: 'empty-changeset', changedPaths, differing: [] }
+  }
+
+  // 訊息用：branch 與 base 兩棵樹在 changeset 路徑上實際不同的部分。整份比對後取交集，
+  // 不把 changedPaths 當 pathspec 傳給 git —— changeset 大時會撞到 argv 長度上限。
+  let differing = changedPaths
+  try {
+    const treeDiff = new Set(nameOnly(['diff', '--name-only', branchName, baseRef]))
+    differing = changedPaths.filter((p) => treeDiff.has(p))
+  } catch {
+    differing = changedPaths
+  }
+  if (differing.length === 0) {
+    return { absorbed: true, reason: 'content-identical', changedPaths, differing }
+  }
+
+  let patch
+  try {
+    patch = execFileSync('git', ['diff', '--binary', mergeBase, branchName], {
+      cwd: consumerRoot,
+      encoding: 'utf8',
+      maxBuffer: 256 * 1024 * 1024,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+  } catch (e) {
+    return {
+      absorbed: false,
+      reason: 'patch-unreadable',
+      changedPaths,
+      differing,
+      error: e?.message ?? String(e),
+    }
+  }
+  if (!patch.trim()) {
+    return { absorbed: true, reason: 'empty-changeset', changedPaths, differing: [] }
+  }
+
+  const scratch = mkdtempSync(join(tmpdir(), 'wt-absorb-'))
+  const patchFile = join(scratch, 'changeset.patch')
+  const indexFile = join(scratch, 'index')
+  try {
+    writeFileSync(patchFile, patch)
+    const env = { ...process.env, GIT_INDEX_FILE: indexFile }
+    git(['read-tree', baseRef], { cwd: consumerRoot, env })
+    git(['apply', '--cached', '--check', '--reverse', patchFile], { cwd: consumerRoot, env })
+    return {
+      absorbed: true,
+      reason: 'changeset-already-applied',
+      changedPaths,
+      differing,
+      mergeBase,
+    }
+  } catch {
+    return { absorbed: false, reason: 'content-differs', changedPaths, differing, mergeBase }
+  } finally {
+    rmSync(scratch, { recursive: true, force: true })
+  }
+}
+
+/**
+ * 一棵 session worktree 的 branch 內容「落地到哪了」（TD-863 修法 2）。
+ *
+ * `mergedToMain` 只認 ancestry，於是 squash 落地、patch 落地、被另一份實作取代的樹全顯示
+ * unlanded，收割者得逐棵手跑 `git apply --check -R` 才知道能不能清。這裡把那幾步算好：
+ *
+ *   in-history  branch tip 是 base 的祖先（commit 都在 base 的歷史裡）
+ *   in-base     `merge-base..branch` 的 diff 反套得進 **base 的 commit tree**（squash／patch
+ *               落地後已 commit）。`reason: empty-changeset` = 淨 diff 為空，沒有東西要落地
+ *   in-worktree 反套不進 base tree、只反套得進 consumer root 的**工作區**——內容唯一的副本
+ *               是 main 上**未 commit** 的改動（可能是別 session 的 WIP）。**NEVER 讀成可清**：
+ *               那份改動被 `checkout --`／`reset --hard`／revert 掉，清過的樹就再也找不回來
+ *   clean-apply 正套得進工作區——內容還沒落地，但現在套得乾淨
+ *   superseded  以上都不成立，且 branch 動過的檔（新舊路徑都算，`--no-renames`）在 fork 之後
+ *               base 上有 commit（`supersededBy` 列出那些 commit 供人判，**不是**自動可清）
+ *   conflict    以上都不成立，base 在 fork 後也沒碰這些檔（衝突來自工作區 WIP）
+ *   unknown     量不到（branch／merge-base／base tree 讀不到、git 失敗）——NEVER 讀成可清；
+ *               `reason` 指出哪一步失敗
+ *
+ * 只看 branch tip 的 commit：session worktree 自己未 commit 的檔不在 changeset 裡，由
+ * `enrichWorktree` 的 `dirty` 欄位另報。「清樹不丟內容」= landedState ∈ {in-history, in-base}
+ * **且** dirty === 0；本函式只回報，清不清由呼叫端決定。
+ *
+ * 全程唯讀：`git apply --check` 不寫檔；base tree 比對用 scratch 目錄裡的暫時 index
+ * （`GIT_INDEX_FILE`），consumer root 的 index 與工作區都不碰。
+ */
+export type LandedState =
+  | 'in-history'
+  | 'in-base'
+  | 'in-worktree'
+  | 'clean-apply'
+  | 'superseded'
+  | 'conflict'
+  | 'unknown'
+
+export function classifyLandedState(
+  consumerRoot,
+  branchName,
+  baseRef = resolveLandingBase(consumerRoot),
+): { landedState: LandedState; supersededBy: string[]; reason?: string } {
+  const unknown = (reason) => ({ landedState: 'unknown' as const, supersededBy: [], reason })
+  try {
+    git(['merge-base', '--is-ancestor', branchName, baseRef], { cwd: consumerRoot })
+    return { landedState: 'in-history', supersededBy: [] }
+  } catch (e) {
+    // exit 1 = 不是祖先；其他 exit（ref 不存在…）一律 unknown
+    if (e?.status !== 1) return unknown('ancestry-unreadable')
+  }
+  let mergeBase
+  let patch
+  try {
+    mergeBase = git(['merge-base', baseRef, branchName], { cwd: consumerRoot }).trim()
+    patch = execFileSync('git', ['diff', '--binary', mergeBase, branchName], {
+      cwd: consumerRoot,
+      encoding: 'utf8',
+      maxBuffer: 256 * 1024 * 1024,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+  } catch {
+    return unknown('changeset-unreadable')
+  }
+  // ahead > 0 但淨 diff 為空（加了又撤回）：沒有任何東西要落地
+  if (!patch.trim()) return { landedState: 'in-base', supersededBy: [], reason: 'empty-changeset' }
+
+  const scratch = mkdtempSync(join(tmpdir(), 'wt-landed-'))
+  const patchFile = join(scratch, 'changeset.patch')
+  const baseIndexEnv = { ...process.env, GIT_INDEX_FILE: join(scratch, 'base.index') }
+  const applies = (extra, env = undefined) => {
+    try {
+      git(['apply', '--check', ...extra, patchFile], { cwd: consumerRoot, env })
+      return true
+    } catch {
+      return false
+    }
+  }
+  try {
+    writeFileSync(patchFile, patch)
+    // 先對 base 的 commit tree 比（暫時 index），再對工作區比：兩者都反套得進時以
+    // 「已 commit」為準；只有工作區反套得進的才是 in-worktree（TD-863 0-A r1 Major）。
+    try {
+      git(['read-tree', baseRef], { cwd: consumerRoot, env: baseIndexEnv })
+    } catch {
+      return unknown('base-tree-unreadable')
+    }
+    if (applies(['--cached', '--reverse'], baseIndexEnv))
+      return { landedState: 'in-base', supersededBy: [] }
+    if (applies(['--reverse']))
+      return { landedState: 'in-worktree', supersededBy: [], reason: 'uncommitted-on-base' }
+    if (applies([])) return { landedState: 'clean-apply', supersededBy: [] }
+  } finally {
+    rmSync(scratch, { recursive: true, force: true })
+  }
+
+  let supersededBy = []
+  try {
+    // --no-renames：rename 偵測只列新路徑，base 碰舊路徑（或反之）就對不上（0-A r1 Minor）
+    const paths = new Set(
+      git(['diff', '--no-renames', '--name-only', mergeBase, branchName], { cwd: consumerRoot })
+        .split('\n')
+        .filter(Boolean),
+    )
+    // 不把 paths 當 pathspec 傳：changeset 大時會撞 argv 上限（同 detectAbsorbedByOtherPath）
+    const log = execFileSync(
+      'git',
+      [
+        'log',
+        '--no-renames',
+        '--format=%x00%h %s',
+        '--name-only',
+        '--no-decorate',
+        `${mergeBase}..${baseRef}`,
+      ],
+      { cwd: consumerRoot, encoding: 'utf8', maxBuffer: 256 * 1024 * 1024 },
+    )
+    for (const block of log.split('\0').filter((b) => b.trim())) {
+      const [head, ...files] = block.split('\n')
+      if (files.some((f) => paths.has(f.trim()))) supersededBy.push(head.trim())
+    }
+  } catch {
+    return unknown('base-history-unreadable')
+  }
+  return supersededBy.length > 0
+    ? { landedState: 'superseded', supersededBy }
+    : { landedState: 'conflict', supersededBy: [] }
+}
+
+export function syncWorktreeWithMain(wtPath, branchName, slug) {
+  const targetRef = resolveSyncTargetRef(wtPath, { fetch: true })
+
+  let behind = 0
+  try {
+    const out = git(['rev-list', '--count', `${branchName}..${targetRef}`], { cwd: wtPath })
+    behind = parseInt(out, 10) || 0
+  } catch {
+    return { synced: false, behind: 0 }
+  }
+
+  if (behind === 0) {
+    return { synced: false, behind: 0 }
+  }
+
+  const commitMsg = preSyncCommitMessage(branchName)
+  let mergeError = null
+  try {
+    git(['merge', '--no-ff', '-m', commitMsg, targetRef], { cwd: wtPath, stdio: 'inherit' })
+  } catch (e) {
+    mergeError = e
+  }
+
+  const readConflicted = () => {
+    const raw = git(['status', '--porcelain'], { cwd: wtPath })
+    return raw
+      .split('\n')
+      .filter((line) => /^(UU|AA|DD|AU|UA|UD|DU) /.test(line))
+      .map((line) => line.slice(3).trim())
+  }
+
+  let conflicted = readConflicted()
+
+  // ── Auto-resolve passes ────────────────────────────────────────────────
+  // Stale-fork conflicts on long-lived wt branches (e.g. wt behind main by
+  // 180+ commits) are dominated by two mechanical patterns that wt-helper
+  // can resolve safely without user judgement:
+  //
+  //   1. LOCKED projection paths (`.claude/`, `.agents/`, `.codex/`,
+  //      Cursor projector dest, `.claude/hub.json`, etc. — see
+  //      locked-projection.ts). Handwritten `.cursor/` 與 Cursor 自管目錄
+  //      不在此列。main is SoT for generated files. Take main version.
+  //
+  //   2. Legacy archive paths, only when that directory exists: the old
+  //      archive flow moved change folders INTO archive (one-way). Wt has no legitimate
+  //      reason to disagree with main about archive contents. Take main.
+  //
+  // Both cases use the same mechanic: `git checkout --theirs <path>` (wt
+  // runs `git merge main`, so theirs == main) + `git add <path>`. The
+  // resolve pass logs counts and returns autoResolved metadata so callers
+  // (and tests) can verify behavior.
+  //
+  // Conservative: any conflict outside these two predicates falls through
+  // to the original throw — real content conflicts (docs/tech-debt.md,
+  // active spec.md edits) still get user attention.
+  const autoResolved = { locked: 0 }
+
+  const runResolvePass = (predicate, label, counterKey) => {
+    if (conflicted.length === 0) return
+    const matched = conflicted.filter(predicate)
+    if (matched.length === 0) return
+    for (const path of matched) {
+      try {
+        git(['checkout', '--theirs', '--', path], { cwd: wtPath })
+        git(['add', '--', path], { cwd: wtPath })
+      } catch (e) {
+        // Swallow per-path failure — fall through and let the residual
+        // conflict surface in the final throw with full context. Log so
+        // the user sees what auto-resolve attempted.
+        console.error(
+          `warn: auto-resolve ${label} failed for '${path}': ${e?.message ?? e} — left for manual resolution`,
+        )
+      }
+    }
+    autoResolved[counterKey] += matched.length
+    console.log(
+      `merge-back: auto-resolved ${matched.length} ${label} pre-sync conflict(s) (took theirs from main)`,
+    )
+    conflicted = readConflicted()
+  }
+
+  runResolvePass((p) => isLockedProjectionPathFor(wtPath, p), 'LOCKED projection', 'locked')
+
+  // If auto-resolve cleared every conflict, finalize the merge commit.
+  // mergeError may still be set even though `git status` is clean (e.g.
+  // `git merge` exited non-zero due to conflicts that we then resolved).
+  if (conflicted.length === 0) {
+    if (autoResolved.locked > 0) {
+      try {
+        git(['commit', '--no-edit'], { cwd: wtPath, stdio: 'inherit' })
+      } catch (e) {
+        // commit can fail if e.g. pre-commit hook rejects — surface as throw
+        throw new Error(
+          `merge-back pre-sync auto-resolve succeeded but commit failed: ${e?.message ?? e}\n` +
+            `Worktree '${wtPath}' is in mid-merge state with all conflicts staged.\n` +
+            `Resolution — inspect, then finalize manually:\n` +
+            `  cd ${wtPath}\n` +
+            `  git status\n` +
+            `  git commit --no-edit\n` +
+            `  cd -\n` +
+            `  node scripts/wt-helper.ts merge-back ${slug}\n`,
+          { cause: e },
+        )
+      }
+      return { synced: true, behind, autoResolved }
+    }
+    if (mergeError) {
+      // No conflicts and no auto-resolve happened, but merge errored — odd
+      // state. Surface as throw rather than silently claim success.
+      throw new Error(`pre-sync merge failed: ${mergeError?.message ?? mergeError}`, {
+        cause: mergeError,
+      })
+    }
+    return { synced: true, behind, autoResolved }
+  }
+
+  // ── Residual conflict path: surface with auto-resolve summary ─────────
+  const preview = conflicted
+    .slice(0, 10)
+    .map((f) => `  ${f}`)
+    .join('\n')
+  const more = conflicted.length > 10 ? `\n  ... and ${conflicted.length - 10} more` : ''
+  const autoResolvedTotal = autoResolved.locked
+  const autoResolvedSummary =
+    autoResolvedTotal > 0
+      ? `\n(auto-resolved ${autoResolvedTotal}: LOCKED=${autoResolved.locked}; ${conflicted.length} remain)`
+      : ''
+  const detail =
+    conflicted.length > 0
+      ? `${conflicted.length} file(s) hit conflict during pre-sync${autoResolvedSummary}:\n${preview}${more}`
+      : `pre-sync merge failed: ${mergeError?.message ?? mergeError}`
+  throw new Error(
+    `merge-back pre-sync blocked: ${detail}\n\n` +
+      `Worktree '${wtPath}' is left in unmerged state — main's working tree was NOT touched.\n` +
+      `Resolution — resolve in worktree, then re-run merge-back:\n` +
+      `  cd ${wtPath}\n` +
+      `  # resolve conflict markers, git add <files>\n` +
+      `  git commit --no-edit       # finalize the pre-sync merge\n` +
+      `  cd -\n` +
+      `  node scripts/wt-helper.ts merge-back ${slug}\n\n` +
+      `Override (NOT recommended): re-run with --skip-pre-sync to attempt squash directly\n` +
+      `(legacy path — conflicts would surface in main's working tree).`,
+  )
+}
+
+// Preserve gitignored review artifacts from worktree before cleanup destroys
+// them. `screenshots/<env>/<topic>/` is the verify:ui screenshot
+// convention; gitignored so they don't bloat git history.
+// `git merge --squash` carries no gitignored content, so without this sync,
+// `git worktree remove --force` permanently deletes screenshots and downstream
+// post-merge sweep finds no files in main. See TD-160.
+//
+// Behavior: for every entry under `screenshots/` in the worktree (including
+// `_archive`, which is just as gitignored as the rest), merge **per file** into
+// main's same relative path:
+//   - destination file missing            → copy
+//   - destination file byte-identical     → skip (silent, already preserved)
+//   - destination file exists, differs    → copy as `<stem>.wt-<slug><ext>`
+//                                           (`-2`, `-3`, … if taken), created
+//                                           exclusively; NEVER overwrite
+// Directory-level skip is forbidden: gitignored screenshots exist only in the
+// worktree's working tree, so anything not copied here is destroyed by the
+// subsequent `git worktree remove --force` with no git object to recover from.
+//
+// Invariant: cleanup must not run until every gitignored artifact has been
+// individually accounted for — so this is **fail-closed**. Any scan error, copy
+// error, or entry type we cannot faithfully preserve (symlink, FIFO, socket,
+// device) is recorded as a failure, and `cmdMergeBack` MUST skip cleanup and
+// retain the worktree when any failure is present. Reporting a warning and
+// deleting the worktree anyway is the exact failure mode this function exists
+// to prevent.
+const DIGEST_CHUNK = 1 << 20
+
+// Chunked so a single large screenshot cannot blow the heap. Reads through one
+// descriptor and re-stats it afterwards, so a file mutated mid-read is reported
+// as a failure rather than silently digesting a torn snapshot.
+function fileDigest(p) {
+  const fd = openSync(p, 'r')
+  try {
+    const { size, mtimeMs } = statSync(p)
+    const hash = createHash('sha256')
+    const buf = Buffer.allocUnsafe(DIGEST_CHUNK)
+    let read
+    while ((read = readSync(fd, buf, 0, DIGEST_CHUNK, null)) > 0) hash.update(buf.subarray(0, read))
+    const after = statSync(p)
+    if (after.size !== size || after.mtimeMs !== mtimeMs) {
+      throw new Error(`file changed while hashing: ${p}`)
+    }
+    return hash.digest('hex')
+  } finally {
+    closeSync(fd)
+  }
+}
+
+// Refuse to write through a symlink (or any non-directory masquerading as a
+// parent): following one would let a dangling/hostile link redirect the copy
+// outside main's screenshots tree.
+function assertPlainDestination(dstPath, rootReal) {
+  let cur = dirname(dstPath)
+  const seen = []
+  while (!existsSync(cur)) {
+    seen.push(cur)
+    const parent = dirname(cur)
+    if (parent === cur) break
+    cur = parent
+  }
+  const st = lstatSync(cur, { throwIfNoEntry: false })
+  if (!st) throw new Error(`destination root missing: ${cur}`)
+  if (st.isSymbolicLink()) throw new Error(`destination parent is a symlink: ${cur}`)
+  if (!st.isDirectory()) throw new Error(`destination parent is not a directory: ${cur}`)
+  const real = realpathSync(cur)
+  if (real !== rootReal && !real.startsWith(`${rootReal}/`)) {
+    throw new Error(`destination escapes screenshots root: ${real}`)
+  }
+  for (const p of seen) void p
+  const existing = lstatSync(dstPath, { throwIfNoEntry: false })
+  if (existing && existing.isSymbolicLink()) {
+    throw new Error(`destination file is a symlink: ${dstPath}`)
+  }
+  return existing
+}
+
+// Exclusive create; returns the name actually used. Never truncates an existing
+// candidate — a byte-identical one counts as already preserved, a differing one
+// pushes to the next suffix.
+function copyToFreeConflictName(srcPath, dstDir, name, slug, rootReal) {
+  const dot = name.lastIndexOf('.')
+  const stem = dot > 0 ? name.slice(0, dot) : name
+  const ext = dot > 0 ? name.slice(dot) : ''
+  for (let n = 1; n <= 100; n++) {
+    const candidate = `${stem}.wt-${slug}${n === 1 ? '' : `-${n}`}${ext}`
+    const candidatePath = join(dstDir, candidate)
+    const existing = assertPlainDestination(candidatePath, rootReal)
+    if (existing) {
+      if (
+        existing.size === statSync(srcPath).size &&
+        fileDigest(srcPath) === fileDigest(candidatePath)
+      ) {
+        return { name: candidate, identical: true }
+      }
+      continue
+    }
+    mkdirSync(dstDir, { recursive: true })
+    copyFileSync(srcPath, candidatePath, fsConstants.COPYFILE_EXCL)
+    return { name: candidate, identical: false }
+  }
+  throw new Error(`no free conflict name for ${name} after 100 attempts`)
+}
+
+function mergeScreenshotDir(srcDir, dstDir, ctx, out) {
+  let entries
+  try {
+    entries = readdirSync(srcDir, { withFileTypes: true })
+  } catch (e) {
+    out.push({
+      ...ctx,
+      rel: ctx.rel || '.',
+      failed: true,
+      scanFailure: true,
+      error: e.message ?? String(e),
+    })
+    return
+  }
+  for (const entry of entries) {
+    const rel = ctx.rel ? `${ctx.rel}/${entry.name}` : entry.name
+    const srcPath = join(srcDir, entry.name)
+    const dstPath = join(dstDir, entry.name)
+    if (entry.isSymbolicLink() || (!entry.isDirectory() && !entry.isFile())) {
+      // Cannot faithfully preserve; must not be silently dropped by cleanup.
+      out.push({
+        ...ctx,
+        rel,
+        failed: true,
+        unsupported: true,
+        error: `unsupported entry type (symlink/special file): ${srcPath}`,
+      })
+      continue
+    }
+    if (entry.isDirectory()) {
+      mergeScreenshotDir(srcPath, dstPath, { ...ctx, rel }, out)
+      continue
+    }
+    try {
+      const existing = assertPlainDestination(dstPath, ctx.rootReal)
+      if (!existing) {
+        mkdirSync(dstDir, { recursive: true })
+        copyFileSync(srcPath, dstPath, fsConstants.COPYFILE_EXCL)
+        out.push({ ...ctx, rel, copied: true })
+        continue
+      }
+      if (existing.size === statSync(srcPath).size && fileDigest(srcPath) === fileDigest(dstPath)) {
+        out.push({ ...ctx, rel, identical: true })
+        continue
+      }
+      const { name: conflictName, identical } = copyToFreeConflictName(
+        srcPath,
+        dstDir,
+        entry.name,
+        ctx.slug,
+        ctx.rootReal,
+      )
+      out.push({
+        ...ctx,
+        rel,
+        renamed: true,
+        alreadyPreserved: identical,
+        as: ctx.rel ? `${ctx.rel}/${conflictName}` : conflictName,
+      })
+    } catch (e) {
+      out.push({ ...ctx, rel, failed: true, error: e.message ?? String(e) })
+    }
+  }
+}
+
+function preserveWorktreeScreenshots(wtPath, mainPath, slug = 'worktree') {
+  const src = join(wtPath, 'screenshots')
+  if (!existsSync(src)) return { files: [], ok: true }
+  const dstRoot = join(mainPath, 'screenshots')
+  mkdirSync(dstRoot, { recursive: true })
+  const files = []
+  // Walk the whole tree — including `_archive` and any loose files at the
+  // `screenshots/` or `<env>/` level. Everything here is gitignored, so an
+  // entry we decline to walk is an entry cleanup deletes forever.
+  mergeScreenshotDir(
+    src,
+    dstRoot,
+    { env: '.', topic: '.', rel: '', slug: makeSlugSafe(slug), rootReal: realpathSync(dstRoot) },
+    files,
+  )
+  const failed = files.filter((f) => f.failed)
+  return { files, ok: failed.length === 0 }
+}
+
+/**
+ * Belt-and-braces: carry verify-evidence receipts that only exist in the worktree
+ * back to main before cleanup destroys the directory.
+ *
+ * `docs/evidence/*.jsonl` is git-tracked (TD-394; pre-purge receipts live under
+ * `.spectra/evidence/` and are carried too), so the phase-tick commit
+ * is the primary transport and `merge-back --squash` normally carries receipts on its
+ * own. This function covers the paths that never reach a commit at all: manual merges,
+ * flows that bypass the phase-tick discipline, and worktrees forked before TD-394.
+ * Landing here means that discipline was not followed, so it warns rather than staying
+ * silent.
+ *
+ * Merge semantics mirror evidence-store: append-only JSONL, last-write-wins per
+ * `(itemId, kind)`. A worktree record is carried over when main has no record for that
+ * key, or main's record is older.
+ */
+function preserveWorktreeEvidence(wtPath, mainPath, slug = 'worktree') {
+  // `docs/evidence/` 是 2026-10 openspec purge 後的落點；`.spectra/evidence/` 留給
+  // 遷移前 fork 的 worktree——那裡的 in-flight receipt 照樣要帶回 main。
+  const dirs = ['docs/evidence', '.spectra/evidence']
+  const files = []
+  let ok = true
+  for (const relDir of dirs) {
+    const src = join(wtPath, relDir)
+    if (!existsSync(src)) continue
+    const r = carryEvidenceDir(src, join(mainPath, relDir), relDir, slug)
+    files.push(...r.files)
+    if (!r.ok) ok = false
+  }
+  return { files, ok }
+}
+
+function carryEvidenceDir(src, dstRoot, relDir, slug) {
+  const files = []
+
+  let entries
+  try {
+    entries = readdirSync(src).filter((f) => f.endsWith('.jsonl'))
+  } catch (e) {
+    return {
+      files: [
+        {
+          rel: relDir,
+          failed: true,
+          scanFailure: true,
+          error: e.message ?? String(e),
+        },
+      ],
+      ok: false,
+    }
+  }
+
+  for (const name of entries) {
+    const rel = `${relDir}/${name}`
+    try {
+      const wtLines = readFileSync(join(src, name), 'utf8').split('\n')
+      const dstFile = join(dstRoot, name)
+      const mainLines = existsSync(dstFile) ? readFileSync(dstFile, 'utf8').split('\n') : []
+
+      // Malformed lines cannot be keyed, so they cannot be shown to be already in main.
+      // Fail closed rather than let cleanup delete something unaccounted for.
+      const malformed = []
+      const parse = (lines, bucket) => {
+        const out = new Map()
+        for (const line of lines) {
+          const trimmed = line.trim()
+          if (!trimmed) continue
+          try {
+            const record = JSON.parse(trimmed)
+            out.set(`${record.itemId}::${record.kind}`, { record, raw: trimmed })
+          } catch {
+            bucket.push(trimmed.slice(0, 120))
+          }
+        }
+        return out
+      }
+      const wtRecords = parse(wtLines, malformed)
+      const mainRecords = parse(mainLines, [])
+
+      const carried = []
+      for (const [key, entry] of wtRecords) {
+        const existing = mainRecords.get(key)
+        if (
+          existing &&
+          !(String(existing.record.timestamp ?? '') < String(entry.record.timestamp ?? ''))
+        ) {
+          continue
+        }
+        carried.push(entry.raw)
+      }
+
+      if (malformed.length > 0) {
+        files.push({
+          rel,
+          failed: true,
+          error: `${malformed.length} malformed JSONL line(s) could not be accounted for: ${malformed.join(' | ')}`,
+        })
+        continue
+      }
+
+      if (carried.length === 0) {
+        files.push({ rel, identical: true, slug: makeSlugSafe(slug) })
+        continue
+      }
+
+      mkdirSync(dstRoot, { recursive: true })
+      let payload = ''
+      if (existsSync(dstFile)) {
+        const current = readFileSync(dstFile, 'utf8')
+        if (current.length > 0 && !current.endsWith('\n')) payload += '\n'
+      }
+      payload += carried.join('\n') + '\n'
+      appendFileSync(dstFile, payload, 'utf8')
+      files.push({ rel, copied: true, count: carried.length, slug: makeSlugSafe(slug) })
+    } catch (e) {
+      files.push({ rel, failed: true, error: e.message ?? String(e) })
+    }
+  }
+
+  return { files, ok: files.every((f) => !f.failed) }
+}
+
+function findCleanupWorktree(consumerRoot, cleanSlug) {
+  const wts = sessionWorktrees(consumerRoot)
+  const sessionHit = wts.find(
+    (w) => w.path.endsWith(`/${cleanSlug}`) && w.branch && w.branch.endsWith(`-${cleanSlug}`),
+  )
+  if (sessionHit) return sessionHit
+
+  const all = parseWorktreeList(git(['worktree', 'list', '--porcelain'], { cwd: consumerRoot }))
+  const mainPath = resolve(consumerRoot)
+  const candidates = all.filter((w) => {
+    if (!w.path.endsWith(`/${cleanSlug}`)) return false
+    if (resolve(w.path) === mainPath) return false
+    const branch = (w.branch || '').replace(/^refs\/heads\//, '')
+    if (branch.startsWith('integration/')) return false
+    return true
+  })
+  if (candidates.length === 1) return candidates[0]
+  const extra = candidates.length >= 2 ? `\n${candidates.map((c) => c.path).join('\n')}` : ''
+  throw new Error(`No session worktree found for slug: ${cleanSlug}${extra}`)
+}
+
+async function cmdReconcile(slug: string, opts: WtOptions = {}) {
+  if (!slug) throw new Error('Usage: wt-helper reconcile <slug> [--json]')
+  const consumerRoot = findConsumerRoot()
+  const target = findCleanupWorktree(consumerRoot, makeSlugSafe(slug))
+  for (const root of [consumerRoot, target.path]) {
+    if (!existsSync(join(root, '.clade', 'projections')))
+      throw new Error(`projection receipt is missing in ${root}; run hub:sync to seed it first`)
+  }
+  const result = reconcileRebasedProjectionState(target.path, consumerRoot)
+  if (opts.json) console.log(JSON.stringify(result))
+  else {
+    console.log(`reconcile: updated ${result.updated} projection receipt(s) in ${target.path}`)
+    for (const reason of result.skipped) console.log(`reconcile: skipped: ${reason}`)
+  }
+  if (result.blocked > 0) process.exitCode = 1
+}
+
+export { parseDiscardPathspecs }
+
+/** porcelain entry（rename 為 `a -> b`）是否整筆落在 pathspec 內；rename 兩端都要命中。 */
+function isDiscardedEntry(path, pathspecs) {
+  if (pathspecs.length === 0) return false
+  return path.split(' -> ').every((p) => matchesDiscardPathspec(p, pathspecs))
+}
+
+// residue 只存「人可能還要看」的東西。可重建的建置產物（舊 HEAD 的樹裡 `.gitignore` 沒蓋到的
+// `vendor/review-gui-web/.nuxt`、`.output` 等）直接丟、不進 object store：disk-hygiene 為了騰空間
+// 清樹，NEVER 反過來把大 blob 寫進 common dir 再被 ref 釘住（PR #726 0-A r1 Major）。
+const RESIDUE_BUILD_SEGMENTS = new Set([
+  '.nuxt',
+  '.output',
+  'node_modules',
+  '.vite',
+  '.turbo',
+  '.cache',
+])
+const RESIDUE_MAX_FILE_BYTES = 1024 * 1024
+const RESIDUE_MAX_TOTAL_BYTES = 16 * 1024 * 1024
+/** residue ref 的保留期（天）；計畫未定期限前採保守預設，`CLADE_WT_RESIDUE_RETENTION_DAYS` 可覆寫。 */
+const RESIDUE_RETENTION_DAYS_DEFAULT = 30
+
+function residueRetentionSeconds() {
+  const days = Number(process.env.CLADE_WT_RESIDUE_RETENTION_DAYS)
+  return (Number.isFinite(days) && days >= 0 ? days : RESIDUE_RETENTION_DAYS_DEFAULT) * 86_400
+}
+
+function residueRecordDir(consumerRoot) {
+  return join(
+    process.env.CLADE_WT_RESIDUE_DIR ?? join(homedir(), '.cache', 'clade', 'wt-residue'),
+    basename(consumerRoot),
+  )
+}
+
+/**
+ * 把 porcelain 路徑展開成實際要存的檔（目錄逐檔走），濾掉建置產物段與超過上限的檔。
+ * 不在磁碟上的路徑＝tracked 檔被刪，照收（`git add -A` 記成刪除）；目錄內被刪的 tracked 檔
+ * 由 `ls-files --deleted` 補回。回傳的 skipped 只是紀錄，不會被保存。
+ */
+export function planResidueFiles(
+  wtPath,
+  paths,
+  limits: { maxFileBytes?: number; maxTotalBytes?: number } = {},
+) {
+  const maxFile = limits.maxFileBytes ?? RESIDUE_MAX_FILE_BYTES
+  const maxTotal = limits.maxTotalBytes ?? RESIDUE_MAX_TOTAL_BYTES
+  const keep = new Set<string>()
+  const skipped: { path: string; reason: string }[] = []
+  let total = 0
+  const isBuild = (rel) => rel.split('/').some((seg) => RESIDUE_BUILD_SEGMENTS.has(seg))
+  const visit = (rel) => {
+    if (isBuild(rel)) {
+      skipped.push({ path: rel, reason: 'build-artifact' })
+      return
+    }
+    const abs = join(wtPath, rel)
+    let st
+    try {
+      st = lstatSync(abs)
+    } catch {
+      keep.add(rel)
+      return
+    }
+    if (st.isDirectory()) {
+      if (existsSync(join(abs, '.git'))) {
+        skipped.push({ path: rel, reason: 'nested-repo' })
+        return
+      }
+      // 目錄內容問 git，不逐檔 readdir：ignored 子路徑進了 `git add -A` 會讓整筆 residue 失敗。
+      // untracked（排除 ignored）∪ modified ∪ deleted 就是 status 收合掉的全部。
+      const listed = new Set<string>()
+      for (const mode of [['--others', '--exclude-standard'], ['--modified'], ['--deleted']]) {
+        let out = ''
+        try {
+          out = git(['ls-files', '-z', ...mode, '--', `:(literal)${rel}`], { cwd: wtPath })
+        } catch {
+          continue
+        }
+        for (const d of out.split('\0').filter(Boolean)) listed.add(d)
+      }
+      for (const d of [...listed].toSorted()) {
+        if (d.endsWith('/')) skipped.push({ path: d.replace(/\/+$/, ''), reason: 'nested-repo' })
+        else visitFile(d, undefined, false)
+      }
+      return
+    }
+    // porcelain 列出的單檔照理不會是 ignored，仍先問一次：add -A 遇到 ignored 會讓整筆失敗。
+    visitFile(rel, st, true)
+  }
+  const isIgnored = (rel) => {
+    try {
+      git(['check-ignore', '-q', '--', rel], { cwd: wtPath })
+      return true
+    } catch {
+      return false
+    }
+  }
+  const visitFile = (rel, statKnown?, checkIgnore = false) => {
+    if (isBuild(rel)) {
+      skipped.push({ path: rel, reason: 'build-artifact' })
+      return
+    }
+    let st = statKnown
+    if (!st) {
+      try {
+        st = lstatSync(join(wtPath, rel))
+      } catch {
+        keep.add(rel)
+        return
+      }
+    }
+    if (checkIgnore && isIgnored(rel)) {
+      skipped.push({ path: rel, reason: 'ignored' })
+      return
+    }
+    const size = st.isFile() ? st.size : 0
+    if (size > maxFile) {
+      skipped.push({ path: rel, reason: `too-large(${size})` })
+      return
+    }
+    if (total + size > maxTotal) {
+      skipped.push({ path: rel, reason: 'over-total-cap' })
+      return
+    }
+    total += size
+    keep.add(rel)
+  }
+  for (const p of paths) visit(p.replace(/\/+$/, ''))
+  return { files: [...keep].toSorted(), skipped, bytes: total }
+}
+
+/**
+ * 刪掉超過保留期的 `refs/clade-residue/*` 與對應紀錄檔（每次存 residue 時順手跑；
+ * `wt-helper residue-prune` 可單獨跑）。判準是 ref 指向那筆 commit 的 committer date。
+ */
+export function pruneCleanupResidue(consumerRoot, { now = Date.now() / 1000 } = {}) {
+  const cutoff = now - residueRetentionSeconds()
+  const pruned: string[] = []
+  let listing = ''
+  try {
+    listing = git(
+      ['for-each-ref', '--format=%(refname) %(committerdate:unix)', 'refs/clade-residue/'],
+      { cwd: consumerRoot },
+    )
+  } catch {
+    return pruned
+  }
+  for (const line of listing.split('\n').filter(Boolean)) {
+    const [ref, ts] = line.split(' ')
+    if (!(Number(ts) < cutoff)) continue
+    git(['update-ref', '-d', ref], { cwd: consumerRoot })
+    rmSync(
+      join(residueRecordDir(consumerRoot), `${ref.slice('refs/clade-residue/'.length)}.json`),
+      {
+        force: true,
+      },
+    )
+    pruned.push(ref)
+  }
+  return pruned
+}
+
+/**
+ * cleanup 前保存被 pathspec 放行的殘留（plan §3.1）：以暫時 index 在 HEAD 上疊這些路徑的
+ * working copy，寫成一筆 commit 掛在 `refs/clade-residue/<slug>`（不碰 stash stack、不動樹的 index）；
+ * 同 slug 已有、仍在保留期內的 residue 成為第二個 parent，不覆蓋掉。另寫
+ * `~/.cache/clade/wt-residue/<repo>/<slug>.json`（`CLADE_WT_RESIDUE_DIR` 可覆寫根目錄）。
+ * 建置產物與超過大小上限的檔不存（見 planResidueFiles，紀錄檔列為 skipped）；過期 residue 先 prune。
+ * 任何一步失敗就 throw——呼叫端在移除之前呼叫，失敗即整棵保留。
+ */
+function saveCleanupResidue(consumerRoot, wtPath, slug, branchName, entries) {
+  const paths = [...new Set(entries.flatMap((e) => e.path.split(' -> ')))]
+  const plan = planResidueFiles(wtPath, paths)
+  const pruned = pruneCleanupResidue(consumerRoot)
+  const scratch = mkdtempSync(join(tmpdir(), 'clade-residue-'))
+  const env = {
+    ...Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith('GIT_'))),
+    GIT_INDEX_FILE: join(scratch, 'index'),
+    GIT_LITERAL_PATHSPECS: '1',
+    GIT_AUTHOR_NAME: 'clade-residue',
+    GIT_AUTHOR_EMAIL: 'clade-residue@localhost',
+    GIT_COMMITTER_NAME: 'clade-residue',
+    GIT_COMMITTER_EMAIL: 'clade-residue@localhost',
+  }
+  const ref = `refs/clade-residue/${slug}`
+  try {
+    const head = git(['rev-parse', 'HEAD'], { cwd: wtPath, env })
+    git(['read-tree', head], { cwd: wtPath, env })
+    for (let i = 0; i < plan.files.length; i += 500)
+      git(['add', '-A', '--', ...plan.files.slice(i, i + 500)], { cwd: wtPath, env })
+    const tree = git(['write-tree'], { cwd: wtPath, env })
+    let prev = ''
+    try {
+      prev = git(['rev-parse', '-q', '--verify', `${ref}^{commit}`], { cwd: wtPath, env })
+    } catch {
+      prev = ''
+    }
+    const message =
+      `clade-residue: ${slug} (${branchName})\n\n` +
+      `cleanup --discard-pathspec 移除前保存；worktree ${wtPath}\n` +
+      paths.map((p) => `- ${p}`).join('\n')
+    const commit = git(
+      ['commit-tree', tree, '-p', head, ...(prev ? ['-p', prev] : []), '-m', message],
+      { cwd: wtPath, env },
+    )
+    git(['update-ref', ref, commit], { cwd: wtPath, env })
+    const dir = residueRecordDir(consumerRoot)
+    mkdirSync(dir, { recursive: true })
+    const recordPath = join(dir, `${slug}.json`)
+    writeFileSync(
+      recordPath,
+      `${JSON.stringify(
+        {
+          slug,
+          branch: branchName,
+          worktree: wtPath,
+          head,
+          ref,
+          commit,
+          previous: prev || null,
+          paths,
+          skipped: plan.skipped.slice(0, 200),
+          skipped_total: plan.skipped.length,
+          saved_bytes: plan.bytes,
+          reason: 'cleanup --discard-pathspec',
+          saved_at: new Date().toISOString(),
+        },
+        null,
+        2,
+      )}\n`,
+    )
+    return { ref, commit, recordPath, skipped: plan.skipped.length, pruned }
+  } catch (error) {
+    throw new Error(
+      `cleanup retained ${wtPath}: residue 保存失敗（${errorMessage(error)}），未移除任何東西`,
+      { cause: error },
+    )
+  } finally {
+    rmSync(scratch, { recursive: true, force: true })
+  }
+}
+
+/** `batch cleanup --discard-pathspec` 的 residue 保存：與 `cleanup` 同一份格式與保留期。 */
+export function saveBatchCleanupResidue(
+  consumerRoot: string,
+  wtPath: string,
+  slug: string,
+  branchName: string,
+  paths: string[],
+) {
+  return saveCleanupResidue(
+    consumerRoot,
+    wtPath,
+    slug,
+    branchName,
+    paths.map((path) => ({ path })),
+  )
+}
+
+async function cmdCleanup(
+  slug,
+  opts,
+  probes: { mergedPrProbe?: typeof defaultMergedPrProbe } = {},
+) {
+  if (!slug)
+    throw new Error(
+      'Usage: wt-helper cleanup <slug> [--dry-run] [--force] [--force-discard-unland] [--force-discard-uncommitted] [--discard-pathspec <path>[,…]] [--allow-orphan-record] [--superseded-by <commit|file=commit|file=path>[,…] --reason <text>]',
+    )
+  const discardPathspecs = parseDiscardPathspecs(opts.discardPathspec)
+  const declaring = opts.supersededBy !== undefined
+  if (declaring && !String(opts.reason ?? '').trim())
+    throw new Error('cleanup --superseded-by 需要 --reason <為什麼判定已被取代>')
+  const cleanSlug = makeSlugSafe(slug)
+  const consumerRoot = findConsumerRoot()
+  const target = findCleanupWorktree(consumerRoot, cleanSlug)
+
+  assertLegacyAllowed(consumerRoot, target.path)
+  // detached 樹（review wt、rebase 中斷後留下的樹）沒有 branch：gate 改以 HEAD commit 當 rev 判，
+  // 顯示用 label，結尾不刪任何 branch。
+  const detachedHead = !target.branch
+  const branchName = detachedHead ? target.head : target.branch.replace('refs/heads/', '')
+  const branchLabel = detachedHead ? `(detached ${target.head.slice(0, 12)})` : branchName
+
+  // Pre-check ALL gates upfront so the error message can recommend the
+  // full flag combo in one go, rather than ping-ponging the user between
+  // --force / --force-discard-unland / --force-discard-uncommitted.
+  // The third gate (uncommitted) was added after TDMS 2026-05-17 incident
+  // where 47 baseline files lived only in the worktree's working tree
+  // (applied from stash, never committed) and vanished on cleanup.
+  // squash-merge 不建立 merge 邊，ancestry 因此對每一條正常 land 完的 branch 都誤報。
+  // marker 相符時兩道 ancestry gate 一起放行（見 isSquashLanded 上方的推導與實測）。
+  const ancestryMerged = detachedHead
+    ? isAncestorOfLandingBase(consumerRoot, branchName)
+    : mergedBranches(consumerRoot).has(branchName)
+  const squashLanded = isSquashLanded(consumerRoot, cleanSlug, branchName)
+  if (squashLanded && !ancestryMerged) {
+    const base = git(['merge-base', 'main', branchName], { cwd: consumerRoot }).trim()
+    const paths = git(['diff', '--name-only', '-z', base, branchName], { cwd: consumerRoot })
+      .split('\0')
+      .filter(Boolean)
+    if (paths.length) {
+      try {
+        git(['diff', '--quiet', '--cached', '--', ...paths], { cwd: consumerRoot })
+      } catch {
+        throw new Error(
+          'cleanup: legacy squash content is still staged in main; commit or reset it before removing the source',
+        )
+      }
+      // NO content comparison follows, deliberately. Everything below is the derivation, because
+      // the shape of this gate is inviting enough that it was written twice (TD-992 first cut) and
+      // the reason it cannot work is not visible from the call site.
+      //
+      // What is left to ask, once the marker matches and the index is clean, is exactly one thing:
+      // merge-back staged the squash and told the caller to finish with a formal /commit — did that
+      // commit happen, or did someone discard the staged content instead? Content cannot answer it.
+      // `isSquashLanded`'s own derivation says so in full: a squash throws the ancestry away, so
+      // "already landed" is NOT recoverable from the trees. Three measurements on the one branch
+      // this gate was written for (2026-09-07, `session/...-herdr-closure-paths`, verified landed):
+      //
+      //   `git diff --numstat <branch> main`  → 3 of 4 paths report deletions. One is another
+      //                                         session editing an unrelated entry; two are oxfmt
+      //                                         reflowing this branch's OWN lines. merge-back
+      //                                         auto-commits fmt drift and `vp check --fix` runs
+      //                                         before publish, so the normal path manufactures
+      //                                         deletions on its own.
+      //   `summarizeAddedLinesPresence`       → 67 of this branch's added lines "missing" from
+      //                                         `docs/tech-debt.md`, because later commits
+      //                                         legitimately rewrote those TD entries.
+      //   reverse-applying the patch          → a reformatted line does not reverse-apply either;
+      //                                         same false positive in a different spelling.
+      //
+      // The instrument that DOES answer it exists, in `wt-batch.ts`: record the landing commit and
+      // check `merge-base --is-ancestor <landedHead> refs/heads/main`. Pure history, no content.
+      // This path has no landing sha to check — the marker is written at squash time, before the
+      // commit exists — so it cannot run that check and must not fake one out of content.
+      //
+      // Refusing anyway is worse than not asking. `cleanup` on a squash-landed branch deletes the
+      // worktree DIRECTORY; the branch ref survives (see the `-d` below), so nothing is lost and
+      // the checkpoint stays reachable. The refusal's only exit was `--force`, which is what turns
+      // `-d` into `-D` and actually destroys the branch — the gate's failure mode pushed people
+      // toward the single action that made the loss real.
+      //
+      // NEVER re-add a tree/patch/line comparison here in any spelling. The uncommitted-worktree
+      // gate below is what caught the TDMS 2026-05-17 evaporation; this block was born 2026-09-06
+      // in 22da082ca, months later, and never had that job.
+    }
+  }
+  // 內容已由別條路徑進 main（例：別 session 或 publish 流程以不同 SHA 重新提交同一份改動）。
+  // 判準是 detectAbsorbedByOtherPath 的反套：branch 的每一個 hunk 都已在 main 上 ⟹ 移除
+  // worktree 與 branch 不會丟任何內容。這一道只**放行**，NEVER 拿它擋——反套失敗照舊走
+  // 下面的 unland gate，所以上方 squash 段「NEVER 以內容比對擋 cleanup」的推導不受影響。
+  const absorbed =
+    !squashLanded && !ancestryMerged
+      ? detectAbsorbedByOtherPath(consumerRoot, branchName, 'main')
+      : null
+  const absorbedLanded = absorbed?.absorbed === true
+  // TD-1103 第四條憑證：GitHub 上 MERGED 的 PR 其 headRefOid 逐字等於 branch tip
+  // —— 伺服器端落地事實，commit 級證據嚴格強於檔案內容比對，命中時同
+  // squashLanded 路徑連 detectUnlandedFiles 一起跳過。只在三條本地憑證全失手時
+  // 才出門打 gh（網路依賴因此只出現在「現況本就 BLOCKED」的分支）；probe 回
+  // unknown／無命中都落回原本三道 gate，fail closed。
+  // 再窄一層：probe 唯一能豁免的是 --force 與 --force-discard-unland 兩道 gate，
+  // 兩個 flag 都給了之後它無論回什麼都不改變判定 —— 那時出門打 gh（最長 15s）
+  // 只是白跑，跳過。`--force` 單獨給時仍跑：命中可豁免 --force-discard-unland，
+  // 跳過反而讓「多給一個 flag」比零 flag 更難過。
+  // detached 沒有 branch 名可查 `gh pr list --head`，不出門。
+  const mergedPr =
+    !detachedHead &&
+    !squashLanded &&
+    !ancestryMerged &&
+    !absorbedLanded &&
+    !(opts.force && opts.forceDiscardUnland)
+      ? detectMergedPrLanding(consumerRoot, branchName, probes.mergedPrProbe)
+      : null
+  const prLanded = mergedPr?.status === 'known' && mergedPr.value.landed === true
+  const branchMerged = squashLanded || ancestryMerged || absorbedLanded || prLanded
+  const unlanded =
+    squashLanded || absorbedLanded || prLanded ? [] : detectUnlandedFiles(consumerRoot, branchName)
+  // 第四條憑證證明的是「已落在 origin/<base>」，前三條證明的是「已在本機 main」
+  // —— clade home 的本機 main 與 origin 常態分岔，兩者在報表上 MUST 分開標，
+  // 不讓 merged=Y 的語意被悄悄放寬（TD-1103 複審）。
+  const landingBase = resolveLandingBase(consumerRoot)
+  const mergedLocal = squashLanded || ancestryMerged || absorbedLanded
+  // TD-1082：只在四條落地憑證全失手時才驗宣告；已落地的 branch 不需要它。
+  const superseded =
+    declaring && !branchMerged
+      ? verifySupersededDeclaration(consumerRoot, branchName, unlanded, opts.supersededBy)
+      : null
+  const supersededOk = superseded?.ok === true
+  if (declaring && branchMerged)
+    console.log(`cleanup: ${branchLabel} 已有落地憑證 —— --superseded-by 不需要，忽略`)
+  if (superseded && !superseded.ok && !opts.dryRun) {
+    throw new Error(
+      `cleanup --superseded-by 不成立，未移除任何東西：\n` +
+        [
+          ...superseded.errors.map((e) => `  - ${e}`),
+          ...superseded.uncovered.map((f) => `  - ${f}：沒有任何條目覆蓋`),
+        ].join('\n'),
+    )
+  }
+  if (absorbedLanded) {
+    console.log(
+      `cleanup: ${branchLabel} 的 changeset 已完整存在於 main（${absorbed.reason}）—— 略過兩道 ancestry gate`,
+    )
+  }
+  if (prLanded) {
+    console.log(
+      `cleanup: ${branchLabel} 的 tip 與 GitHub merged PR #${mergedPr.value.pr} 的 headRefOid 逐字相符（內容已落地到 origin/${landingBase}）—— 略過兩道 ancestry gate`,
+    )
+  }
+  if (squashLanded) {
+    console.log(
+      `cleanup: ${branchLabel} 的 tip 與 squash-landing marker '${landedMarkerRef(cleanSlug)}' 相符 —— 略過兩道 ancestry gate`,
+    )
+  }
+  // Tool-managed drift MUST be excluded here for the same reason merge-back's WIP gate
+  // excludes it (see isToolManagedDrift) — and the two gates MUST agree, or atomic
+  // merge-back breaks in half: cmdMergeBack squashes successfully, then calls cmdCleanup,
+  // which still counts that file as uncommitted and refuses. Result is
+  // "absorbed into main (cleanup skipped/failed)" on **every** lane, each needing a manual
+  // --force-discard-uncommitted to finish (perno's 4 lanes, 2026-07-26).
+  //
+  // Only `modified` is filtered: isToolManagedDrift compares against HEAD, which an
+  // untracked file has no version of.
+  //
+  // LOCKED projection（`.claude/**`、`CLAUDE.md`、`.clade/vendor/**`、vendored `scripts/*` …）
+  // 同理 MUST 一起豁免，而且理由與 merge-back 逐字相同 —— cmdMergeBack 的 WIP 判定
+  // (`wtUserDirtyAll`) 就是先過 `isLockedProjectionPathFor` 才算數，那裡的註解寫得很清楚：
+  // *propagate residue, not user WIP* + *re-materialize on next bootstrap*。main 是這些
+  // 檔的 SoT，worktree 內留下的是 clade bootstrap 每次進去就重寫一次的**較舊**投影。
+  //
+  // 沒有這一層，bootstrap 跑一次就在每個 worktree 種下一批永遠清不掉的髒檔，於是
+  // merge-back 自己呼叫的 cleanup（它只傳 force + forceDiscardUnland，**沒有**傳
+  // forceDiscardUncommitted）必然失敗，atomic 收尾再次斷成兩半 —— 正是上面 TD-252 那段
+  // 註解所描述、且明寫「兩道 gate MUST agree」的同一個斷法，只是換成投影檔觸發。
+  // 2026-08-22 於 perno 實測：20 個 session worktree 有 8 個的髒檔 100% 屬於這一類。
+  //
+  // 豁免範圍嚴格等於 merge-back 的判準，**NEVER** 放寬成「髒檔一律豁免」：真 user WIP
+  // （未 commit 的規格提案、`.env*.example`、scratch script）照舊擋 —— 另外 12 個
+  // worktree 就是靠這條繼續被擋住的。
+  const uncommittedObs = detectUncommittedWorktreeFiles(target.path)
+  if (uncommittedObs.status === 'unknown') {
+    if (opts.dryRun) {
+      console.log(`cleanup --dry-run: ${cleanSlug}`)
+      console.log(`  worktree           ${target.path}`)
+      console.log(
+        `  verdict            BLOCKED — uncommitted status unknown: ${uncommittedObs.reason}`,
+      )
+      return
+    }
+    throw new Error(
+      `cleanup blocked: uncommitted status unknown (${uncommittedObs.reason}); refusing to treat failure as clean`,
+    )
+  }
+  const uncommittedRaw = uncommittedObs.value
+  // TD-1148：systemd unit／drop-in／crontab 仍指進這棵樹時，移除它等於讓那些服務靜默失效。
+  // 沒有 flag 可繞過——唯一的修法是把設定改指 main 或刪掉，gate 本身不替人判斷哪一個。
+  const hostRefsObs = findHostConfigReferences(target.path)
+  const hostRefs = hostRefsObs.status === 'known' ? hostRefsObs.value : []
+  const isIgnorableDrift = (entry, kind) => isIgnorableWorktreeDrift(target.path, entry.path, kind)
+  const uncommittedAll = {
+    modified: uncommittedRaw.modified.filter((m) => !isIgnorableDrift(m, 'modified')),
+    untracked: uncommittedRaw.untracked.filter((u) => !isIgnorableDrift(u, 'untracked')),
+  }
+  // --discard-pathspec：呼叫端**逐條點名**可丟的路徑（W-2026-10-01-worktree-accumulation-root-cause
+  // §3 C4）。只有落在 pathspec 內的 dirty 被放行，而且移除前先存成 refs/clade-residue/<slug>；
+  // 其餘 dirty 照舊擋——NEVER 退化成整棵 --force-discard-uncommitted。
+  const inDiscard = (entry) => isDiscardedEntry(entry.path, discardPathspecs)
+  const discarded = [
+    ...uncommittedAll.modified.filter(inDiscard),
+    ...uncommittedAll.untracked.filter(inDiscard),
+  ]
+  const uncommitted = {
+    modified: uncommittedAll.modified.filter((m) => !inDiscard(m)),
+    untracked: uncommittedAll.untracked.filter((u) => !inDiscard(u)),
+  }
+  const uncommittedCount = uncommitted.modified.length + uncommitted.untracked.length
+  // git 不知道我們決定忽略這些檔，`git worktree remove` 照樣會因 dirty 而拒絕。
+  // 只放行 gate 而不讓 remove 帶 --force，等於把同一個失敗從 gate 挪到 remove。
+  const toolManagedCount =
+    uncommittedRaw.modified.length -
+    uncommitted.modified.length +
+    (uncommittedRaw.untracked.length - uncommitted.untracked.length)
+  const needsForce = !branchMerged && !opts.force && !supersededOk
+  const needsDiscardUnland = unlanded.length > 0 && !opts.forceDiscardUnland && !supersededOk
+  const needsDiscardUncommitted = uncommittedCount > 0 && !opts.forceDiscardUncommitted
+  // 未過期 claim＝有人宣告這棵樹還在用，內容面全綠（merged＋clean）不是所有權證據。
+  // 持有者有正面在世證據（非本 session 的行程 cwd 在樹內，或 journal 寫者仍活）就擋，
+  // 沒有 flag 可繞——確認持有者已不在後由人 `claim-helper.ts drop <id>`，那是可稽核的一步。
+  // unknown 放行但留警告：claim 不帶持有者身分，正常收尾（Bash-only 寫入、Codex、Herdr 外）
+  // 本來就判不出，擋下去等於每次收尾都要手動 drop。
+  const claimObs = findClaimByWorktreeObserved(consumerRoot, target.path)
+  const claimHolder =
+    claimObs.status === 'known' && claimObs.value
+      ? { claim: claimObs.value, ...claimHolderVerdict(consumerRoot, claimObs.value) }
+      : null
+  const claimBlock =
+    claimObs.status === 'unknown'
+      ? `claims unreadable (${claimObs.reason}); refusing to treat failure as no claim`
+      : claimHolder?.verdict === 'alive'
+        ? `active claim ${claimHolder.claim.session_id} (heartbeat ${claimHolder.claim.last_heartbeat}) holder ${claimHolder.verdict}: ${claimHolder.why}`
+        : null
+
+  // --dry-run：唯讀回報三道 gate 的判定，不動 worktree、不刪 branch、不寫任何 ref。
+  // 這是驗證豁免規則是否正確分辨「投影殘留」與「真 user WIP」的唯一非破壞性入口 ——
+  // 沒有它，要確認一個 worktree 現在可不可以清，就只能真的去清它。
+  if (opts.dryRun) {
+    const blocked = [
+      needsForce ? '--force' : null,
+      needsDiscardUnland ? '--force-discard-unland' : null,
+      needsDiscardUncommitted ? '--force-discard-uncommitted' : null,
+    ].filter(Boolean)
+    console.log(`cleanup --dry-run: ${cleanSlug}`)
+    console.log(`  worktree           ${target.path}`)
+    console.log(`  branch             ${branchLabel}`)
+    console.log(
+      `  ancestry           merged=${mergedLocal ? 'Y' : 'N'} squashLandedMarker=${squashLanded ? 'Y' : 'N'} absorbedByOtherPath=${absorbedLanded ? 'Y' : 'N'} mergedPr(origin/${landingBase})=${mergedPr === null ? '-' : prLanded ? 'Y' : mergedPr.status === 'unknown' ? 'unknown' : 'N'} unlandedFiles=${unlanded.length}`,
+    )
+    if (superseded) {
+      console.log(
+        `  superseded         declared=Y valid=${superseded.ok ? 'Y' : 'N'} covered=${superseded.coverage.length}/${unlanded.length}`,
+      )
+      for (const e of superseded.errors) console.log(`    ✗ ${e}`)
+      for (const f of superseded.uncovered) console.log(`    ✗ ${f}：沒有任何條目覆蓋`)
+    }
+    console.log(
+      `  uncommitted        blocking=${uncommittedCount} ignored(projection/tool-managed)=${toolManagedCount}` +
+        (discardPathspecs.length
+          ? ` discard(pathspec, residue saved first)=${discarded.length}`
+          : ''),
+    )
+    for (const d of discarded.slice(0, 10)) console.log(`    discard  ${d.path}`)
+    if (uncommittedCount > 0) {
+      for (const m of uncommitted.modified.slice(0, 10)) console.log(`    ${m.status}  ${m.path}`)
+      for (const u of uncommitted.untracked.slice(0, 10)) console.log(`    ??  ${u.path}`)
+    }
+    console.log(
+      `  host-config        refs=${hostRefsObs.status === 'known' ? hostRefs.length : `unknown (${hostRefsObs.reason})`}`,
+    )
+    if (hostRefs.length > 0) console.log(formatHostConfigRefs(hostRefs))
+    console.log(
+      `  claim              ${
+        claimObs.status === 'unknown'
+          ? `unknown (${claimObs.reason})`
+          : claimHolder
+            ? `${claimHolder.claim.session_id} holder=${claimHolder.verdict} (${claimHolder.why})`
+            : 'none'
+      }`,
+    )
+    if (claimBlock)
+      blocked.push(
+        claimObs.status === 'unknown'
+          ? '修復或移除 .clade/claims/ 下讀不到的 claim 檔（無 flag 可繞過）'
+          : 'claim 持有者確認已不在後 claim-helper.ts drop <id>（無 flag 可繞過）',
+      )
+    if (hostRefsObs.status === 'unknown' || hostRefs.length > 0)
+      blocked.push('宿主設定改指 main 或移除（無 flag 可繞過）')
+    console.log(
+      blocked.length === 0
+        ? '  verdict            CLEAN — 零 flag 即可 cleanup'
+        : `  verdict            BLOCKED — 需要 ${blocked.join(' ')}`,
+    )
+    return
+  }
+
+  if (claimBlock)
+    throw new Error(
+      `Cleanup blocked: ${claimBlock}\n` +
+        (claimObs.status === 'unknown'
+          ? `  The claim inventory under .clade/claims/ could not be read or parsed —\n` +
+            `  the bad file may belong to an unrelated tree and still blocks every cleanup.\n` +
+            `  Inspect .clade/claims/ under ${consumerRoot}, fix or remove the malformed file,\n` +
+            `  then re-run cleanup ${cleanSlug}.`
+          : `  This tree is still claimed and in use by a process or session that is not you;\n` +
+            `  removing it would delete a live session's cwd and drop its claim.\n` +
+            `  Confirm the holder has ended (herdr agent list / its pane), then:\n` +
+            `    node scripts/claim-helper.ts drop ${claimHolder?.claim.session_id ?? '<session-id>'}\n` +
+            `  and re-run cleanup ${cleanSlug}.`),
+    )
+  if (claimHolder?.verdict === 'unknown')
+    console.warn(
+      `cleanup: active claim ${claimHolder.claim.session_id} (heartbeat ${claimHolder.claim.last_heartbeat}) ` +
+        `holder unknown (${claimHolder.why}); no live process or writer found in the tree — removing and dropping it.`,
+    )
+  if (hostRefsObs.status === 'unknown')
+    throw new Error(
+      `cleanup blocked: host config references unknown (${hostRefsObs.reason}); refusing to treat failure as clean`,
+    )
+  if (hostRefs.length > 0)
+    throw new Error(
+      `Cleanup blocked: host config still references '${target.path}':\n` +
+        `${formatHostConfigRefs(hostRefs)}\n${HOST_CONFIG_REMEDY}`,
+    )
+
+  if (needsForce || needsDiscardUnland || needsDiscardUncommitted) {
+    const issues = []
+    if (needsForce) {
+      issues.push(`- Branch ${branchLabel} is not merged into main (gated by --force)`)
+    }
+    if (needsDiscardUnland) {
+      // 列**未進 main 的 commit**，不是檔名清單 —— 使用者要判的是「這些 commit 我還要
+      // 不要」，檔名答不了那題（TD-302）。取不到 commit 時才退回檔名。
+      const commits = unlandedCommits(consumerRoot, branchName)
+      const items = commits.length > 0 ? commits : unlanded
+      const label =
+        commits.length > 0
+          ? `${commits.length} commit(s) not in main`
+          : `${unlanded.length} file(s) whose content is NOT present in main's working tree`
+      const preview = items
+        .slice(0, 10)
+        .map((f) => `    - ${f}`)
+        .join('\n')
+      const more = items.length > 10 ? `\n    ... and ${items.length - 10} more` : ''
+      issues.push(
+        `- Branch ${branchLabel} has ${label} (gated by --force-discard-unland):\n${preview}${more}`,
+      )
+    }
+    if (needsDiscardUncommitted) {
+      const preview = [
+        ...uncommitted.modified.slice(0, 10).map((m) => `    - ${m.status}  ${m.path}`),
+        ...uncommitted.untracked.slice(0, 10).map((u) => `    - ??  ${u.path}`),
+      ]
+        .slice(0, 10)
+        .join('\n')
+      const more = uncommittedCount > 10 ? `\n    ... and ${uncommittedCount - 10} more` : ''
+      issues.push(
+        `- Worktree '${target.path}' has ${uncommittedCount} uncommitted file(s) that will be permanently destroyed by 'git worktree remove --force' (gated by --force-discard-uncommitted):\n${preview}${more}`,
+      )
+    }
+    const flagsNeeded = []
+    if (needsForce) flagsNeeded.push('--force')
+    if (needsDiscardUnland) flagsNeeded.push('--force-discard-unland')
+    if (needsDiscardUncommitted) flagsNeeded.push('--force-discard-uncommitted')
+    throw new Error(
+      `Cleanup blocked by ${issues.length} gate(s):\n` +
+        issues.join('\n') +
+        `\n\nResolution — re-run with the full flag combo:\n` +
+        `  node scripts/wt-helper.ts cleanup ${cleanSlug} ${flagsNeeded.join(' ')}\n` +
+        `\nWhy each gate:\n` +
+        `  --force                       discards the unmerged branch ref\n` +
+        `  --force-discard-unland        acknowledges branch's commits will be lost\n` +
+        `                                (their content never made it into main)\n` +
+        `  --force-discard-uncommitted   acknowledges worktree's uncommitted files\n` +
+        `                                (modified/untracked, including pre-fork baseline\n` +
+        `                                 applied from stash) will be permanently destroyed\n` +
+        (needsDiscardUnland
+          ? `\nmain 之後改寫了這些 hunk（內容已被後續演進取代）？不要用 --force，改宣告：\n` +
+            `  node scripts/wt-helper.ts cleanup ${cleanSlug} --superseded-by <commit|file=commit|file=path>[,…] --reason <text>\n` +
+            `  （逐檔驗證；成立時先釘 refs/wt-superseded/ 才移除，移除成功後寫事件）\n`
+          : '') +
+        `\nUse \`wt-helper merge-back ${cleanSlug}\` first if you want to commit the work,\n` +
+        `or \`wt-helper rescue\` to see pinned pre-fork baselines available for restore.`,
+    )
+  }
+
+  if (mergedLocal || prLanded) {
+    try {
+      const projectionState = reconcileLandedProjectionState(consumerRoot, target.path)
+      if (projectionState.updated > 0)
+        console.log(`cleanup: reconciled ${projectionState.updated} landed projection receipt(s)`)
+      for (const reason of projectionState.skipped)
+        console.log(`cleanup: projection receipt skipped: ${reason}`)
+    } catch (error) {
+      throw new Error(
+        `cleanup retained ${target.path}: projection receipt reconcile failed: ${errorMessage(error)}; ` +
+          `resolve the receipt or pending projection transaction, then retry cleanup ${cleanSlug}`,
+        { cause: error },
+      )
+    }
+  }
+
+  const supersededPin = supersededOk
+    ? pinSupersededTip(consumerRoot, cleanSlug, branchName, String(opts.reason).trim())
+    : undefined
+
+  // 被 pathspec 放行的殘留先存，存不成就整棵保留（throw 在任何移除動作之前）。
+  if (discarded.length > 0) {
+    const residue = saveCleanupResidue(consumerRoot, target.path, cleanSlug, branchLabel, discarded)
+    console.log(
+      `cleanup: ${discarded.length} 筆 pathspec 殘留已存到 ${residue.ref}（${residue.commit.slice(0, 12)}）；紀錄 ${residue.recordPath}` +
+        (residue.skipped ? `；${residue.skipped} 筆建置產物／超量檔未保存` : '') +
+        (residue.pruned.length ? `；過期 residue 已清 ${residue.pruned.length} 筆` : ''),
+    )
+  }
+
+  // Release per-worktree resources before the directory disappears — the
+  // bootstrap script lives inside the worktree. No-op for consumers without it.
+  teardownWorktreeSubmodules(target.path)
+  const envCleanup = runWtEnvBootstrap(target.path, 'destroy', {
+    allowOrphanRecord: opts.allowOrphanRecord,
+  })
+  if (envCleanup?.status === 'orphan-recorded' && !opts.allowOrphanRecord) {
+    throw new Error(
+      `Worktree env cleanup did not complete for ${cleanSlug}; ` +
+        `re-run with --allow-orphan-record to record it as an orphan and continue.`,
+    )
+  }
+
+  const removeArgs = ['worktree', 'remove']
+  // toolManagedCount > 0：gate 已判定這些 drift 可忽略（見上方），但 git 仍視之為 dirty
+  // 而拒絕移除，所以這裡必須補 --force。它只涵蓋 isToolManagedDrift 與
+  // isLockedProjectionPathFor 認可的檔——真的 user WIP 早在 gate 就攔下了，走不到這裡。
+  // forceDiscardUncommitted：gate 已由呼叫端授權丟棄 user WIP，git 同樣要 --force 才肯移除。
+  // discarded.length > 0：殘留已存成 residue ref，git 仍視之為 dirty，同樣要 --force。
+  if (opts.force || opts.forceDiscardUncommitted || toolManagedCount > 0 || discarded.length > 0) {
+    removeArgs.push('--force')
+  }
+  removeArgs.push(target.path)
+  git(removeArgs, { cwd: consumerRoot })
+  if (supersededPin) {
+    recordSupersededCleanup(
+      consumerRoot,
+      cleanSlug,
+      branchName,
+      supersededPin,
+      superseded,
+      String(opts.reason).trim(),
+    )
+    console.log(
+      `cleanup: ${branchLabel} 依取代宣告移除（${superseded.coverage.length} 檔有證據）—— tip 保留在 ${supersededPin.ref}`,
+    )
+  }
+  // worktree 已消失，marker 的用途（證明這個 tip 已 land）也隨之結束。留著只會在同名
+  // slug 被重新開出來時變成一條指向舊 tip 的死 ref。
+  deleteLandedMarker(consumerRoot, cleanSlug)
+  // Post-remove verification: git worktree remove may leave gitignored dirs
+  // (e.g. screenshots/) on macOS. Fallback rm ensures no orphaned directories.
+  if (existsSync(target.path)) {
+    try {
+      rmSync(target.path, { recursive: true, force: true })
+      console.log(`warn: worktree dir survived git remove — cleaned residual gitignored files`)
+    } catch (e) {
+      console.error(`warn: could not remove residual dir ${target.path}: ${e.message ?? e}`)
+    }
+  }
+  cleanupCodebaseMemoryIndex(target.path)
+  // `-D` only where the caller is knowingly discarding unlanded work. A squash-landed branch is
+  // never that case: it is not an ancestor of main, so `-d` refuses and the ref survives — and
+  // that surviving ref is the last reachable copy of the checkpoint once the worktree is gone.
+  // Honouring `--force` here would delete it, which is precisely the loss the removed content
+  // gate above was trying (and failing) to prevent. Deleting it stays available as a deliberate,
+  // separate `git branch -D`.
+  // absorbed 不同於 squash：內容已逐 hunk 驗證在 main 上，branch 只是重複的副本，`-D` 不丟任何東西。
+  // prLanded 同理但落地處在 server 端：squash 後的內容已在 origin/<base>、merge 前的 head 由
+  // GitHub `refs/pull/N/head` 保存，本地 branch 只是重複副本 —— `-D` 不丟任何東西，且 MUST
+  // 刪：worktree 移除後 `cleanup <slug>` 會以 `No session worktree found` 拒絕服務，留著的
+  // branch 從此再也清不到，正是 TD-1103 要消滅的殘留。用 `-D` 而非 `-d` 還有一層原因：
+  // `git branch -d` 在 branch 設有 upstream 時是對 upstream 判 merged，同一憑證會依
+  // tracking ref 在不在產生「刪／留」兩種結果，`-D` 讓兩格一致。`opts.force` 同理 ——
+  // 使用者明示的 `--force` 拿到的是 `-D`，NEVER 被 probe 命中降級回 `-d`。
+  // supersededOk 同理：tip 已釘在 refs/wt-superseded/，`-D` 不讓任何 commit 變成不可達。
+  const deleteFlag =
+    (opts.force && !squashLanded) || absorbedLanded || prLanded || supersededOk ? '-D' : '-d'
+  try {
+    if (!detachedHead) git(['branch', deleteFlag, branchName], { cwd: consumerRoot })
+  } catch {
+    console.error(
+      squashLanded
+        ? `note: branch ${branchName} kept — squash landing leaves it un-mergeable to git, and it is the last copy of the checkpoint. Discard with: git branch -D ${branchName}`
+        : `warn: branch ${branchName} could not be deleted; keep manually`,
+    )
+  }
+  try {
+    // TD-996: this tree is being removed, so its claim goes with it even after TTL.
+    // The default reader skips expired files; those would otherwise survive every cleanup.
+    const claim = findClaimByWorktree(consumerRoot, target.path, { includeExpired: true })
+    if (claim) {
+      dropClaim(consumerRoot, claim.session_id)
+      console.log(`Dropped claim ${claim.session_id}`)
+    }
+  } catch {
+    // best-effort claim cleanup; never block worktree removal
+  }
+  // C8：回收量測。移除已成功，這筆只是事實紀錄——寫不進去不影響 cleanup 結果。
+  try {
+    const { recordWorktreeReleased } = await import(
+      new URL('./work-inventory-store.ts', import.meta.url).href
+    )
+    recordWorktreeReleased(consumerRoot, {
+      path: resolve(target.path),
+      branch: branchName,
+      head: target.head ?? null,
+      slug: cleanSlug,
+      landed_evidence: ancestryMerged
+        ? 'ancestry'
+        : squashLanded
+          ? 'squash-marker'
+          : absorbedLanded
+            ? 'absorbed'
+            : prLanded
+              ? `merged-pr:#${mergedPr?.value?.pr ?? '?'}`
+              : supersededOk
+                ? 'superseded'
+                : 'none',
+    })
+  } catch (e) {
+    console.error(`note: work-asset release event skipped (fail-open): ${e?.message ?? e}`)
+  }
+  console.log(`Removed ${target.path}`)
+}
+
+// Atomic ceremony: stash main blockers (optional) → squash session branch
+// into main → cleanup worktree. Designed to be called from merge-back flows
+// (auto, slug = change name) or manually (ad-hoc Form-1 worktrees).
+/**
+ * TD-1064 — 在 publish / propagate 飛行中改 main 的 working tree 或 HEAD，會打死那一趟。
+ *
+ * 成因不是 git 競爭：`scripts/sync-rules.ts` 讀的是 **working tree**、不經 git，所以檔案在
+ * transaction 中途出現／消失就得到 `transaction source precondition changed` 與
+ * `transaction final state conflict`，publish exit 1。2026-09-10 實測：17:14:39 一次 29 檔的
+ * merge-back，讓 16:55:56 起跑的另一趟 publish 在 17:18:13 全滅，錯誤清單裡一個都不是它自己的檔。
+ *
+ * **判準是「這個指令會不會改變 main 的 working tree 或 HEAD」，NEVER 是「它在不在某份入口清單裡」**
+ * —— 新增這類入口時 MUST 一併呼叫本 guard，清單只是當下的實況不是窮舉。
+ *
+ * **NEVER 降成 warn**：warn 的成本是別人一整趟 22 分鐘的 gate，等待成本是幾分鐘。
+ * **NEVER** 在 pgrep 結果後面再接對 launcher 長相的過濾（`^[0-9]+ node ` 那型）——
+ * 過濾掉的會是真的 in-flight 行程，而失敗方向是靜默放行。「腳本路徑是不是獨立 argv 元素」
+ * 不屬此類：它識別的是被執行的腳本、對所有 launcher 恆成立，且讀不到一律保留
+ * （判準與實測在 `lib/publish-in-flight.ts` 的 `detectPublishInFlight`）。
+ */
+function detectPublishInFlight() {
+  return detectPublishInFlightShared()
+}
+
+/**
+ * 哪些 in-flight publish／propagate **真的會讀到 `targetRoot` 這棵樹**。
+ *
+ * 收窄的判準是行程的 **cwd**，NEVER 是「目標路徑長得像不像暫存目錄」——後者要維護一張
+ * 暫存根目錄清單，而 `wt-helper.fixtures.test.ts` 用的是 `~/.tmp` 不是 `os.tmpdir()`，
+ * 清單型判準第一次就漏掉它（2026-09-10 v1.12.43 實測）。cwd 量的是那件事本身：
+ * publish 讀的就是它自己 cwd 那棵樹。
+ *
+ * **三種讀不出來一律 fail closed**（pid 非數字／`/proc` 讀不到／沒給 targetRoot）——
+ * 「偵測不出來」與「沒有在飛」的後果不對稱，NEVER 讓前者靜默放行。
+ */
+function inFlightHoldersFor(targetRoot, detect = detectPublishInFlight) {
+  return inFlightHoldersForShared(targetRoot, detect)
+}
+
+function assertNoPublishInFlight(action, opts: WtOptions = {}, detect = detectPublishInFlight) {
+  assertNoPublishInFlightShared(action, opts.targetRoot, opts.iKnowPublishIsRunning, detect)
+}
+
+async function cmdMergeBack(slug, opts: WtOptions = {}) {
+  if (!slug) {
+    throw new Error(
+      'Usage: wt-helper merge-back <slug> [--dry-run] [--auto-stash] [--include-worktree-wip] [--no-cleanup] [--noop-if-missing] [--skip-pre-sync] [--i-know-publish-is-running] [--work-done --verification <one line>]',
+    )
+  }
+  // Refused before anything moves, not after the squash: a merge-back that lands and *then*
+  // discovers it cannot file the claim leaves the caller with no way to re-run it — the worktree
+  // and branch are gone by the end of this function. Same fail-closed shape as
+  // `herdr-session-handoff.ts --work-done` (a completion claim with no evidence is worse than
+  // none) and as `flow done`'s own refusal; three doors into `work.done`, one gate.
+  if (opts.workDone && !opts.verification?.trim()) {
+    throw new Error(
+      "merge-back --work-done requires --verification '<how it was verified>': a completion claim " +
+        'with no evidence is worse than none (rules/core/flow-work-tracking.md § R1)',
+    )
+  }
+  if (opts.workDone && opts.dryRun) {
+    throw new Error(
+      'merge-back --work-done is not accepted with --dry-run: a dry run lands nothing, so there is ' +
+        'nothing for the claim to be about',
+    )
+  }
+  const cleanSlug = makeSlugSafe(slug)
+  const consumerRoot = findConsumerRoot()
+  assertNoPublishInFlight('merge-back', { ...opts, targetRoot: consumerRoot })
+  const target = findSessionWorktreeForSlug(consumerRoot, cleanSlug)
+  if (!target) {
+    if (opts.noopIfMissing) {
+      console.log(`merge-back: no session worktree for ${cleanSlug} (no-op)`)
+      return { absorbed: false, slug: cleanSlug, reason: 'no-worktree' }
+    }
+    throw new Error(`No session worktree found for slug: ${cleanSlug}`)
+  }
+
+  const branchName = target.branch.replace('refs/heads/', '')
+  assertLegacyAllowed(consumerRoot, target.path)
+
+  if (opts.patch) {
+    if (opts.autoStash || opts.includeWorktreeWip || opts.acceptLanded || opts.workDone)
+      throw new Error(
+        '--patch cannot combine with --auto-stash, --include-worktree-wip, --accept-landed or --work-done',
+      )
+    const result = landWorktreePatch(consumerRoot, target.path, branchName, opts.dryRun)
+    console.log(`merge-back --patch${opts.dryRun ? ' dry-run' : ''}: ${result.reason}`)
+    console.log(`  ${result.paths.join('\n  ')}`)
+    console.log(
+      '  Source retained; 已落 main working tree 時，待正式 /commit；不寫 index 或 landing marker。',
+    )
+    return {
+      ...result,
+      slug: cleanSlug,
+      absorbed: false,
+      absorbedByOtherPath: result.reason === 'already-present',
+      cleanupDone: false,
+      stashRef: null,
+    }
+  }
+
+  // Patch mode does not use the index, including its lock; legacy squash still does.
+  const lockStatus = ensureNoStaleIndexLock(consumerRoot)
+  if (lockStatus.cleaned) console.error(`⚠ rm'd stale .git/index.lock — proceeding`)
+
+  // TD-915: which card the claim goes to is decided HERE, before anything moves. The tail used to
+  // read ambient CLADE_WORK_ID after the squash, and an ambient left over from another shell filed
+  // `work.done` against a different card — an event with no retraction path.
+  let doneWorkId: string | null = null
+  if (opts.workDone) {
+    const resolved = resolveMergeBackWorkId(
+      consumerRoot,
+      target.path,
+      process.env.CLADE_WORK_ID,
+      branchName,
+    )
+    if ('error' in resolved) {
+      throw new Error(`merge-back --work-done STOP（main 沒有被動過）：${resolved.error}`)
+    }
+    doneWorkId = resolved.workId
+    console.log(`merge-back: --work-done will file against ${doneWorkId} (from ${resolved.source})`)
+  }
+
+  // TD-739 / TD-964: the squash reads and writes main's WHOLE index. Measured before anything
+  // moves (dry-run reports it; a real run refuses right after the dry-run block) and measured
+  // again right before the squash, because pre-sync runs a network fetch in between.
+  let mainStaged: string[]
+  try {
+    mainStaged = readMainStagedEntries(consumerRoot)
+  } catch (e) {
+    throw new Error(
+      `merge-back blocked: main index status unknown (${e?.message ?? e}); refusing to treat failure as empty`,
+      { cause: e },
+    )
+  }
+
+  const blockers = detectMergeBlockers(consumerRoot, branchName)
+
+  // Pre-flight: worktree dirty tracked-file check (TDMS-1J 2026-05-18 incident).
+  // detectMergeBlockers only catches files in main that would be overwritten;
+  // it doesn't see edits inside the worktree that were never committed. Without
+  // this check, `git merge --squash` silently drops worktree WIP, then cleanup
+  // permanently destroys the worktree → WIP gone with no recovery path.
+  //
+  // Filter clade-managed projection paths via the shared LOCKED_PROJECTION
+  // regex (kept in sync with hub:bootstrap auto-sync range — see top-of-file
+  // constant). Those are propagate residue, not user WIP, and re-materialize
+  // on next bootstrap. User code (server/, src/, app/, ...) and untracked
+  // non-projection files are real WIP and must be committed before squash.
+  const wtDirtyObs = detectUncommittedWorktreeFiles(target.path)
+  if (wtDirtyObs.status === 'unknown') {
+    throw new Error(
+      `merge-back blocked: worktree status unknown (${wtDirtyObs.reason}); refusing to treat failure as clean`,
+    )
+  }
+  const wtDirty = wtDirtyObs.value
+  const wtUserDirtyAll = [
+    // repo-aware：clade home 的 `vendor/snippets/**` 等是源檔不是投影，過濾掉它們等於讓
+    // 只改 snippet 的 worktree 靜默通過未 commit gate（TD-344）。
+    ...wtDirty.modified
+      .filter((m) => !isLockedProjectionPathFor(target.path, m.path))
+      .map((m) => ({ ...m, kind: 'modified' })),
+    ...wtDirty.untracked
+      .filter((u) => !isLockedProjectionPathFor(target.path, u.path))
+      .map((u) => ({ ...u, status: '??', kind: 'untracked' })),
+  ]
+  // Partition: OXFMT_AUTO_PATHS entries whose drift is purely oxfmt
+  // normalization of the HEAD version are auto-commit candidates (no user
+  // prompt). Everything else stays as semantic user WIP and falls through to
+  // the existing STOP gate.
+  const wtFmtDrift = []
+  const wtToolManaged = []
+  const wtUserDirty = []
+  for (const d of wtUserDirtyAll) {
+    if (d.kind === 'modified' && isToolManagedDrift(target.path, d.path)) {
+      // wt-helper 自己 bootstrap 造成、且刻意不該 land 的差異 → 兩邊都不進
+      // （不擋 merge-back，也不 auto-commit）。見 isToolManagedDrift 註解。
+      wtToolManaged.push(d)
+    } else if (d.kind === 'modified' && isFormatOnlyDrift(target.path, d.path)) {
+      wtFmtDrift.push(d)
+    } else {
+      wtUserDirty.push(d)
+    }
+  }
+  if (wtToolManaged.length > 0) {
+    console.log(
+      `merge-back: ignoring ${wtToolManaged.length} tool-managed drift file(s) ` +
+        `(${wtToolManaged.map((d) => d.path).join(', ')}) — created by wt-helper bootstrap, ` +
+        `intentionally not landed on main`,
+    )
+  }
+
+  // Surface pinned pre-fork baselines for this slug so the user knows what's
+  // available for rescue if cleanup later detects uncommitted-baseline loss
+  // (cmdCleanup --force-discard-uncommitted gate, post-TDMS 2026-05-17 fix).
+  let baselineRefs = []
+  try {
+    const raw = git(['for-each-ref', '--format=%(refname)', `refs/wt-baseline/${cleanSlug}/`], {
+      cwd: consumerRoot,
+    })
+    baselineRefs = raw.split('\n').filter(Boolean)
+  } catch {}
+
+  // landingRef is resolved first so preSyncBehind uses the same target (TD-592).
+  const landingRef = resolveSyncTargetRef(consumerRoot, { fetch: false })
+
+  let preSyncBehind = 0
+  if (!opts.skipPreSync) {
+    try {
+      const out = git(['rev-list', '--count', `${branchName}..${landingRef}`], { cwd: target.path })
+      preSyncBehind = parseInt(out, 10) || 0
+    } catch {}
+  }
+
+  // Distinct from `preSyncBehind` on purpose: that one measures branch..target
+  // (nonzero on every healthy merge-back). This one measures local main against
+  // the SAME landing ref pre-sync uses, and nonzero means the squash would stage
+  // files this worktree never touched.
+  const mainBehindTarget = commitsBehindRef(consumerRoot, landingRef)
+
+  // TD-745, the mirror of `mainBehindTarget`: commits local main has that the branch will still
+  // lack after pre-sync (pre-sync brings in `landingRef`, never local main). Nonzero means the
+  // squash is a 3-way merge of a branch that never saw those commits — the case where the branch's
+  // older copy of a file lands over local main's newer one, and `Pre-sync behind: 0` says nothing.
+  const branchBehindLocalMain = opts.skipPreSync
+    ? null
+    : countCommitsMissingFromBranch(consumerRoot, branchName, landingRef)
+
+  if (opts.dryRun) {
+    console.log(`merge-back dry-run for ${cleanSlug}:`)
+    console.log(`  Worktree:        ${target.path}`)
+    console.log(`  Branch:          ${branchName}`)
+    console.log(`  Blockers:        ${blockers.length}`)
+    for (const b of blockers.slice(0, 20)) {
+      console.log(`    ${b.type.padEnd(10)} ${b.path}`)
+    }
+    if (blockers.length > 20) {
+      console.log(`    ... and ${blockers.length - 20} more`)
+    }
+    console.log(`  Worktree WIP:    ${wtUserDirty.length}`)
+    for (const d of wtUserDirty.slice(0, 20)) {
+      console.log(`    ${(d.status ?? '??').padEnd(3)} ${d.path}`)
+    }
+    if (wtUserDirty.length > 20) {
+      console.log(`    ... and ${wtUserDirty.length - 20} more`)
+    }
+    console.log(`  Fmt-only drift:  ${wtFmtDrift.length} (would auto-commit on real run)`)
+    for (const d of wtFmtDrift.slice(0, 20)) {
+      console.log(`    ${(d.status ?? '??').padEnd(3)} ${d.path}`)
+    }
+    if (wtFmtDrift.length > 20) {
+      console.log(`    ... and ${wtFmtDrift.length - 20} more`)
+    }
+    console.log(`  Pinned baselines: ${baselineRefs.length}`)
+    for (const r of baselineRefs) console.log(`    ${r}`)
+    if (opts.skipPreSync) {
+      console.log(`  Pre-sync:        SKIPPED (--skip-pre-sync)`)
+    } else {
+      console.log(`  Pre-sync behind: ${preSyncBehind} commit(s) on main`)
+    }
+    console.log(
+      `  Local main behind ${landingRef}: ${mainBehindTarget} commit(s)` +
+        (mainBehindTarget > 0 ? ` (would fast-forward local main before squash)` : ''),
+    )
+    console.log(
+      branchBehindLocalMain === null
+        ? `  Branch behind local main: not measured (--skip-pre-sync: squash is a 3-way merge by request)`
+        : `  Branch behind local main: ${branchBehindLocalMain} commit(s) after pre-sync` +
+            // dry-run resolves landingRef with fetch:false; the real run fetches in pre-sync and
+            // re-measures, so commits main-sync already pushed can read nonzero here and pass there.
+            ` (measured against cached ${landingRef}; dry-run does not fetch)` +
+            (branchBehindLocalMain > 0
+              ? ` (the squash would land the branch's older copy of those files over local main — merge-back would refuse unless a fetch of ${landingRef} brings them in)`
+              : ''),
+    )
+    console.log(`  Main index staged: ${mainStaged.length}`)
+    for (const line of mainStaged.slice(0, 20)) console.log(`    ${line.replace('\t', '  ')}`)
+    if (mainStaged.length > 20) console.log(`    ... and ${mainStaged.length - 20} more`)
+    if (mainStaged.length > 0) {
+      console.log(
+        `  Action: main index is not empty; merge-back would refuse before touching anything (TD-739 / TD-964).`,
+      )
+    } else if (branchBehindLocalMain !== null && branchBehindLocalMain > 0) {
+      console.log(
+        `  Action: local main has ${branchBehindLocalMain} commit(s) cached ${landingRef} lacks; merge-back would refuse (TD-745) unless pre-sync's fetch brings them in.`,
+      )
+    } else if (wtUserDirty.length > 0) {
+      console.log(
+        `  Action: worktree has uncommitted WIP; without --include-worktree-wip, merge-back would refuse.`,
+      )
+    } else if (blockers.length > 0) {
+      console.log(
+        `  Action: blockers detected; without --auto-stash, merge-back would fail at pre-flight.`,
+      )
+    } else if (preSyncBehind > 0 && !opts.skipPreSync) {
+      console.log(
+        `  Action: would merge ${landingRef} into wt (${preSyncBehind} commit(s)), then squash + cleanup. Conflicts (if any) stay in wt.`,
+      )
+    } else {
+      console.log(`  Action: would squash + cleanup cleanly.`)
+    }
+    return {
+      absorbed: false,
+      slug: cleanSlug,
+      dryRun: true,
+      blockers,
+      wtUserDirty,
+      wtFmtDrift,
+      baselineRefs,
+      preSyncBehind,
+      mainBehindTarget,
+      branchBehindLocalMain,
+      mainStaged,
+    }
+  }
+
+  if (mainStaged.length > 0) {
+    throw new Error(mainIndexNotEmptyMessage(cleanSlug, mainStaged, 'before any change'))
+  }
+
+  if (baselineRefs.length > 0) {
+    console.log(`merge-back: ${baselineRefs.length} pinned pre-fork baseline(s) for ${cleanSlug}:`)
+    for (const r of baselineRefs) console.log(`  ${r}`)
+    console.log(
+      `  → if cleanup later detects uncommitted files, inspect via 'wt-helper rescue --show <ref>'.`,
+    )
+    console.log(
+      `  → redundant 'wt-baseline/${cleanSlug}/<ISO>' stash entries are safe to drop via '${stashReconcileCmd(consumerRoot)} --slug ${cleanSlug} --interactive'.`,
+    )
+    console.log('')
+  }
+
+  // Auto-commit format-only drift on OXFMT_AUTO_PATHS files (no user prompt).
+  // Branch runs BEFORE the wtUserDirty STOP gate, so mixed cases (format-only
+  // drift on settings.json + real WIP on server/foo.ts) auto-land the trivial
+  // bit first, then STOP cleanly on the remaining semantic edits.
+  //
+  // pre-commit / commit-msg hooks run normally. oxfmt is idempotent — re-running
+  // fmt on already-formatted content produces zero further drift. OXFMT_AUTO_PATHS
+  // are config files (settings.json, .editorconfig, etc.) which oxlint doesn't
+  // touch, so lint won't false-positive either. Message shape comes from
+  // fmtDriftCommitMessage() so it clears commitlint on clade and consumers alike.
+  if (wtFmtDrift.length > 0) {
+    const paths = wtFmtDrift.map((d) => d.path)
+    try {
+      git(['add', '--', ...paths], { cwd: target.path })
+      const msg = fmtDriftCommitMessage(cleanSlug, paths)
+      git(['commit', '-m', msg], { cwd: target.path, stdio: 'inherit' })
+      console.log(
+        `merge-back: auto-committed ${paths.length} format-only drift file(s) on ${branchName} (oxfmt(HEAD) === current)`,
+      )
+    } catch (e) {
+      throw new Error(
+        `merge-back: format-only auto-commit failed: ${e.message ?? e}\n` +
+          `Affected paths: ${paths.join(', ')}\n` +
+          `Resolution — commit manually in worktree (resolve any hook violation first), then re-run merge-back.`,
+        { cause: e },
+      )
+    }
+  }
+
+  // Act on worktree WIP detection from pre-flight: either auto-amend (opt-in)
+  // or refuse with clear remediation steps. See computation above for rationale.
+  //
+  // pre-commit + commit-msg hooks run on amend. The HEAD commit message was
+  // produced by Claude/pi following [[wt]] `rules/worker契約.md` Rule 5 (emoji + scope:
+  // `🧹 chore(wt): ...` or similar), so commit-msg passes. pre-commit may fail
+  // if amended user WIP has lint/test issues — that's a legitimate gate, the
+  // catch below surfaces remediation.
+  if (wtUserDirty.length > 0) {
+    if (opts.includeWorktreeWip) {
+      const paths = wtUserDirty.map((d) => d.path)
+      try {
+        git(['add', '--', ...paths], { cwd: target.path })
+        git(['commit', '--amend', '--no-edit'], {
+          cwd: target.path,
+          stdio: 'inherit',
+        })
+        console.log(
+          `merge-back: --include-worktree-wip auto-amended ${paths.length} dirty file(s) into ${branchName} HEAD`,
+        )
+      } catch (e) {
+        throw new Error(
+          `merge-back: --include-worktree-wip auto-amend failed: ${e.message ?? e}\n` +
+            `Likely cause: pre-commit hook (lint/test/typecheck) rejected the amended WIP.\n` +
+            `Resolution — cd ${target.path}, fix the hook violation, then:\n` +
+            `  git add ${paths.slice(0, 3).join(' ')}${paths.length > 3 ? ' ...' : ''}\n` +
+            `  git commit --amend --no-edit\n` +
+            `Then re-run wt-helper merge-back.`,
+          { cause: e },
+        )
+      }
+    } else {
+      const preview = wtUserDirty
+        .slice(0, 10)
+        .map((d) => `  ${(d.status ?? '??').padEnd(3)} ${d.path}`)
+        .join('\n')
+      const more = wtUserDirty.length > 10 ? `\n  ... and ${wtUserDirty.length - 10} more` : ''
+      throw new Error(
+        `merge-back blocked: worktree '${target.path}' has ${wtUserDirty.length} uncommitted edit(s) to tracked/untracked file(s):\n` +
+          preview +
+          more +
+          `\n\nAtomic-landing requires all worktree edits be committed before squash.\n` +
+          `'git merge --squash' only carries commits — uncommitted worktree WIP is dropped,\n` +
+          `then permanently destroyed by post-squash cleanup.\n\n` +
+          `Resolution — commit on the worktree branch first:\n` +
+          `  cd ${target.path}\n` +
+          `  git add <files>\n` +
+          `  git commit --amend --no-edit       # or new commit\n` +
+          `Then re-run: wt-helper merge-back ${cleanSlug}\n\n` +
+          `Override with --include-worktree-wip to auto-amend (not recommended — an explicit\n` +
+          `commit with a meaningful message is safer).`,
+      )
+    }
+  }
+
+  if (!opts.skipPreSync) {
+    const syncResult = syncWorktreeWithMain(target.path, branchName, cleanSlug)
+    if (syncResult.synced) {
+      console.log(
+        `merge-back: pre-synced wt with main (${syncResult.behind} commit(s) behind, merge commit: '${preSyncCommitMessage(branchName).split('\n')[0]}')`,
+      )
+    }
+  }
+
+  // Both gates below run BEFORE the stash / fast-forward / squash: at this point only the
+  // worktree branch has moved (pre-sync), main's working tree and index are exactly as found,
+  // so a refusal here leaves nothing on main to put back.
+  //
+  // (1) TD-739 / TD-964 re-check. Pre-sync ran a network fetch since the first reading.
+  let stagedAtSquash: string[]
+  try {
+    stagedAtSquash = readMainStagedEntries(consumerRoot)
+  } catch (e) {
+    throw new Error(
+      `merge-back blocked: main index status unknown (${e?.message ?? e}); refusing to treat failure as empty`,
+      { cause: e },
+    )
+  }
+  if (stagedAtSquash.length > 0) {
+    throw new Error(
+      mainIndexNotEmptyMessage(cleanSlug, stagedAtSquash, 'after pre-sync, before squash') +
+        `\nWorktree '${target.path}' + branch '${branchName}' preserved（pre-sync 已進 branch，重跑不會重做）。`,
+    )
+  }
+
+  // (2) TD-745. Measured after pre-sync, against the post-fast-forward main: the ff below only
+  // adds commits `landingRef` has, and pre-sync already merged `landingRef` into the branch, so
+  // counting now equals counting after the ff. Nonzero = local main is ahead of the landing ref
+  // with commits the branch never saw, and the squash is a 3-way merge nobody asked for.
+  // `--skip-pre-sync` is the explicit request for that 3-way squash and is left alone.
+  if (!opts.skipPreSync) {
+    let missing: number
+    try {
+      missing = countCommitsMissingFromBranch(consumerRoot, branchName, landingRef)
+    } catch (e) {
+      throw new Error(
+        `merge-back blocked: cannot measure whether local main is ahead of '${branchName}' (${e?.message ?? e}); refusing to squash blind (TD-745)`,
+        { cause: e },
+      )
+    }
+    if (missing > 0) {
+      const sample = (() => {
+        try {
+          return git(['log', '--oneline', '-5', 'HEAD', `^${branchName}`, `^${landingRef}`], {
+            cwd: consumerRoot,
+          })
+        } catch {
+          return ''
+        }
+      })()
+      throw new Error(
+        `merge-back STOP: Branch behind local main: ${missing} commit(s) — local main has commits that\n` +
+          `'${branchName}' never saw, and pre-sync only brings in ${landingRef}.\n` +
+          (sample
+            ? sample
+                .split('\n')
+                .map((l) => `  ${l}`)
+                .join('\n') +
+              (missing > 5 ? `\n  … 另外 ${missing - 5} 個` : '') +
+              '\n'
+            : '') +
+          `\nSquashing now is a 3-way merge of a branch holding OLDER copies of files local main has since\n` +
+          `changed; every dry-run field (Blockers / WIP / Pre-sync behind) reads 0 on this shape (TD-745).\n` +
+          `main 沒有被動過。\n\n` +
+          `Resolution — pick one, then re-run: wt-helper merge-back ${cleanSlug}\n` +
+          `  1. land local main's commits on ${landingRef} first (clade home: node scripts/main-sync.ts --apply;\n` +
+          `     elsewhere: push them through the repo's normal landing path)\n` +
+          `  2. or bring local main into the branch inside the worktree, where conflicts stay isolated:\n` +
+          `       git -C ${target.path} merge --no-ff ${resolveLandingBase(consumerRoot)}\n` +
+          `Worktree '${target.path}' + branch '${branchName}' preserved。`,
+      )
+    }
+  }
+
+  let stashRef = null
+  if (blockers.length > 0) {
+    // Classify blockers — if any belong to ANOTHER active session's claim,
+    // stop with explicit ownership diagnosis rather than silently stashing
+    // their WIP. This is Phase 3 (Q5) audit: claim-aware pre-merge-back gate.
+    // LOCKED projection blockers fall through to existing auto-stash path
+    // (they are clade-managed, safe to stash). Everything else is left for
+    // user decision via the existing --auto-stash flow.
+    const myClaim = findClaimByWorktree(consumerRoot, target.path)
+    const cls = classifyDirtyPaths(
+      consumerRoot,
+      blockers.map((b) => b.path),
+      { excludeClaim: myClaim },
+    )
+    if (cls.otherSession.length > 0) {
+      const preview = cls.otherSession
+        .slice(0, 10)
+        .map(
+          (o) =>
+            `  ${o.path}  ← session ${o.session_id} / change ${o.change_id ?? '(none)'} / branch ${o.branch ?? '(none)'}`,
+        )
+        .join('\n')
+      const more =
+        cls.otherSession.length > 10 ? `\n  ... and ${cls.otherSession.length - 10} more` : ''
+      const claims = readActiveClaims(consumerRoot).filter(
+        (c) => !myClaim || c.session_id !== myClaim.session_id,
+      )
+      throw new Error(
+        `merge-back STOP: ${cls.otherSession.length} blocker(s) overlap with another active session's claim:\n` +
+          preview +
+          more +
+          `\n\n` +
+          `These paths belong to a DIFFERENT session's worktree. Stashing them ` +
+          `would silently swallow that session's WIP — wt-helper refuses.\n\n` +
+          `Active sessions on this consumer (excluding self):\n` +
+          formatActiveSessionsForError(claims) +
+          `\n\nResolution paths:\n` +
+          `  1. Let the other session finish (merge-back its own work) first, then re-run.\n` +
+          `  2. If the other claim is stale (session no longer running):\n` +
+          `       node scripts/claim-helper.ts drop <session-id>\n` +
+          `     then re-run merge-back.\n` +
+          `  3. If the path overlap is intentional cross-session collaboration:\n` +
+          `     coordinate manually (commit / stash by the other session) before re-running.`,
+      )
+    }
+
+    // claim guard scope MUST ⊇ bulk-stash scope. The bulk-stash below (line
+    // ~1903 `git stash push -u`, no pathspec) snapshots ALL of main's dirty
+    // state — not just `blockers` (= branch changeset ∩ main dirty). The above
+    // `cls` check only classifies blockers, so the difference set
+    // (allDirty \ blockers) — unrelated dirty that ISN'T part of this branch's
+    // changeset — was never checked against claims and got silently swept into
+    // the wt-merge-block stash. When that difference contains another active
+    // session's claimed WIP, the bulk-stash swallows it. Match the guard scope
+    // to the stash scope: classify the difference set and refuse if it overlaps
+    // another session. Only runs under --auto-stash (the only path that reaches
+    // bulk-stash; without it the blocker-only gate below already refuses).
+    // See pitfall-merge-back-autostash-bulk-captures-other-session-wip.
+    if (opts.autoStash) {
+      const blockerPathSet = new Set(blockers.map((b) => b.path))
+      const mainDirty = detectMainDirty(consumerRoot)
+      const allDirtyPaths = [
+        ...mainDirty.modified.map((m) => m.path),
+        ...mainDirty.untracked.map((u) => u.path),
+      ]
+      const nonBlockerDirty = allDirtyPaths.filter((p) => !blockerPathSet.has(p))
+      const diffCls = classifyDirtyPaths(consumerRoot, nonBlockerDirty, { excludeClaim: myClaim })
+      if (diffCls.otherSession.length > 0) {
+        const preview = diffCls.otherSession
+          .slice(0, 10)
+          .map(
+            (o) =>
+              `  ${o.path}  ← session ${o.session_id} / change ${o.change_id ?? '(none)'} / branch ${o.branch ?? '(none)'}`,
+          )
+          .join('\n')
+        const more =
+          diffCls.otherSession.length > 10
+            ? `\n  ... and ${diffCls.otherSession.length - 10} more`
+            : ''
+        const claims = readActiveClaims(consumerRoot).filter(
+          (c) => !myClaim || c.session_id !== myClaim.session_id,
+        )
+        throw new Error(
+          `merge-back STOP: --auto-stash would bulk-stash ${diffCls.otherSession.length} dirty path(s) belonging to another active session's claim:\n` +
+            preview +
+            more +
+            `\n\n` +
+            `These paths are NOT part of this branch's changeset (not blockers), but ` +
+            `--auto-stash bulk-stashes ALL of main's dirty state — including unrelated ` +
+            `WIP — so it would silently swallow that session's work into the ` +
+            `wt-merge-block stash. wt-helper refuses.\n\n` +
+            `Active sessions on this consumer (excluding self):\n` +
+            formatActiveSessionsForError(claims) +
+            `\n\nResolution paths:\n` +
+            `  1. Let the other session finish (merge-back / commit its own work) first, then re-run.\n` +
+            `  2. If the other claim is stale (session no longer running):\n` +
+            `       node scripts/claim-helper.ts drop <session-id>\n` +
+            `     then re-run merge-back --auto-stash.\n` +
+            `  3. Have the other session commit or stash its WIP so main is clean of it before re-running.`,
+        )
+      }
+    }
+
+    if (!opts.autoStash && blockers.length <= 3 && blockers.every((b) => b.type === 'modified')) {
+      const isoTs = new Date().toISOString().replace(/[:.]/g, '-')
+      const paths = blockers.map((b) => b.path)
+      const minStashMsg = `wt-merge-block/${cleanSlug}/protect/${isoTs}`
+      git(['stash', 'push', '-m', minStashMsg, '--', ...paths], { cwd: consumerRoot })
+      stashRef = minStashMsg
+      opts.minimalStashPaths = paths
+      console.log(`merge-back: minimal-stashed ${paths.length} blocker(s): ${paths.join(', ')}`)
+    } else if (!opts.autoStash) {
+      const preview = blockers
+        .slice(0, 10)
+        .map((b) => `  ${b.type.padEnd(10)} ${b.path}`)
+        .join('\n')
+      const more = blockers.length > 10 ? `\n  ... and ${blockers.length - 10} more` : ''
+      throw new Error(
+        `merge-back blocked: ${blockers.length} file(s) in main's working tree would be overwritten by squash:\n` +
+          preview +
+          more +
+          `\n\nRe-run with --auto-stash to bulk-stash main's dirty state as 'wt-merge-block/${cleanSlug}/<ISO>'\n` +
+          `(blockers + any unrelated dirty paths); reconcile later via \`${stashReconcileCmd(consumerRoot)}\`.`,
+      )
+    } else {
+      // --auto-stash path ONLY. This block MUST stay mutually exclusive with the
+      // minimal-stash branch above: it pushes a SECOND stash and reassigns
+      // `stashRef`, while the auto-restore below pops only `stash@{0}`. When both
+      // ran, the minimal `protect/*` stash was orphaned and its blockers silently
+      // vanished from the working tree — with the success log still claiming
+      // "auto-restored N minimal-stashed path(s)".
+      // See pitfall-wt-helper-merge-back-double-stash-orphans-minimal.
+      const isoTs = new Date().toISOString().replace(/[:.]/g, '-')
+      // Phase 7 (Q8): stash namespace carries the merge-back's session_id (from
+      // its worktree claim) so stash-reconcile can attribute a stash back to a
+      // specific session. Fallback to slug-only when no claim found (warn so
+      // path-detection-only attribution is visible).
+      let mergeBackClaim = null
+      try {
+        mergeBackClaim = findClaimByWorktree(consumerRoot, target.path)
+      } catch {}
+      const sessionPart = mergeBackClaim?.session_id ? `/${mergeBackClaim.session_id}` : ''
+      if (!mergeBackClaim) {
+        console.error(
+          `note: no .clade/claims/ entry for worktree ${target.path} — stash falls back to slug-only namespace`,
+        )
+      }
+      const stashMsg = `wt-merge-block/${cleanSlug}${sessionPart}/${isoTs}`
+      // Snapshot refs/stash before push so we can verify a new entry was actually created.
+      // See pitfall-wt-helper-merge-back-silent-stash-miss: `git stash push -u` on a
+      // clean working tree exits 0 with "No local changes to save" and creates no
+      // entry, which made the success log misleading when a concurrent session
+      // cleared main between blocker detection and stash push.
+      let stashHeadBefore = null
+      try {
+        stashHeadBefore = git(['rev-parse', '--verify', 'refs/stash'], { cwd: consumerRoot })
+      } catch {
+        stashHeadBefore = null
+      }
+      try {
+        // Bulk stash (no pathspec) — matches cmdAdd's baseline-stash strategy.
+        // Previously this used `git stash push -u -m <msg> -- <blocker-paths>`,
+        // but `git stash push -u` with pathspec hits a scope-leak bug on
+        // git 2.50.1 (TDMS 2026-05-18: 22 blockers requested → 74 files stashed
+        // including unrelated main tracked-tree mods). Bulk stash makes the
+        // semantics explicit: "snapshot main's dirty state so squash can land,
+        // user reconciles via stash-reconcile.ts". See pitfall-git-stash-
+        // pathspec-scope-leak (merge-back surface).
+        git(['stash', 'push', '-u', '-m', stashMsg], { cwd: consumerRoot })
+      } catch (e) {
+        throw new Error(`merge-back: failed to stash blockers: ${e.message ?? e}`, { cause: e })
+      }
+      let stashHeadAfter = null
+      try {
+        stashHeadAfter = git(['rev-parse', '--verify', 'refs/stash'], { cwd: consumerRoot })
+      } catch {
+        stashHeadAfter = null
+      }
+      if (stashHeadAfter && stashHeadAfter !== stashHeadBefore) {
+        stashRef = stashMsg
+        console.log(
+          `merge-back: bulk-stashed main's dirty state as '${stashMsg}' (covers ${blockers.length} blocker(s) + any unrelated dirty paths)`,
+        )
+      } else {
+        stashRef = null
+        console.warn(
+          `merge-back: warning — bulk stash command exited clean but no new stash entry created.`,
+        )
+        console.warn(
+          `             main working tree was already clean when stash ran (likely a concurrent`,
+        )
+        console.warn(
+          `             session cleared it between blocker detection and stash push). Skipping`,
+        )
+        console.warn(
+          `             stashRef assignment; squash will proceed against current main state.`,
+        )
+      }
+    }
+  }
+
+  // ── Local main MUST NOT be behind the landing ref before the squash ─────
+  // pre-sync aligned the wt branch to `landingRef`; the squash below lands into
+  // local main. When local main is behind, the squash diff is
+  //   (branch changeset) ∪ (commits local main is missing)
+  // and `git status` does not distinguish the two sources. Every surface signal
+  // stays green for the session running merge-back — the cost lands on the NEXT
+  // session sharing this tree (publish's clean-tree re-check refuses to run).
+  // Re-measured here (not reused from the pre-dry-run reading) because pre-sync
+  // ran a real `git fetch` in between. See
+  // pitfall-merge-back-presync-stages-origin-main-commits.
+  const behindAtSquash = commitsBehindRef(consumerRoot, landingRef)
+  if (behindAtSquash > 0) {
+    try {
+      git(['merge', '--ff-only', landingRef], { cwd: consumerRoot, stdio: 'inherit' })
+      console.log(
+        `merge-back: fast-forwarded local main to ${landingRef} (${behindAtSquash} commit(s)) before squash`,
+      )
+    } catch (e) {
+      throw new Error(
+        `merge-back STOP: local main is ${behindAtSquash} commit(s) behind ${landingRef} and could not be fast-forwarded:\n` +
+          `  ${e.message ?? e}\n\n` +
+          `Pre-sync already aligned '${branchName}' to ${landingRef}, so squashing into a stale main\n` +
+          `would stage those ${behindAtSquash} commit(s)' files alongside your changeset — indistinguishable\n` +
+          `by source, and enough to block the next session's publish on this shared tree.\n\n` +
+          `Resolution — bring local main current, then re-run:\n` +
+          `  cd ${consumerRoot}\n` +
+          `  git status                      # resolve whatever blocks the fast-forward\n` +
+          `  git merge --ff-only ${landingRef}\n` +
+          `  wt-helper merge-back ${cleanSlug}`,
+        { cause: e },
+      )
+    }
+  }
+
+  // squash 前的快照：失敗時分辨「squash 動過哪些路徑」與「本來就在 main 上的別人 WIP」。
+  const statusBefore = git(['status', '--porcelain'], { cwd: consumerRoot })
+  const stagedBefore = new Set(
+    git(['diff', '--cached', '--name-only'], { cwd: consumerRoot })
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean),
+  )
+  let squashError = null
+  try {
+    git(['merge', '--squash', branchName], { cwd: consumerRoot, stdio: 'inherit' })
+  } catch (e) {
+    squashError = e
+  }
+
+  // Check for conflict markers in working tree.
+  const statusAfter = git(['status', '--porcelain'], { cwd: consumerRoot })
+  const conflicted = statusAfter
+    .split('\n')
+    .filter((line) => /^(UU|AA|DD|AU|UA|UD|DU) /.test(line))
+    .map((line) => line.slice(3).trim())
+
+  // TD-619: 衝突不必然代表「還有東西要落地」—— branch 內容被別條路徑先帶進 main 時
+  // 也長這個樣子，而那種情況每次重跑都重現同一組衝突，沒有終止條件。判定放在 abort
+  // 之後、throw 之前；absorbed 為真時本函式後段照常走 cleanup（見 absorbedByOtherPath）。
+  let absorbedByOtherPath = false
+  if (conflicted.length > 0 || squashError) {
+    try {
+      git(['merge', '--abort'], { cwd: consumerRoot, stdio: 'ignore' })
+    } catch {}
+
+    // abort 對 squash merge 是 no-op（見 resetSquashResidue）—— 殘骸要自己收，
+    // 否則 UU 會留在共用的 main 上，重跑也只是在殘骸上再撞一次同一組衝突。
+    // 只收 squash **改變過**的 index 列。squash 之前就 staged 的路徑（別 session 的 WIP）
+    // porcelain 列前後一字不差，NEVER 收進來 —— resetSquashResidue 對 HEAD 沒有的檔是
+    // rmSync，2026-09-16 fixture 實測：別人 staged 的新檔在 squash 被拒後被直接刪掉。
+    const linesBefore = new Set(statusBefore.split('\n'))
+    const squashTouched = statusAfter
+      .split('\n')
+      .filter((line) => line.trim().length > 0)
+      .filter((line) => line[0] !== ' ' && line[0] !== '?')
+      .filter((line) => !linesBefore.has(line))
+      .map((line) => line.slice(3).trim())
+      .filter(Boolean)
+    resetSquashResidue(consumerRoot, squashTouched)
+
+    // TD-754: "main 已還原" used to be printed unconditionally. It is now a MEASUREMENT: the
+    // porcelain status after the residue reset must equal the pre-squash snapshot, read before the
+    // stash pop below (the pop legitimately changes it). Any difference is listed and the claim is
+    // withdrawn — a failure message that says "restored" while index content is gone is how the
+    // 2026-08-28 loss read as a clean failure.
+    let restoreDrift: string[]
+    try {
+      restoreDrift = porcelainDrift(
+        statusBefore,
+        git(['status', '--porcelain'], { cwd: consumerRoot }),
+      )
+    } catch (e) {
+      restoreDrift = [`(status unreadable after restore: ${e?.message ?? e})`]
+    }
+    // The snapshot is whole-tree, so a concurrent session editing an unrelated file in this window
+    // also shows up as drift. Only rows on paths this squash could have touched get restore advice.
+    const squashScope = new Set(squashTouched)
+    try {
+      const base = git(['merge-base', 'HEAD', branchName], { cwd: consumerRoot })
+      for (const p of git(['diff', '--name-only', '--no-renames', base, branchName], {
+        cwd: consumerRoot,
+      }).split('\n')) {
+        if (p.trim()) squashScope.add(p.trim())
+      }
+    } catch {}
+    const restoreNote = restoreDriftNote(restoreDrift, squashScope)
+
+    // git 在寫入任何東西之前就拒絕了（`Entry … not uptodate` / `would be overwritten` /
+    // `stash failed`）：沒有衝突、樹前後完全相同。成因是 main 當下的 index／working tree，
+    // 不是 branch 內容 —— absorbed 量測與 `--accept-landed` 在這裡都答錯問題，
+    // 後者還會誘導人丟掉真的未落地內容。
+    const squashRefused = conflicted.length === 0 && statusAfter === statusBefore
+
+    // Pop stash and re-check — git stash pop can leave UU in index when stash
+    // content conflicts with the post-abort working tree. Previously this was
+    // swallowed with only `console.error('warn:')`, letting half-resolved UU
+    // accumulate silently across sessions until later flows (archive, propagate)
+    // failed in puzzling ways. Now we surface pop conflicts as part of the throw.
+    let popUnmerged = []
+    let popExitError = null
+    if (stashRef) {
+      try {
+        git(['stash', 'pop'], { cwd: consumerRoot, stdio: 'inherit' })
+      } catch (e) {
+        popExitError = e
+      }
+      // Status re-check is authoritative — git stash pop with conflicts exits 1
+      // AND leaves UU entries, but exit code alone isn't reliable across git
+      // versions. The UU paths are the actual breakage signal.
+      const statusAfterPop = git(['status', '--porcelain'], { cwd: consumerRoot })
+      popUnmerged = statusAfterPop
+        .split('\n')
+        .filter((line) => /^(UU|AA|DD|AU|UA|UD|DU) /.test(line))
+        .map((line) => line.slice(3).trim())
+    }
+
+    const squashDetail =
+      conflicted.length > 0
+        ? `${conflicted.length} file(s) hit merge conflict during squash:\n` +
+          conflicted
+            .slice(0, 10)
+            .map((f) => `  ${f}`)
+            .join('\n')
+        : `squash failed: ${squashError?.message ?? squashError}`
+
+    const popDetail =
+      popUnmerged.length > 0
+        ? `\n\nstash pop also conflicted; ${popUnmerged.length} file(s) left UU in index:\n` +
+          popUnmerged
+            .slice(0, 10)
+            .map((f) => `  ${f}`)
+            .join('\n') +
+          `\nstash '${stashRef}' preserved — \`git stash list\` to inspect; ` +
+          `resolve UU (\`git checkout --ours/--theirs <path> && git add <path>\`) before re-running.`
+        : popExitError
+          ? `\n\nstash pop exited with error but no UU detected; stash '${stashRef}' preserved — inspect with \`git stash list\`.`
+          : ''
+
+    // 還原沒量到一致 → 不論後面判成 refused / absorbed / accept-landed 都停在這裡：那三條路徑
+    // 都建立在「main 已回到 squash 之前」之上，往下走等於在殘骸上宣告結果（TD-754）。
+    if (restoreDrift.length > 0) {
+      throw new Error(
+        `merge-back: ${squashDetail}${popDetail}\n\n${restoreNote}\n` +
+          `Worktree '${target.path}' + branch '${branchName}' preserved。先處理 squash 範圍內的列；範圍外的列屬於別的持有者（clade home 跑 flow who），NEVER 替它還原。之後再判要不要重跑。`,
+        { cause: squashError ?? undefined },
+      )
+    }
+
+    // 內容已被別條路徑吸收 → 沒有東西可 commit，重跑幾次都一樣。改走正常 cleanup，
+    // 使用者不必按 `cleanup --force --force-discard-unland`（那個旗標的語義是「丟棄
+    // 未落地工作」，與此處的事實相反）。
+    // stash pop 若自己也留下 UU，就算 absorbed 也不能往下走 —— 那是獨立的破壞訊號。
+    if (squashRefused) {
+      const preexisting = statusBefore
+        .split('\n')
+        .filter((line) => line.trim().length > 0 && !line.startsWith('??'))
+      throw new Error(
+        `merge-back: git 拒絕執行 squash，main 沒有被改動 —— 成因是 main 當下的 index／working tree，` +
+          `不是這條 branch 的內容（${squashError?.message ?? squashError}）。\n` +
+          `上方 git 的原始訊息指出是哪個路徑（常見：別 session staged 的檔 stat 過期 → ` +
+          `\`not uptodate\` / \`would be overwritten\` / \`stash failed\`）。\n` +
+          (preexisting.length > 0
+            ? `squash 前 main 上已有 ${preexisting.length} 個 tracked 變動（不屬於本 branch，未被動過）：\n` +
+              preexisting
+                .slice(0, 10)
+                .map((l) => `  ${l}`)
+                .join('\n') +
+              (preexisting.length > 10 ? `\n  … 另外 ${preexisting.length - 10} 個` : '') +
+              '\n'
+            : '') +
+          popDetail.replace(/^\n+/, '') +
+          `\n出路：讓那些路徑的擁有者 commit 或 unstage 後，原樣重跑 \`wt-helper merge-back ${cleanSlug}\`。\n` +
+          `NEVER 自己 unstage／reset 別人的 staged 檔；NEVER 用 --accept-landed —— branch 內容**沒有**落進 main。\n` +
+          `Worktree '${target.path}' + branch '${branchName}' preserved。`,
+        { cause: squashError },
+      )
+    }
+
+    const absorbCheck =
+      popUnmerged.length === 0 && !popExitError
+        ? detectAbsorbedByOtherPath(consumerRoot, branchName)
+        : { absorbed: false, reason: 'stash-pop-unresolved', changedPaths: [], differing: [] }
+
+    if (absorbCheck.absorbed) {
+      absorbedByOtherPath = true
+      // conflict 分支已經把 stash pop 回來了（若有），後段的 auto-restore 不該再跑一次。
+      stashRef = null
+      const tipShaForVerify = (() => {
+        try {
+          return git(['rev-parse', '--verify', `${branchName}^{commit}`], {
+            cwd: consumerRoot,
+          }).trim()
+        } catch {
+          return branchName
+        }
+      })()
+      console.log('')
+      console.log(
+        `merge-back: '${cleanSlug}' 的 changeset 已由別條路徑落進 main` +
+          `（absorbed-by-other-path / ${absorbCheck.reason}；${absorbCheck.changedPaths.length} 個路徑）。` +
+          `再 squash 一次不會多出任何東西，改走正常 cleanup —— 不需要 --force。`,
+      )
+      console.log(
+        `  逐檔驗證（branch 加的每一行都應已在 main；下列 patch 反套得掉正是本次的判定依據）：`,
+      )
+      for (const f of absorbCheck.changedPaths.slice(0, 10)) {
+        console.log(`    git diff ${tipShaForVerify.slice(0, 12)} HEAD -- '${f}'`)
+      }
+      if (absorbCheck.changedPaths.length > 10) {
+        console.log(`    … 另外 ${absorbCheck.changedPaths.length - 10} 個路徑`)
+      }
+      console.log('')
+    } else if (absorbCheck.reason === 'content-differs' && opts.acceptLanded) {
+      // 使用者明確斷言「main 的版本已取代這條 branch，剩下的 delta 作廢」。
+      // 這是一句斷言不是一個 force —— 但它丟掉的是**真的只存在此 branch**的內容，
+      // 所以在刪 branch 之前把 tip 釘成 rescue ref，並把丟掉的路徑逐條印出來留證。
+      absorbedByOtherPath = true
+      stashRef = null
+      let discardedTip = null
+      try {
+        discardedTip = git(['rev-parse', '--verify', `${branchName}^{commit}`], {
+          cwd: consumerRoot,
+        }).trim()
+        git(['update-ref', `refs/wt-accepted-landed/${cleanSlug}`, discardedTip], {
+          cwd: consumerRoot,
+        })
+      } catch (e) {
+        throw new Error(
+          `merge-back --accept-landed: 無法釘住 '${branchName}' 的 tip 供事後救回，拒絕往下走：` +
+            `${e?.message ?? e}`,
+          { cause: e },
+        )
+      }
+      console.log('')
+      console.warn(
+        `merge-back --accept-landed: 以 main 的版本為準收掉 '${cleanSlug}'。` +
+          `以下 ${absorbCheck.differing.length} 個路徑在此 branch 與 main **不同**，其差異將不會進 main：`,
+      )
+      for (const f of absorbCheck.differing.slice(0, 20)) console.warn(`    ${f}`)
+      if (absorbCheck.differing.length > 20) {
+        console.warn(`    … 另外 ${absorbCheck.differing.length - 20} 個路徑`)
+      }
+      console.warn(
+        `  branch tip 已釘為 'refs/wt-accepted-landed/${cleanSlug}' → ${discardedTip.slice(0, 12)}\n` +
+          `  事後要看被丟掉的內容：git diff HEAD refs/wt-accepted-landed/${cleanSlug}`,
+      )
+      console.log('')
+    } else {
+      let absorbNote = ''
+      if (absorbCheck.reason === 'content-differs') {
+        // 每個路徑報「branch 加了而 main 沒有的行數」。0 = main 已含 branch 加的每一行
+        // （上下文變了才反套不掉）；>0 = 那些行真的只在此 branch 上。這是**證據不是判定**，
+        // 所以呈現成數字讓人判，NEVER 拿它自動收尾。
+        const rows = summarizeAddedLinesPresence(
+          consumerRoot,
+          branchName,
+          absorbCheck.mergeBase,
+          absorbCheck.differing,
+        )
+        const onlyHere = rows.filter((r) => r.missing !== 0)
+        absorbNote =
+          `\n\n這條 branch 與 main 在 ${absorbCheck.differing.length} 個路徑上仍不同。` +
+          `每列的數字 = branch 加了而 main 沒有的行數（0 = main 已含 branch 加的每一行）：\n` +
+          rows
+            .slice(0, 10)
+            .map((r) => `   ${r.missing === null ? '?' : r.missing}  ${r.path}`)
+            .join('\n') +
+          (rows.length < absorbCheck.differing.length
+            ? `\n   … 另外 ${absorbCheck.differing.length - rows.length} 個路徑未量測`
+            : '') +
+          `\n\n逐條看差異：git diff HEAD ${branchName} -- '<path>'\n` +
+          (onlyHere.length === 0
+            ? `全部為 0：main 已含此 branch 加的每一行（自動判定沒過只因 patch 的上下文被鄰行改動）。\n`
+            : `其中 ${onlyHere.length} 個路徑有只存在此 branch 的行 —— 收掉前先確認那些行真的作廢。\n`) +
+          `確認 main 的版本已取代這條 branch 後：\n` +
+          `   wt-helper merge-back ${cleanSlug} --accept-landed\n` +
+          `（會先把 branch tip 釘成 refs/wt-accepted-landed/${cleanSlug} 供事後救回，不需要 --force）`
+      } else if (absorbCheck.reason !== 'stash-pop-unresolved') {
+        absorbNote = `\n\n(absorbed-by-other-path 判定：無法量測 —— ${absorbCheck.reason})`
+      }
+      throw new Error(
+        `merge-back: ${squashDetail}${popDetail}${absorbNote}\n\n` +
+          `Worktree '${target.path}' + branch '${branchName}' preserved; ` +
+          `${restoreNote}\n` +
+          `原樣重跑會撞到同一組衝突 —— 上面兩條出路擇一。`,
+      )
+    }
+  }
+
+  // Squash 已無衝突落進 index —— 這是「wt-helper 把這個 branch tip 併進 main」唯一一次
+  // 能被直接觀察到的時刻，記下來供之後的 cleanup 採信（見 landedMarkerRef 上方）。
+  // 寫失敗只降級成原本的 ancestry gate 行為，不影響本次收尾。
+  // absorbed-by-other-path 走不到這裡的前提：本次執行**沒有**把 branch tip squash 進
+  // main（內容是別條路徑帶進去的），寫 marker 等於記一筆沒發生過的事。
+  if (!absorbedByOtherPath) {
+    let tipSha = null
+    try {
+      tipSha = git(['rev-parse', '--verify', `${branchName}^{commit}`], {
+        cwd: consumerRoot,
+      }).trim()
+    } catch {
+      tipSha = null
+    }
+    if (writeLandedMarker(consumerRoot, cleanSlug, tipSha)) {
+      console.log(
+        `merge-back: 記下 squash-landing marker '${landedMarkerRef(cleanSlug)}' → ${tipSha.slice(0, 8)}`,
+      )
+    }
+  }
+
+  // Auto-restore covers BOTH stash paths (minimal-scope and --auto-stash bulk).
+  // Leaving the bulk stash parked for a later stash-reconcile.ts run means the
+  // squash lands on a main that is missing the user's other in-flight work, and
+  // every downstream step (archive gate, /commit grouping) sees a main that does
+  // not reflect reality. Restoring here puts squash result + prior dirty back in
+  // one working tree, which is what "commit everything together" needs.
+  // The bulk stash itself stays bulk on purpose — pathspec stash hits a
+  // scope-leak bug on git 2.50.1 (see the comment above the stash push).
+  if (stashRef) {
+    let stashedFileCount = null
+    try {
+      stashedFileCount = git(['stash', 'show', '--name-only', 'stash@{0}'], { cwd: consumerRoot })
+        .split('\n')
+        .filter(Boolean).length
+    } catch {
+      stashedFileCount = null
+    }
+    const scopeLabel = opts.minimalStashPaths ? 'minimal-stashed' : 'stashed'
+    const countLabel = opts.minimalStashPaths
+      ? `${opts.minimalStashPaths.length}`
+      : (stashedFileCount ?? '?')
+    try {
+      git(['stash', 'pop'], { cwd: consumerRoot })
+      console.log(`merge-back: auto-restored ${countLabel} ${scopeLabel} path(s) onto main`)
+      stashRef = null
+    } catch {
+      console.warn(
+        `merge-back: stash pop conflicted — stash '${stashRef}' preserved.\n` +
+          `             Squash HAS landed on main; the stashed changes have NOT been\n` +
+          `             merged back. Resolve with \`git checkout --ours/--theirs <path>\`\n` +
+          `             then \`git stash drop\`, or inspect via \`node scripts/stash-reconcile.ts\`.`,
+      )
+    }
+  }
+
+  // Preserve gitignored review artifacts (screenshots) before cleanup destroys
+  // the worktree dir. `git merge --squash` carries nothing under `screenshots/`
+  // because it's gitignored; without this sync downstream post-merge sweep
+  // finds no files in main. See TD-160.
+  let screenshotSync = { files: [], ok: true }
+  if (opts.cleanup !== false) {
+    try {
+      screenshotSync = preserveWorktreeScreenshots(target.path, consumerRoot, cleanSlug)
+    } catch (e) {
+      screenshotSync = {
+        files: [{ env: '.', topic: '.', rel: '.', failed: true, error: e.message ?? String(e) }],
+        ok: false,
+      }
+    }
+    const copied = screenshotSync.files.filter((f) => f.copied)
+    const identical = screenshotSync.files.filter((f) => f.identical)
+    const renamed = screenshotSync.files.filter((f) => f.renamed)
+    const failed = screenshotSync.files.filter((f) => f.failed)
+    const scanFailed = failed.filter((f) => f.scanFailure)
+    if (copied.length + identical.length + renamed.length + failed.length > 0) {
+      console.log(
+        `merge-back: screenshot preserve — copied ${copied.length}, skipped-identical ${identical.length}, renamed-conflict ${renamed.length}, failed ${failed.length}` +
+          (scanFailed.length > 0
+            ? ` (incl. ${scanFailed.length} directory scan failure(s) — unknown number of files left unexamined)`
+            : ''),
+      )
+    }
+    if (copied.length > 0) {
+      const list = copied.map((f) => f.rel).join(', ')
+      console.log(`merge-back: screenshot copied: ${list}`)
+    }
+    if (renamed.length > 0) {
+      const list = renamed.map((f) => `${f.rel} → ${f.as}`).join('; ')
+      console.warn(
+        `merge-back: ${renamed.length} screenshot file(s) differed from main and were kept side-by-side (review and delete the redundant copy): ${list}`,
+      )
+    }
+    if (failed.length > 0) {
+      const list = failed.map((f) => `${f.rel} (${f.error})`).join('; ')
+      console.error(
+        `merge-back: ${failed.length} screenshot artifact(s) could not be preserved: ${list}`,
+      )
+    }
+  }
+
+  // Belt-and-braces for verify receipts that never made it into a phase-tick commit
+  // (manual merge, bypassed discipline, pre-TD-394 worktree). See TD-394.
+  let evidenceSync = { files: [], ok: true }
+  if (opts.cleanup !== false) {
+    try {
+      evidenceSync = preserveWorktreeEvidence(target.path, consumerRoot, cleanSlug)
+    } catch (e) {
+      evidenceSync = {
+        files: [{ rel: 'docs/evidence', failed: true, error: e.message ?? String(e) }],
+        ok: false,
+      }
+    }
+    const carried = evidenceSync.files.filter((f) => f.copied)
+    const evFailed = evidenceSync.files.filter((f) => f.failed)
+    if (carried.length > 0) {
+      const list = carried.map((f) => `${f.rel} (+${f.count})`).join(', ')
+      console.warn(
+        `merge-back: ${carried.length} evidence sidecar(s) had worktree-only receipts and were carried to main: ${list}\n` +
+          `             These should have landed via the phase-tick commit (see rules/core/commit.detail.md\n` +
+          `             § Artifact-tick（hard rule）). Review and commit them on main.`,
+      )
+    }
+    if (evFailed.length > 0) {
+      const list = evFailed.map((f) => `${f.rel} (${f.error})`).join('; ')
+      console.error(
+        `merge-back: ${evFailed.length} evidence sidecar(s) could not be preserved: ${list}`,
+      )
+    }
+  }
+
+  // Fail-closed: gitignored artifacts have no git object to recover from, so a
+  // worktree may only be destroyed once every one of them is accounted for.
+  if (!screenshotSync.ok || !evidenceSync.ok) {
+    console.error(
+      `merge-back: unpreserved artifacts at ${target.path}; source retained\n` +
+        `  Reason: ${screenshotSync.ok ? 'evidence sidecar preserve' : 'screenshot preserve'} did not account for every artifact (see errors above).\n` +
+        `  Copy the listed paths out before this source is cleaned up. Removal is owned by\n` +
+        `  \`wt-helper batch cleanup\`, which also retains a source that still holds ignored files.`,
+    )
+  }
+
+  // A squash only stages content. Its sources remain recoverable until /commit
+  // verifies a durable main landing; batch cleanup owns automatic deletion.
+  const cleanupDone = false
+
+  const summary =
+    `merge-back: ${cleanSlug} ` +
+    (absorbedByOtherPath
+      ? 'already in main via another path (nothing squashed)'
+      : 'absorbed into main') +
+    (stashRef ? ` (blockers stashed as ${stashRef})` : '') +
+    ' (source retained; formal /commit and verified cleanup required)'
+  console.log(summary)
+
+  // `git merge --squash` stages the changeset but deliberately does NOT commit:
+  // landing is finished by the caller in main with /commit
+  // ([[wt]] `rules/worktree保留與回收判準.md` Rule 3 legacy merge-back). That contract is correct, but the
+  // summary above reads as "done" while the worktree and branch are already
+  // gone, so the staged index is the only remaining copy. Say the remaining
+  // step out loud. (2026-08-04: two clade-home sessions in one afternoon each
+  // read "absorbed into main + worktree cleaned" as committed; the second only
+  // caught it because a rule told it to grep HEAD for its own content.)
+  //
+  // 只列**這次 merge-back 放進 index 的**路徑。squash 前就 staged 的別 session 檔 NEVER 列進
+  // 「/commit 這些檔」的指示 —— 照做會用你的名義把別人寫到一半的東西提交（2026-09-16 fixture
+  // 實測：成功訊息把 main 上他人 staged 的 tasks 檔列在 `Run the full /commit workflow for` 裡）。
+  // 仍屬本 branch changeset 的路徑例外保留：它是你的內容，只是剛好先前也被 stage 過。
+  let stagedPaths = []
+  let othersStaged = []
+  try {
+    const changeset = new Set(
+      git(['diff', '--name-only', 'HEAD', branchName], { cwd: consumerRoot })
+        .split('\n')
+        .map((line) => line.trim())
+        .filter(Boolean),
+    )
+    const allStaged = git(['diff', '--cached', '--name-only'], { cwd: consumerRoot })
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean)
+    for (const p of allStaged) {
+      if (stagedBefore.has(p) && !changeset.has(p)) othersStaged.push(p)
+      else stagedPaths.push(p)
+    }
+  } catch {}
+  if (othersStaged.length > 0) {
+    console.log('')
+    console.log(
+      `note: main 上另有 ${othersStaged.length} 個 merge-back 之前就 staged 的路徑，不屬於本 branch —— ` +
+        `NEVER 一起 commit（/commit 只帶下方 Staged 清單的路徑，\`git commit --only -- <paths>\`）：\n` +
+        othersStaged
+          .slice(0, 5)
+          .map((p) => `    ${p}`)
+          .join('\n') +
+        (othersStaged.length > 5 ? `\n    … 另外 ${othersStaged.length - 5} 個` : ''),
+    )
+  }
+  if (stagedPaths.length > 0) {
+    const shown = stagedPaths
+      .slice(0, 4)
+      .map((p) => `'${p}'`)
+      .join(' ')
+    console.log('')
+    console.log(
+      `⚠ Staged into main, NOT committed (${stagedPaths.length} file(s)) — source worktree and branch retained.`,
+    )
+    console.log(`  Finish landing now:`)
+    console.log(
+      `  Run the full /commit workflow for ${shown}${stagedPaths.length > 4 ? ' ...' : ''}`,
+    )
+    console.log(
+      `  Then verify: git show HEAD:<file> | grep -c '<a plain-text string you just wrote>'`,
+    )
+  }
+
+  // TD-684 Phase 0 — merge-back is one of the three closing rituals where an agent is already
+  // declaring a piece of work finished while holding the R1 evidence for it, so this is where
+  // `work.done` costs nothing extra to file. Without it the funnel starves upstream: every
+  // acceptance UI improvement downstream has nothing to show, because the terminal state was
+  // never pressed (2026-08-28 measured: 「已收 0」 on a 112-work-item spine).
+  //
+  // Opt-in, copying `herdr-session-handoff.ts --work-done` rather than inventing a second shape.
+  // The reason is the same one that flag documents: landing one worktree branch is a strictly
+  // smaller claim than "the work this branch belonged to is done" — a work item legitimately
+  // spans several worktrees, and making it automatic would upgrade every merge-back into a
+  // completion claim nobody made.
+  //
+  // The verification the caller typed is kept verbatim and the observed landing facts are
+  // APPENDED, never substituted: the tool knows things the caller cannot restate honestly
+  // (whether the squash actually landed, whether the index is still uncommitted), and a reader
+  // deciding whether to accept needs both halves. The staged-pending count in particular is the
+  // one fact that would otherwise make this a premature done — merge-back stages but does not
+  // commit, so `absorbed into main` is not yet `committed on main`.
+  //
+  // Fail-open by construction, for the same reason as `cmdAdd`'s openWork: `vendor/scripts/flow/`
+  // is clade-home-only while wt-helper itself is projected into every consumer, so the import is
+  // dynamic and every failure path is a warn. NEVER let this gate the landing — main's index is
+  // already written by the time we get here.
+  // `doneWorkId` was resolved before anything moved (TD-915); reaching here with --work-done means
+  // it is set. The claim binding wins over ambient CLADE_WORK_ID — see resolveMergeBackWorkId.
+  if (opts.workDone && doneWorkId) {
+    const observed = [
+      absorbedByOtherPath
+        ? `already in main via another path (nothing squashed)`
+        : `squash landed on main`,
+      'source retained; removal owned by batch cleanup',
+      stagedPaths.length > 0
+        ? `${stagedPaths.length} path(s) STAGED, not yet committed`
+        : 'nothing left staged',
+      stashRef ? `blockers stashed as ${stashRef}` : null,
+    ].filter(Boolean)
+    try {
+      const { markWorkDone } = await import(new URL('./flow/emit.ts', import.meta.url).href)
+      // `substrate` is a closed enum in vendor/signals/schema.json and `git` is the honest
+      // member: the observable act this claim is about is the squash. NEVER invent a
+      // `wt-helper` value here — the validator rejects unknown members, and a rejected write
+      // is silent apart from one stderr line (2026-08-28: the first cut of this code did
+      // exactly that and still printed "filed"). `actor` is the free-form field; the tool name
+      // belongs there.
+      const res = markWorkDone({
+        work_id: doneWorkId,
+        verification: `${opts.verification.trim()} — merge-back ${cleanSlug}: ${observed.join('; ')}`,
+        verifiedBy: 'wt-helper',
+        actor: opts.agent ?? 'wt-helper',
+        substrate: 'git',
+        payload: {
+          slug: cleanSlug,
+          absorbed_by_other_path: absorbedByOtherPath,
+          cleanup_done: cleanupDone,
+          staged_pending: stagedPaths.length,
+          stash_ref: stashRef ?? null,
+        },
+        cwd: consumerRoot,
+      })
+      // MUST branch on `written`. `markWorkDone` returns `{written:false, errors}` on a
+      // validator refusal instead of throwing, so a bare call followed by a success line
+      // reports a claim that was never filed — indistinguishable, in the terminal, from one
+      // that was.
+      console.log('')
+      if (res?.written) {
+        console.log(`merge-back: flow work.done filed for ${doneWorkId}`)
+        console.log(
+          `  Acceptance is a human's: node vendor/scripts/flow/flow.ts accept ${doneWorkId} --reason '<why>'`,
+        )
+      } else {
+        console.error(
+          `merge-back: flow work.done REFUSED for ${doneWorkId} — ` +
+            `${(res?.errors ?? []).map((e) => e.code ?? String(e)).join(',') || 'unknown'}.\n` +
+            `             The landing itself is unaffected; the claim was not filed. File it by hand:\n` +
+            `             node vendor/scripts/flow/flow.ts done ${doneWorkId} --verification '<...>'`,
+        )
+      }
+    } catch (e) {
+      console.error(`note: flow work.done skipped (fail-open): ${e?.message ?? e}`)
+    }
+  }
+
+  if (stashRef) {
+    console.log('')
+    console.log(`Reconcile blocker stash for '${cleanSlug}':`)
+    console.log(`  ${stashReconcileCmd(consumerRoot)} --slug ${cleanSlug} --interactive`)
+    console.log(`(Stash preserved in 'git stash list' — apply/drop is user's call.)`)
+  }
+  return {
+    absorbed: true,
+    absorbedByOtherPath,
+    slug: cleanSlug,
+    stashRef,
+    cleanupDone,
+    blockers,
+    baselineRefs,
+  }
+}
+
+// Semantic alias for migrating grandfathered worktrees from the pre-atomic
+// flow. Mechanically identical to merge-back —
+// the distinction is documentation-level so migration commands stay clear.
+const cmdLandPending = cmdMergeBack
+
+// List pre-fork baseline rescue candidates: `refs/wt-baseline/*` (pinned by
+// cmdAdd stash strategy) plus dangling stash commits found via `git fsck
+// --unreachable` whose subject identifies them as wt-baseline stashes
+// (fallback for incidents pre-dating the pin mechanism). Optional --show
+// <ref-or-sha> prints the full patch via `git stash show -p`.
+async function cmdRescue(opts) {
+  const consumerRoot = findConsumerRoot()
+
+  if (opts.show) {
+    try {
+      execFileSync('git', ['stash', 'show', '-p', opts.show], {
+        cwd: consumerRoot,
+        stdio: 'inherit',
+      })
+    } catch (e) {
+      throw new Error(`rescue --show ${opts.show}: ${e?.message ?? e}`, { cause: e })
+    }
+    return
+  }
+
+  const pinned = []
+  try {
+    const raw = git(
+      ['for-each-ref', '--format=%(refname) %(objectname) %(subject)', 'refs/wt-baseline/'],
+      { cwd: consumerRoot },
+    )
+    for (const line of raw.split('\n').filter(Boolean)) {
+      const m = line.match(/^(\S+) (\S+) (.*)$/)
+      if (m) pinned.push({ ref: m[1], sha: m[2], subject: m[3] })
+    }
+  } catch {}
+
+  const dangling = []
+  try {
+    const raw = execFileSync('git', ['fsck', '--no-reflogs', '--unreachable'], {
+      cwd: consumerRoot,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    for (const line of raw.split('\n')) {
+      const m = line.match(/^unreachable commit ([0-9a-f]+)$/)
+      if (!m) continue
+      const sha = m[1]
+      let subject = ''
+      try {
+        subject = git(['log', '-1', '--format=%s', sha], { cwd: consumerRoot })
+      } catch {
+        continue
+      }
+      if (/^On [^:]+: wt-baseline\//.test(subject)) {
+        dangling.push({ sha, subject })
+      }
+    }
+  } catch {}
+
+  // Deduplicate dangling by pinned sha — a pinned ref already covers its sha.
+  const pinnedShas = new Set(pinned.map((p) => p.sha))
+  const danglingFiltered = dangling.filter((d) => !pinnedShas.has(d.sha))
+
+  if (opts.json) {
+    console.log(JSON.stringify({ pinned, dangling: danglingFiltered }, null, 2))
+    return
+  }
+
+  if (pinned.length === 0 && danglingFiltered.length === 0) {
+    console.log('No wt-baseline rescue candidates found.')
+    return
+  }
+
+  if (pinned.length > 0) {
+    console.log(`Pinned pre-fork baselines (refs/wt-baseline/*) — ${pinned.length}:`)
+    for (const p of pinned) {
+      console.log(`  ${p.ref}`)
+      console.log(`    sha:     ${p.sha}`)
+      console.log(`    subject: ${p.subject}`)
+    }
+    console.log('')
+  }
+  if (danglingFiltered.length > 0) {
+    console.log(
+      `Dangling unreachable wt-baseline stashes (gc candidate within ~30 days) — ${danglingFiltered.length}:`,
+    )
+    for (const d of danglingFiltered) {
+      console.log(`  sha:     ${d.sha}`)
+      console.log(`  subject: ${d.subject}`)
+    }
+    console.log('')
+  }
+  console.log('To inspect a candidate (read-only patch view):')
+  console.log('  node scripts/wt-helper.ts rescue --show <ref-or-sha>')
+  console.log('To restore to current branch:')
+  console.log('  git stash apply <ref-or-sha>          # may conflict; resolve before committing')
+  console.log('  git checkout <ref-or-sha> -- <paths>  # selective restore by path')
+}
+
+// Scan <consumer>-wt/ for directories that are not registered git worktrees
+// (no .git file). These are leftovers from incomplete cleanup — typically
+// gitignored content (screenshots) that survived `git worktree remove`.
+async function cmdOrphanPrune(opts) {
+  const consumerRoot = findConsumerRoot()
+  const consumerName = basename(consumerRoot)
+  const wtParent = join(dirname(consumerRoot), `${consumerName}-wt`)
+  if (!existsSync(wtParent)) {
+    console.log(`No worktree parent dir: ${wtParent}`)
+    return
+  }
+  const entries = readdirSync(wtParent, { withFileTypes: true })
+  const orphans = []
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue
+    const dirPath = join(wtParent, entry.name)
+    if (!existsSync(join(dirPath, '.git'))) {
+      orphans.push({ slug: entry.name, path: dirPath })
+    }
+  }
+  if (orphans.length === 0) {
+    console.log(`No orphaned directories in ${wtParent}`)
+    return
+  }
+  console.log(`Found ${orphans.length} orphaned director${orphans.length === 1 ? 'y' : 'ies'}:\n`)
+  for (const o of orphans) {
+    const files = []
+    const walk = (p) => {
+      for (const e of readdirSync(p, { withFileTypes: true })) {
+        if (e.isDirectory()) walk(join(p, e.name))
+        else files.push(join(p, e.name).replace(o.path + '/', ''))
+      }
+    }
+    try {
+      walk(o.path)
+    } catch {
+      /* best-effort */
+    }
+    console.log(`  ${o.slug}/  (${files.length} file${files.length === 1 ? '' : 's'})`)
+    for (const f of files.slice(0, 5)) console.log(`    ${f}`)
+    if (files.length > 5) console.log(`    ... and ${files.length - 5} more`)
+  }
+  if (opts.force) {
+    for (const o of orphans) {
+      rmSync(o.path, { recursive: true, force: true })
+      console.log(`Removed orphan: ${o.path}`)
+    }
+  } else {
+    console.log(`\nRe-run with --force to remove all orphaned directories:`)
+    console.log(`  node scripts/wt-helper.ts orphan-prune --force`)
+  }
+}
+
+/**
+ * `--machine <peer>`: run this very subcommand on the peer's own clade checkout, in the same repo
+ * path there (fleet convention: both machines keep `~/offline/<repo>` at the same path). GitHub is
+ * the only sync layer — the peer's `add` fetches origin itself; NEVER rsync or scp a worktree.
+ * Returns the peer's exit code, or null when no `--machine` (or this machine's own label) was given.
+ */
+const PEER_SUBCOMMANDS = new Set(['add', 'cleanup', 'list', 'resolve'])
+
+function forwardToPeer(sub: string | undefined, rest: string[]): number | null {
+  const at = rest.findIndex((arg) => arg === '--machine' || arg.startsWith('--machine='))
+  if (at < 0) return null
+  const equals = rest[at].startsWith('--machine=')
+  const machine = equals ? rest[at].slice('--machine='.length) : (rest[at + 1] ?? '')
+  const args = [...rest.slice(0, at), ...rest.slice(at + (equals ? 1 : 2))]
+  if (!MACHINE_LABEL_PATTERN.test(machine)) {
+    console.error(
+      `error: --machine needs a saved Herdr machine label (got ${JSON.stringify(machine)})`,
+    )
+    return 2
+  }
+  if (machine === localMachineLabel()) {
+    process.argv.splice(2, process.argv.length - 2, sub ?? '', ...args)
+    return null
+  }
+  if (!sub || !PEER_SUBCOMMANDS.has(sub)) {
+    console.error(
+      `error: --machine supports ${[...PEER_SUBCOMMANDS].join(' / ')}; got ${sub ?? '<none>'}`,
+    )
+    return 2
+  }
+  const common = spawnSync('git', ['rev-parse', '--path-format=absolute', '--git-common-dir'], {
+    encoding: 'utf8',
+  })
+  const gitDir = (common.stdout ?? '').trim()
+  if (common.status !== 0 || !gitDir.endsWith('/.git')) {
+    console.error('error: --machine must run inside a repository whose main checkout ends in .git')
+    return 2
+  }
+  const repoRoot = gitDir.slice(0, -'/.git'.length)
+  const peerClade = process.env.CLADE_PEER_CLADE_ROOT?.trim() || join(homedir(), 'offline', 'clade')
+  const remote = [
+    REMOTE_PATH_PREFIX,
+    `cd ${shellQuote(repoRoot)}`,
+    ['exec', 'node', join(peerClade, 'vendor', 'scripts', 'wt-helper.ts'), sub, ...args]
+      .map(shellQuote)
+      .join(' '),
+  ].join(' && ')
+  const forwarded = spawnSync(sshBin(), [...SSH_OPTIONS, machine, remote], { stdio: 'inherit' })
+  if (forwarded.error) {
+    console.error(`error: ssh ${machine} failed: ${forwarded.error.message}`)
+    return 1
+  }
+  return forwarded.status ?? 1
+}
+
+/**
+ * 主持者 pane（掛著 `coordinator-snapshot.ts watch`、登記在 `<state>/holders/`）直接跑 `add` 時拒絕：
+ * 為派工開的樹，機器由 coordinator skill 的 `scripts/open-tree.ts` 依容量分數決定（它帶
+ * `CLADE_TREE_PLACEMENT` 進來），不是預設開在本機；要指名機器（含本機）走同一支並附理由。
+ * 只在讀得到活的主持者登記時才擋——沒有登記、沒有 `lib/coordinator-holder.ts`（consumer 沒有投影它）、
+ * 驗不了存活、或任何讀取失敗都放行，一般 session 的 `add` 行為不變。測試行程（`NODE_TEST_CONTEXT`）不擋。
+ */
+async function dispatchTreePlacementRefusal(
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<string | null> {
+  if (env.CLADE_TREE_PLACEMENT?.trim() || env.NODE_TEST_CONTEXT) return null
+  const pane = env.HERDR_PANE_ID?.trim()
+  if (!pane) return null
+  try {
+    // propagate-completeness: optional-in-consumer -- 主持者守門只在 clade home 生效；consumer 沒投影 holder lib，缺檔即放行
+    const { readHolders } = await import('./lib/coordinator-holder.ts')
+    const stateDir =
+      env.COORDINATOR_STATE_DIR ||
+      join(env.XDG_CACHE_HOME?.trim() || join(homedir(), '.cache'), 'clade', 'coordinator')
+    const read = readHolders(stateDir)
+    if (read.unverified || !read.live.some((h) => h.pane_id === pane)) return null
+  } catch {
+    return null
+  }
+  return [
+    'error: 這個 pane 是主持者（掛著 coordinator watch）：為派工開樹的機器由容量分數決定，不是預設本機。',
+    '  改跑：node .claude/skills/coordinator/scripts/open-tree.ts <slug> --task-summary <text> [--origin …] [--checkout <branch>]',
+    "  確要指名機器（含本機，例如主線自己寫的小改動）：同一支加 --machine <label> --machine-reason '<理由>'",
+    '  判準：.claude/skills/coordinator/rules/派工判準.md Rule 2',
+  ].join('\n')
+}
+
+function printUsage(log = console.error) {
+  log(
+    'Usage: wt-helper <add|detect-main-dirty|list|backlog|prune|reclaim-stale|reconcile|cleanup|merge-back|resolve|land-pending|rescue|orphan-prune|dev|refresh-substrate|batch> [args]',
+  )
+  log('')
+  log("  dev [<alias>]             Start dev server on this worktree's allocated port")
+  log('')
+  log('  refresh-substrate [<slug>] Re-seed gitignored projection state from main after a rebase')
+  log('    [--dry-run] [--json]    (default: the worktree containing cwd)')
+  log('')
+  log('  add <slug>                Create worktree at ~/offline/<consumer>-wt/<slug>/')
+  log('    --base <ref>            Fork from integration/… (local or origin/integration/…)')
+  log('    --checkout <branch>     Fetch, then open a tree on origin/<branch> as that same branch')
+  log('                            (advance an existing PR). Refused if a local branch of the same')
+  log(
+    '                            name has HEAD ≠ origin/<branch>. Not with --base/--precheck-baseline.',
+  )
+  log('    --precheck-baseline [<change>]')
+  log('                            Pre-fork dirty check on main; pairs with')
+  log('                            --baseline-strategy. Bare form = no change context.')
+  log('    --baseline-strategy commit|stash|warn')
+  log('                            commit: selective stage + commit baseline on main;')
+  log('                            stash: leave main dirty + fork clean (default); carry')
+  log(
+    '                            ALL main dirty into worktree only with --include-unrelated-dirty;',
+  )
+  log('                            warn: stop with report (default).')
+  log('    --baseline-scope-paths <comma>   Required for commit strategy; selective stage scope.')
+  log('                            (Not supported by stash — use commit for scoped capture.)')
+  log('    --include-unrelated-dirty        stash strategy only: bulk-capture ALL main dirty')
+  log('                            into the worktree (off by default — fork forks clean).')
+  log(
+    '    --baseline-stash-name <name>     Override default `wt-baseline/<slug>/<ISO>` stash name.',
+  )
+  log('    --skip-prefork-audit             Silence the in-flight feature audit warning')
+  log('                            (default threshold: 50 tracked changes;')
+  log('                            override via WT_PREFORK_AUDIT_THRESHOLD env var).')
+  log("  detect-main-dirty         Report main's dirty paths; pairs with --json.")
+  log(
+    '  list [--json] [--no-landed-state]  Enumerate session worktrees with staleness + landedState',
+  )
+  log('  prune                     Interactively remove merged session worktrees')
+  log(
+    '  backlog [--json] [--no-landed-state]  Read-only worktree accumulation report (>3, no active claims)',
+  )
+  log('  reclaim-stale [--dry-run] Free dev-port slots held by stale worktrees (trees untouched)')
+  log(
+    '    --remove-landed         also remove in-history clean unclaimed sources via cleanup (TD-863)',
+  )
+  log('  reconcile <slug> [--json] Reconcile projection receipts after rebase from main')
+  log('  cleanup <slug>            Remove worktree (gated by --force +')
+  log('                            --force-discard-unland; pre-checks both)')
+  log('    --superseded-by <commit|file=commit|file=path>[,…] --reason <text>')
+  log('                            main later rewrote the hunks: per-file evidence,')
+  log('                            tip pinned in refs/wt-superseded/ + event, then removed')
+  log('    --discard-pathspec <path>[,…]  dirty files under these literal paths do not block;')
+  log(
+    '                            saved to refs/clade-residue/<slug> first, other dirt still blocks',
+  )
+  log(
+    '                            (build artifacts like .nuxt/.output and files over the size cap are',
+  )
+  log('                            dropped, not saved)')
+  log('  residue-prune             Delete refs/clade-residue/* older than the retention window')
+  log(
+    '                            (CLADE_WT_RESIDUE_RETENTION_DAYS, default 30; cleanup also runs it)',
+  )
+  log('  resolve <slug>            Print the session worktree path owning <slug> (exit 3 = none,')
+  log('                            meaning main is authoritative). Same matcher merge-back uses,')
+  log('                            so gates scan exactly the tree Step 0 will land.')
+  log('    --json                  emit {slug,found,path,branch,consumerRoot}')
+  log('  merge-back <slug>         Legacy squash into main; retain sources; flags:')
+  log('    --dry-run               preview blockers + worktree WIP without acting')
+  log(
+    '    --patch                 Apply committed branch patch without touching main index; retain source',
+  )
+  log('    --auto-stash            stash main blockers as wt-merge-block/<slug>/<ISO>')
+  log(
+    '    --origin <scheme>:<id>  name the WORK this tree serves (td:TD-787, notion:<uuid>).',
+    '                            Without it — and without an ambient $CLADE_WORK_ID — the card',
+    '                            is minted but marked 未歸屬 (TD-787).',
+    "    --work-done             file a flow `work.done` claim for the worktree claim's work id",
+  )
+  log(
+    '                            (ambient $CLADE_WORK_ID only as fallback; mismatch refuses, TD-915)',
+  )
+  log('    --verification <line>   required with --work-done: how it was verified. The observed')
+  log('                            landing facts (squashed / cleaned / staged-pending) are')
+  log('                            appended to it, never substituted. Refused with --dry-run.')
+  log('    --include-worktree-wip  auto-amend uncommitted worktree edits into branch HEAD')
+  log('                            (default: refuse with remediation; explicit commit safer)')
+  log('                            NB: dirty files matching OXFMT_AUTO_PATHS whose drift')
+  log('                            reproduces from oxfmt(HEAD) are auto-committed as a')
+  log('                            separate "🧹 chore: wt <slug> 自動落地 N 個純格式漂移檔" commit')
+  log('                            with no prompt (no flag needed; semantic drift still STOPs).')
+  log('    --no-cleanup            skip worktree cleanup after squash')
+  log('    --noop-if-missing       silently no-op if no matching worktree (for hooks)')
+  log('    --skip-pre-sync         skip wt-side merge of landing base before squash')
+  log('                            (default: pre-sync isolates conflicts in wt, not main)')
+  log('  land-pending <slug>       Alias of merge-back for grandfathered worktrees')
+  log('  rescue [--show <ref|sha>] [--json]')
+  log('                            List pre-fork baseline rescue candidates')
+  log('                            (refs/wt-baseline/* pinned + fsck dangling).')
+  log('                            --show prints full patch via stash show -p.')
+  log('  orphan-prune [--force]    Find and remove orphaned dirs in <consumer>-wt/')
+  log('                            (leftover gitignored content after worktree removal)')
+}
+
+// Value-taking flags consume the next token. Bare --precheck-baseline is also valid.
+const VALUE_FLAGS = new Set([
+  '--precheck-baseline',
+  '--baseline-strategy',
+  '--baseline-scope-paths',
+  '--baseline-stash-name',
+  '--show',
+  '--task-summary',
+  '--landing',
+  '--expected-paths',
+  '--origin',
+  '--verification',
+  '--base',
+  '--checkout',
+  '--superseded-by',
+  '--reason',
+  '--discard-pathspec',
+])
+const BOOLEAN_FLAGS = new Set([
+  '--patch',
+  '--remove-landed',
+  '--json',
+  '--force',
+  '--force-discard-unland',
+  '--force-discard-uncommitted',
+  '--accept-landed',
+  '--dry-run',
+  '--auto-stash',
+  '--include-worktree-wip',
+  '--no-cleanup',
+  '--noop-if-missing',
+  '--skip-pre-sync',
+  '--skip-prefork-audit',
+  '--include-unrelated-dirty',
+  '--allow-orphan-record',
+  '--work-done',
+  '--i-know-publish-is-running',
+  '--no-landed-state',
+])
+const BATCH_VALUE_FLAGS = new Set([
+  '--work-id',
+  '--author',
+  '--scope',
+  '--pr',
+  '--kind',
+  '--discussant',
+  '--question',
+  '--evidence',
+  '--retain',
+  '--reason',
+  '--trigger',
+  '--workflow',
+  '--group-work-ids',
+  '--expect-work-id',
+  '--batch',
+  '--owner',
+  '--carrier',
+  '--resume-event',
+  '--event',
+  '--authorization',
+  '--world',
+  '--receipt',
+])
+const BATCH_BOOLEAN_FLAGS = new Set([
+  '--authorize-landing',
+  '--release-writer',
+  '--resume',
+  '--dry-run',
+  '--no-cleanup',
+])
+
+// main() 的 switch 認得的子指令；不在這裡的（含缺漏）照舊落到 usage／exit 1。
+const SUBCOMMANDS = new Set([
+  'add',
+  'detect-main-dirty',
+  'list',
+  'backlog',
+  'prune',
+  'reclaim-stale',
+  'reconcile',
+  'cleanup',
+  'residue-prune',
+  'merge-back',
+  'resolve',
+  'land-pending',
+  'rescue',
+  'orphan-prune',
+  'dev',
+  'refresh-substrate',
+])
+// 會讀 `opts.dryRun` 的子指令；新增子指令支援 `--dry-run` 時 MUST 同步加進來，否則會被 main() 拒絕。
+const DRY_RUN_SUBCOMMANDS = new Set([
+  'cleanup',
+  'merge-back',
+  'land-pending',
+  'dev',
+  'reclaim-stale',
+  'refresh-substrate',
+])
+
+async function main() {
+  let [, , sub, ...rawRest] = process.argv
+  if (sub === '--machine' || sub?.startsWith('--machine=')) {
+    const machineArgs = sub === '--machine' ? [sub, rawRest.shift() ?? ''] : [sub]
+    sub = rawRest.shift()
+    rawRest.push(...machineArgs)
+  }
+  const options: FlagOptions = Object.fromEntries([
+    ...[
+      ...(sub === 'batch' ? BATCH_VALUE_FLAGS : VALUE_FLAGS),
+      ...(sub === 'batch' ? [] : ['--machine']),
+    ].map((flag) => [
+      flag.slice(2),
+      {
+        type: 'string' as const,
+        optionalValue: flag === '--precheck-baseline',
+        freeText: ['--task-summary', '--verification', '--reason'].includes(flag),
+      },
+    ]),
+    ...[...(sub === 'batch' ? BATCH_BOOLEAN_FLAGS : BOOLEAN_FLAGS), '--help'].map((flag) => [
+      flag.slice(2),
+      { type: 'boolean' as const },
+    ]),
+  ])
+  let rest: string[]
+  try {
+    rest = normalizeUnsplitArgv(rawRest, options)
+  } catch (error) {
+    if (!(error instanceof UnsplitArgvError)) throw error
+    console.error(`error: ${error.message}`)
+    if (sub === 'batch') console.error(`subcommands: ${BATCH_USAGE}`)
+    else printUsage()
+    process.exit(2)
+  }
+  if (sub === 'add' && !rest.includes('--help')) {
+    const refusal = await dispatchTreePlacementRefusal()
+    if (refusal) {
+      console.error(refusal)
+      process.exit(2)
+    }
+  }
+  const peerExit = forwardToPeer(sub, rest)
+  if (peerExit !== null) process.exit(peerExit)
+  if (rest.some((arg) => arg === '--machine' || arg.startsWith('--machine='))) return main()
+
+  if (sub === 'batch') {
+    try {
+      const result = runBatchCommand(
+        process.cwd(),
+        rest,
+        {
+          bootstrap: (root, path) => bootstrapWorktreeRuntime(root, path, { strict: true }),
+          destroy: releaseWorktreeRuntime,
+          restore: (_main, path, detached) => reattachWorktreeSubmodules(path, detached),
+          removed: cleanupRemovedWorktreeRuntime,
+          withExclusiveWriterOwnership: withProbedExclusiveWriterOwnership,
+          // TD-1148：只在移除路徑、以 source path（宿主設定引用的那個）於 teardown 之前擋
+          beforeRemoval: (_main, sourcePath) => assertNoHostConfigReferences(sourcePath),
+          beforeRemove: (_main, quarantine) => probeLiveWriterCwd(quarantine),
+          afterRemove: (_main, path, extraRoots) => probeDeletedHandles(path, extraRoots),
+        },
+        undefined,
+        { saveResidue: saveBatchCleanupResidue },
+      )
+      console.log(JSON.stringify(result, null, 2))
+    } catch (e) {
+      // Usage errors (bad flags, missing/ambiguous args) exit 2 with usage —
+      // same contract as invoking wt-batch.ts directly; runtime failures exit 1.
+      if (e instanceof BatchUsageError) {
+        console.error(`error: ${e.message}`)
+        console.error(`subcommands: ${BATCH_USAGE}`)
+        process.exit(2)
+      }
+      throw e
+    }
+    return
+  }
+
+  const flags = new Set<string>()
+  const values = {}
+  const positional = []
+  for (let i = 0; i < rest.length; i++) {
+    const a = rest[i]
+    if (a.startsWith('--')) {
+      if (VALUE_FLAGS.has(a)) {
+        const next = rest[i + 1]
+        if (next === undefined || next.startsWith('--')) {
+          values[a] = ''
+        } else {
+          values[a] = next
+          i++
+        }
+      } else {
+        flags.add(a)
+      }
+    } else {
+      positional.push(a)
+    }
+  }
+  // TD-1142：`--help` 與不認得的旗標都 MUST 在任何子指令動手之前處理。這裡以前只把旗標收進
+  // `flags`，於是 `reclaim-stale --help` 直接釋放了 4 格 dev-port 登記、`prune --help` 跳出刪樹確認。
+  if (flags.has('--help') || positional.includes('-h')) {
+    printUsage(console.log)
+    process.exit(0)
+  }
+  const unknownFlags = [...flags].filter((f) => !BOOLEAN_FLAGS.has(f))
+  if (unknownFlags.length > 0) {
+    console.error(
+      `error: unknown flag(s) for \`${sub ?? ''}\`: ${unknownFlags.join(' ')}（未執行任何動作）`,
+    )
+    printUsage()
+    process.exit(2)
+  }
+  // 全域白名單只證明旗標「某個子指令認得」，不證明這個子指令會讀它。其他旗標被忽略是往安全的方向偏，
+  // `--dry-run` 被忽略則是把預覽變成實跑（reclaim-stale 就踩得到），所以只放行真的讀它的子指令。
+  if (flags.has('--dry-run') && SUBCOMMANDS.has(sub) && !DRY_RUN_SUBCOMMANDS.has(sub)) {
+    console.error(`error: \`${sub ?? ''}\` does not support --dry-run（未執行任何動作）`)
+    process.exit(2)
+  }
+  if (flags.has('--remove-landed') && sub !== 'reclaim-stale') {
+    console.error(`error: ${sub ?? ''} does not support --remove-landed（未執行任何動作）`)
+    process.exit(2)
+  }
+  if (flags.has('--patch') && !['merge-back', 'land-pending'].includes(sub)) {
+    console.error(`error: ${sub ?? ''} does not support --patch（未執行任何動作）`)
+    process.exit(2)
+  }
+  const opts = {
+    patch: flags.has('--patch'),
+    json: flags.has('--json'),
+    noLandedState: flags.has('--no-landed-state'),
+    removeLanded: flags.has('--remove-landed'),
+    force: flags.has('--force'),
+    forceDiscardUnland: flags.has('--force-discard-unland'),
+    forceDiscardUncommitted: flags.has('--force-discard-uncommitted'),
+    acceptLanded: flags.has('--accept-landed'),
+    dryRun: flags.has('--dry-run'),
+    autoStash: flags.has('--auto-stash'),
+    includeWorktreeWip: flags.has('--include-worktree-wip'),
+    cleanup: !flags.has('--no-cleanup'),
+    noopIfMissing: flags.has('--noop-if-missing'),
+    skipPreSync: flags.has('--skip-pre-sync'),
+    skipPreforkAudit: flags.has('--skip-prefork-audit'),
+    includeUnrelatedDirty: flags.has('--include-unrelated-dirty'),
+    allowOrphanRecord: flags.has('--allow-orphan-record'),
+    precheckBaseline: Object.prototype.hasOwnProperty.call(values, '--precheck-baseline')
+      ? values['--precheck-baseline']
+      : undefined,
+    baselineStrategy: values['--baseline-strategy'],
+    baselineScopePaths: values['--baseline-scope-paths'],
+    baselineStashName: values['--baseline-stash-name'],
+    show: values['--show'],
+    taskSummary: values['--task-summary'],
+    landing: values['--landing'],
+    expectedPaths: values['--expected-paths'],
+    origin: values['--origin'],
+    base: values['--base'],
+    checkout: values['--checkout'],
+    workDone: flags.has('--work-done'),
+    iKnowPublishIsRunning: flags.has('--i-know-publish-is-running'),
+    verification: values['--verification'],
+    discardPathspec: values['--discard-pathspec'],
+    supersededBy: Object.prototype.hasOwnProperty.call(values, '--superseded-by')
+      ? values['--superseded-by']
+      : undefined,
+    reason: values['--reason'],
+  }
+
+  switch (sub) {
+    case 'add':
+      await cmdAdd(positional[0], opts)
+      return
+    case 'detect-main-dirty':
+      await cmdDetectMainDirty(opts)
+      return
+    case 'list':
+      await cmdList(opts)
+      return
+    case 'backlog':
+      await cmdBacklog(opts)
+      return
+    case 'prune':
+      await cmdPrune()
+      return
+    case 'reclaim-stale':
+      await cmdReclaimStale({ dryRun: opts.dryRun, removeLanded: opts.removeLanded })
+      return
+    case 'cleanup':
+      await cmdCleanup(positional[0], opts)
+      return
+    case 'reconcile':
+      await cmdReconcile(positional[0], opts)
+      return
+    case 'residue-prune': {
+      const pruned = pruneCleanupResidue(findConsumerRoot())
+      console.log(`residue-prune: removed ${pruned.length} expired ref(s)`)
+      for (const ref of pruned) console.log(`  ${ref}`)
+      return
+    }
+    case 'merge-back':
+      await cmdMergeBack(positional[0], opts)
+      return
+    case 'resolve':
+      await cmdResolve(positional[0], opts)
+      return
+    case 'land-pending':
+      await cmdLandPending(positional[0], opts)
+      return
+    case 'rescue':
+      await cmdRescue(opts)
+      return
+    case 'orphan-prune':
+      await cmdOrphanPrune(opts)
+      return
+    case 'dev':
+      await cmdDev(positional[0], opts)
+      return
+    case 'refresh-substrate':
+      await cmdRefreshSubstrate(positional[0], opts)
+      return
+    default:
+      printUsage()
+      process.exit(1)
+  }
+}
+
+export {
+  cmdAdd,
+  cmdCleanup,
+  cmdDetectMainDirty,
+  cmdLandPending,
+  cmdList,
+  cmdMergeBack,
+  assertNoPublishInFlight,
+  detectPublishInFlight,
+  inFlightHoldersFor,
+  cmdOrphanPrune,
+  cmdPrune,
+  cmdRescue,
+  defaultMergedPrProbe,
+  detectMainDirty,
+  detectMergeBlockers,
+  detectMergedPrLanding,
+  detectUncommittedWorktreeFiles,
+  detectUnlandedFiles,
+  enrichWorktree,
+  findConsumerRoot,
+  gitSelectiveCommit,
+  makeSlugSafe,
+  mergedBranches,
+  parseWorktreeList,
+  preserveWorktreeScreenshots,
+  preserveWorktreeEvidence,
+  sessionWorktrees,
+  setupBriefExclude,
+  timestampPrefix,
+}
+// classifyUnmergedSafety is exported via `export function` at definition site.
+
+function resolveRealPath(p) {
+  try {
+    return realpathSync(p)
+  } catch {
+    return resolve(p)
+  }
+}
+
+const isCli =
+  process.argv[1] &&
+  resolveRealPath(process.argv[1]) === resolveRealPath(new URL(import.meta.url).pathname)
+if (isCli) {
+  main().catch((e) => {
+    console.error('error:', e.message)
+    process.exit(1)
+  })
+}

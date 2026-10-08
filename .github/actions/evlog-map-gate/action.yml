@@ -1,0 +1,47 @@
+# 🔒 LOCKED — managed by clade · Source: vendor/actions/evlog-map-gate/action.yml · 改這裡無效，下次 propagate 會覆寫；請改 $CLADE_HOME/vendor/actions/evlog-map-gate/action.yml
+name: 'evlog map Coverage Gate'
+description: 'Run the clade evlog map gate. Callers MUST pass mode explicitly — min-score (strict: EVERY entry point zero failing checks and zero suppressions) or ratchet (baseline must not regress; touched entry points must be perfect). No default on mode: upstream cannot silently retarget unpinned workflows when the recommended mode changes. Also fails on the false-green case where evlog map finds 0 entry points but reports score 100. Assumes the caller has already checked out the repo with fetch-depth 0 and installed dependencies.'
+author: 'YuDefine/clade'
+
+inputs:
+  base-ref:
+    description: 'Git ref to diff against when determining which entry points this change touches.'
+    required: false
+    default: 'origin/main'
+  cwd:
+    description: 'Directory to scan, relative to the repo root. Set this for monorepos where the app root is not the repo root.'
+    required: false
+    default: '.'
+  baseline:
+    description: 'Path to the committed evlog.map.json baseline, relative to the repo root.'
+    required: false
+    default: 'evlog.map.json'
+  mode:
+    description: 'min-score (strict — every entry point zero-failure, zero-suppression) or ratchet (transitional: baseline must not regress and touched entry points must be perfect). Required on every consumer workflow — never rely on an inherited default.'
+    required: true
+  min-score:
+    description: 'Score floor used when mode is min-score.'
+    required: false
+    default: '100'
+
+runs:
+  using: composite
+  steps:
+    - name: Run evlog map coverage gate
+      shell: bash
+      env:
+        INPUT_BASE_REF: ${{ inputs.base-ref }}
+        INPUT_CWD: ${{ inputs.cwd }}
+        INPUT_BASELINE: ${{ inputs.baseline }}
+        INPUT_MODE: ${{ inputs.mode }}
+        INPUT_MIN_SCORE: ${{ inputs.min-score }}
+      run: |
+        set -euo pipefail
+        # 判定本體在 run.sh：本機的 local.ts 也呼叫同一支，CI 與本機只有一份邏輯。
+        # workflow 明寫了這個 action（mode 必填）＝已導入。此時引擎缺失是安裝不完整，
+        # 不是「尚未導入」：fail-closed，NEVER 印 skip 再 exit 0（checker-contract § Fail-closed Iron Law）。
+        if [ ! -f "$GITHUB_ACTION_PATH/run.sh" ]; then
+          echo "::error::infrastructure-error: run.sh not found next to action.yml — the vendored action is incomplete (re-run clade propagate); the gate did NOT run"
+          exit 2
+        fi
+        bash "$GITHUB_ACTION_PATH/run.sh"

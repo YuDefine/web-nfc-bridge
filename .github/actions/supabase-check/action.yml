@@ -1,0 +1,274 @@
+# 🔒 LOCKED — managed by clade · Source: vendor/actions/supabase-check/action.yml · 改這裡無效，下次 propagate 會覆寫；請改 $CLADE_HOME/vendor/actions/supabase-check/action.yml
+name: 'Supabase Schema Check'
+description: 'Cold-replay the repo migrations on a throwaway local Postgres, then assert three things: the committed database types match what the migrations produce, supabase db lint is clean at the configured level, and (when supabase/tests/ exists) the pgTAP suite passes. A fourth, advisory-only step runs pgbot lint (schema profile) against the same throwaway DB and emits ::warning:: annotations; it never affects the exit code. Never touches a dev, staging or production database — it starts its own stack on the runner, which is also what makes it verify that the migration chain replays from zero. Because it executes code a pull request can rewrite, the job itself MUST run on a runner with no production access (GitHub-hosted, or a self-hosted runner that hosts no production service); see clade rules/core/self-hosted-runner.md § 10. Assumes the caller has already checked out the repo, installed Node.js (actions/setup-node) and installed the Supabase CLI (supabase/setup-cli@v3) pinned to the same version that generated the committed types. Exception: if the repo package.json has devEngines.packageManager, setup-cli v3 fails with EBADDEVENGINES (it runs npm view in the workspace); use supabase/setup-cli v1.7.1 with an explicit version there, at the cost of re-downloading the CLI tarball on every run; see clade rules/core/self-hosted-runner.md section 9.'
+author: 'YuDefine/clade'
+
+inputs:
+  cwd:
+    description: 'Directory containing the supabase/ folder, relative to the repo root. Set this for monorepos where the app root is not the repo root.'
+    required: false
+    default: '.'
+  lint-level:
+    description: 'Severity floor passed to `supabase db lint`. warning (default) means zero tolerance — any finding at warning or above fails the job.'
+    required: false
+    default: 'warning'
+  types-path:
+    description: 'Path to the committed database types file, relative to cwd. Leave empty to auto-detect (package.json config.dbTypesPath, then the conventional locations).'
+    required: false
+    default: ''
+  run-tests:
+    description: 'auto (default; run `supabase test db` only when supabase/tests/ contains files), always, or never.'
+    required: false
+    default: 'auto'
+  pgbot-version:
+    description: 'pgbot release to run `pgbot lint` (schema profile) with, ADVISORY ONLY — findings become ::warning:: annotations and never fail the job. Only versions whose sha256 is pinned inside this action are accepted; `none` skips the step. Runs against the throwaway CI database only, never a real one.'
+    required: false
+    default: '0.8.1'
+  pgbot-base-report:
+    description: 'Optional path (relative to cwd) to a pgbot JSON report produced from the base branch. When set, pgbot only annotates findings NEW relative to that report (--fail-on-new); pre-existing findings are listed in the log but not annotated.'
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - name: Supabase schema check
+      shell: bash
+      env:
+        INPUT_CWD: ${{ inputs.cwd }}
+        INPUT_LINT_LEVEL: ${{ inputs.lint-level }}
+        INPUT_TYPES_PATH: ${{ inputs.types-path }}
+        INPUT_RUN_TESTS: ${{ inputs.run-tests }}
+        INPUT_PGBOT_VERSION: ${{ inputs.pgbot-version }}
+        INPUT_PGBOT_BASE_REPORT: ${{ inputs.pgbot-base-report }}
+      run: |
+        set -euo pipefail
+
+        WORKDIR="$(printf '%s' "$INPUT_CWD" | tr -d '[:space:]')"
+        [ -z "$WORKDIR" ] && WORKDIR=.
+        cd "$WORKDIR"
+
+        # 這個 repo 還沒採用 supabase migrations —— 不是失敗，是還沒接。
+        if [ ! -d supabase/migrations ]; then
+          echo "::warning::no supabase/migrations/ under $WORKDIR — supabase-check not applicable here, skipping"
+          exit 0
+        fi
+
+        # CLI 由 caller 的 supabase/setup-cli@v3 提供。缺了就是 workflow 寫錯，
+        # 不能 warn+skip —— 那會讓「gate 沒跑」與「gate 通過」在 UI 上長得一樣。
+        if ! command -v supabase >/dev/null 2>&1; then
+          echo "::error::supabase CLI not found. Add a 'uses: supabase/setup-cli@v3' step before this action."
+          echo "See vendor/snippets/supabase-ci/README.md for the full workflow template."
+          exit 1
+        fi
+
+        # types 路徑偵測、lint 輸出判讀、pgbot 結果解析都靠 node。缺了不能讓它靜默退化：
+        # 偵測失敗會變成「types drift 檢查跳過」的 warning，與「沒有 types 檔」長得一樣
+        # （perno 2026-09-16 在 CT 102 實測）。
+        if ! command -v node >/dev/null 2>&1; then
+          echo "::error::node not found on PATH. Add a 'uses: actions/setup-node' step before this action."
+          echo "See vendor/snippets/supabase-ci/supabase-check.yml.template for the pinned step."
+          exit 1
+        fi
+
+        cleanup() { supabase stop --no-backup >/dev/null 2>&1 || true; }
+        trap cleanup EXIT
+
+        # 只起 DB service。lint / gen types / pgTAP 都只需要 Postgres，
+        # 起全套 stack（auth / storage / studio）純粹是浪費 runner 時間。
+        echo "::group::supabase db start (cold replay of supabase/migrations/)"
+        supabase db start
+        echo "::endgroup::"
+
+        FAILED=0
+
+        # ── 1. types drift ────────────────────────────────────────────────
+        # 解析路徑的候選清單 MUST 與 commit skill 的 schema-sync.md Step 1.1 一致；
+        # 兩邊分歧會讓 CI 與 commit gate 檢查不同的檔，而兩邊都顯示綠燈。
+        TYPES="$(printf '%s' "$INPUT_TYPES_PATH" | tr -d '[:space:]')"
+        if [ -z "$TYPES" ] && [ -f package.json ]; then
+          TYPES="$(node -e "
+            const fs = require('fs');
+            const pkg = require('./package.json');
+            const custom = pkg.config && pkg.config.dbTypesPath;
+            const candidates = [
+              'packages/core/app/types/database.types.ts',
+              'app/types/database.types.ts',
+              'shared/types/database.types.ts',
+              'src/types/database.types.ts',
+            ];
+            process.stdout.write(custom || candidates.find(p => fs.existsSync(p)) || '');
+          " 2>/dev/null || true)"
+        fi
+
+        if [ -n "$TYPES" ] && [ -f "$TYPES" ]; then
+          echo "::group::types drift ($TYPES)"
+          supabase gen types typescript --local > "$TYPES"
+          if git diff --ignore-space-at-eol --exit-code --quiet -- "$TYPES"; then
+            echo "types match migrations"
+          else
+            echo "::error::$TYPES does not match what supabase/migrations/ produces."
+            echo "Someone hand-edited the types without a matching migration. Regenerate and commit:"
+            echo "  supabase gen types typescript --local > $TYPES"
+            git --no-pager diff -- "$TYPES" || true
+            FAILED=1
+          fi
+          echo "::endgroup::"
+        else
+          echo "::warning::no committed database types file found — types drift check skipped. Set the types-path input if this repo keeps one somewhere non-conventional."
+        fi
+
+        # ── 2. db lint ────────────────────────────────────────────────────
+        # exit code 不可靠（clean 與 findings 都回 0），所以判的是 stdout 內容，NEVER 混入 stderr：
+        # CLI 把 `Connecting to…` / `Linting schema:` / `No schema errors found` 這類狀態行寫到 stderr，
+        # 併進來就會讓乾淨的 lint 看起來非空。stdout 的形狀隨 CLI 版本漂過（2.116.0 實測）：
+        #   --output json 乾淨 → 0 bytes；有 finding → JSON 陣列
+        #   非 tty 的預設輸出 → {"results":[…]} 包裝
+        # 所以「exit 0 且 stdout 全空白」是乾淨，能 parse 的 JSON 以筆數判，其餘非空 stdout 一律算 finding。
+        echo "::group::supabase db lint --level $INPUT_LINT_LEVEL"
+        LINT_OUT="${RUNNER_TEMP:-/tmp}/supabase-lint.out"
+        LINT_ERR="${RUNNER_TEMP:-/tmp}/supabase-lint.err"
+        # 印 finding 筆數；stdout 空白 → 0；不是可辨識的 JSON → exit 1。
+        lint_count() {
+          node -e "
+            const s = require('fs').readFileSync(process.argv[1], 'utf8');
+            if (!s.trim()) { process.stdout.write('0'); process.exit(0); }
+            let r; try { r = JSON.parse(s); } catch { process.exit(1); }
+            const list = Array.isArray(r) ? r : (r && (r.results || r.lints));
+            if (!Array.isArray(list)) process.exit(1);
+            process.stdout.write(String(list.length));
+          " "$1"
+        }
+        LINT_RC=0
+        supabase db lint --level "$INPUT_LINT_LEVEL" --local --output json > "$LINT_OUT" 2> "$LINT_ERR" || LINT_RC=$?
+        if [ "$LINT_RC" -ne 0 ] || ! COUNT="$(lint_count "$LINT_OUT")"; then
+          # --output json 不支援（舊 CLI 回 unknown flag）或輸出不可辨識 → 退預設輸出，同樣只看 stdout。
+          LINT_RC=0
+          supabase db lint --level "$INPUT_LINT_LEVEL" --local > "$LINT_OUT" 2> "$LINT_ERR" || LINT_RC=$?
+          if [ "$LINT_RC" -ne 0 ]; then
+            COUNT=error
+          elif ! COUNT="$(lint_count "$LINT_OUT")"; then
+            # 純文字輸出：排除狀態行後仍有非空白內容才算 finding。
+            if grep -vE '^[[:space:]]*(Connecting to |Linting schema:|No schema errors found)' "$LINT_OUT" | grep -qE '[^[:space:]]'; then
+              COUNT=unparsed
+            else
+              COUNT=0
+            fi
+          fi
+        fi
+        if [ "$COUNT" = "error" ]; then
+          # lint 本身沒跑成（連不上 DB、CLI 崩潰）NEVER 讀成乾淨——gate 沒跑與 gate 通過不可長得一樣。
+          echo "::error::supabase db lint exited $LINT_RC — lint did not run to completion."
+          cat "$LINT_ERR" "$LINT_OUT"
+          FAILED=1
+        elif [ "$COUNT" != "0" ]; then
+          echo "::error::supabase db lint reported findings ($COUNT) at level $INPUT_LINT_LEVEL or above."
+          cat "$LINT_OUT"
+          FAILED=1
+        else
+          echo "lint clean"
+        fi
+        echo "::endgroup::"
+
+        # ── 3. pgTAP（opt-in：有測試才跑） ────────────────────────────────
+        RUN_TESTS=0
+        case "$INPUT_RUN_TESTS" in
+          always) RUN_TESTS=1 ;;
+          never)  RUN_TESTS=0 ;;
+          *)      [ -d supabase/tests ] && [ -n "$(find supabase/tests -name '*.sql' -print -quit)" ] && RUN_TESTS=1 ;;
+        esac
+
+        if [ "$RUN_TESTS" -eq 1 ]; then
+          echo "::group::supabase test db (pgTAP)"
+          supabase test db || FAILED=1
+          echo "::endgroup::"
+        else
+          echo "no supabase/tests/*.sql — pgTAP skipped (opt-in; see vendor/snippets/supabase-ci/README.md)"
+        fi
+
+        # ── 4. pgbot lint（schema profile，ADVISORY ONLY）──────────────────
+        # 規約：rules/modules/db-runtime/supabase-self-hosted/observability.md § schema / config 層健檢 的 profile 分界表。
+        # 這一步 NEVER 動 FAILED：pgbot 的 finding 需要人判業務語意（int4_identity_column 對設定表恆為誤報），
+        # 它只印 ::warning::。也 NEVER 拿到真實 DB 連線——DSN 只從 `supabase status` 取拋棄式 stack 的。
+        PGBOT_VER="$(printf '%s' "$INPUT_PGBOT_VERSION" | tr -d '[:space:]')"
+        if [ -z "$PGBOT_VER" ] || [ "$PGBOT_VER" = "none" ]; then
+          echo "pgbot lint skipped (pgbot-version=none)"
+        else
+          echo "::group::pgbot lint --profile=schema (advisory, v$PGBOT_VER)"
+          # sha256 釘死在這裡，與 vendor/snippets/pg-health-baseline/README.md Step 1 的 VER 同步升。
+          # 只列這裡有的版本才跑；沒列的版本 = 沒人驗過 checksum，warn 後跳過，NEVER 退回 curl | sh。
+          case "$(uname -m)" in x86_64|amd64) PGBOT_ARCH=amd64 ;; aarch64|arm64) PGBOT_ARCH=arm64 ;; *) PGBOT_ARCH= ;; esac
+          PGBOT_SHA=
+          case "${PGBOT_VER}_${PGBOT_ARCH}" in
+            0.8.1_amd64) PGBOT_SHA=1246abb6873267b49fcfb38b7db00cbfa77c1d7d240a43fc020be8c5f1541c20 ;;
+            0.8.1_arm64) PGBOT_SHA=8f1f5a80d274ba007969d154778bf6f8d6863b72c1e4820f84e79a0e8c09cb5d ;;
+          esac
+          if [ -z "$PGBOT_SHA" ]; then
+            echo "::warning::pgbot v$PGBOT_VER/$PGBOT_ARCH has no pinned sha256 in this action — pgbot lint skipped. Pin it in vendor/actions/supabase-check/action.yml (clade) rather than passing an arbitrary version."
+          else
+            PGBOT_DIR="${RUNNER_TEMP:-/tmp}/pgbot-$PGBOT_VER"
+            mkdir -p "$PGBOT_DIR"
+            PGBOT_TGZ="$PGBOT_DIR/pgbot_${PGBOT_VER}_linux_${PGBOT_ARCH}.tar.gz"
+            PGBOT_OK=0
+            if curl -fsSL -o "$PGBOT_TGZ" "https://github.com/pgrundev/pgbot/releases/download/v${PGBOT_VER}/pgbot_${PGBOT_VER}_linux_${PGBOT_ARCH}.tar.gz"; then
+              if echo "$PGBOT_SHA  $PGBOT_TGZ" | sha256sum --check --status; then
+                tar -xzf "$PGBOT_TGZ" -C "$PGBOT_DIR" && [ -x "$PGBOT_DIR/pgbot" ] && PGBOT_OK=1
+              else
+                echo "::warning::pgbot v$PGBOT_VER tarball sha256 MISMATCH — refusing to run it. Either the release was re-cut (re-pin in clade) or the download was tampered with."
+              fi
+            else
+              echo "::warning::pgbot v$PGBOT_VER download failed — pgbot lint skipped (advisory step; the gate above is unaffected)."
+            fi
+            if [ "$PGBOT_OK" -eq 1 ]; then
+              # 拋棄式 stack 的 DSN。`supabase status -o json` 的鍵名隨 CLI 版本漂過（DB_URL / db_url），兩個都試；
+              # 都沒有就 skip，NEVER 猜 127.0.0.1:54322——同台 runner 可能另有 supabase stack（例如 e2e）佔著那個 port，
+              # 猜中的是別人的 DB。
+              CI_DSN="$(supabase status -o json 2>/dev/null | node -e "
+                let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const j=JSON.parse(d);process.stdout.write(j.DB_URL||j.db_url||'')}catch{process.stdout.write('')}})" 2>/dev/null || true)"
+              if [ -z "$CI_DSN" ]; then
+                echo "::warning::supabase status did not report DB_URL for the throwaway stack — pgbot lint skipped rather than guessing a port (advisory step; the gate above is unaffected)."
+                PGBOT_OK=0
+              fi
+            fi
+            if [ "$PGBOT_OK" -ne 1 ]; then
+              [ -f "$PGBOT_TGZ" ] || true
+            else
+              PGBOT_OUT="${RUNNER_TEMP:-/tmp}/pgbot-lint.json"
+              BASE_REPORT="$(printf '%s' "$INPUT_PGBOT_BASE_REPORT" | tr -d '[:space:]')"
+              PGBOT_ARGS=(lint "$CI_DSN" --format=json --fail-on=none)
+              if [ -n "$BASE_REPORT" ]; then
+                if [ -f "$BASE_REPORT" ]; then
+                  PGBOT_ARGS+=(--fail-on-new "$BASE_REPORT")
+                else
+                  echo "::warning::pgbot-base-report '$BASE_REPORT' not found — annotating all schema findings, not only new ones."
+                fi
+              fi
+              # `.pgbot.toml`（若 repo 有）由 pgbot 從 cwd 向上自動找到；suppressed 的 finding 留在 JSON 但不 annotate。
+              # --fail-on-new 的 preexisting 判定以「聚合 finding 的 objects 集合」為單位（0.8.1 實測）：
+              # base 有 3 張 int4 表、PR 加第 4 張 → 整條 int4_identity_column 算新的，不會只列新那張。
+              if "$PGBOT_DIR/pgbot" "${PGBOT_ARGS[@]}" > "$PGBOT_OUT" 2> "${PGBOT_OUT}.err"; then :; else
+                echo "pgbot exited non-zero (advisory; ignored). stderr:"; cat "${PGBOT_OUT}.err" || true
+              fi
+              if node -e "JSON.parse(require('fs').readFileSync('$PGBOT_OUT','utf8'))" 2>/dev/null; then
+                node -e "
+                  const r = JSON.parse(require('fs').readFileSync('$PGBOT_OUT','utf8'));
+                  const all = Array.isArray(r.findings) ? r.findings : [];
+                  const live = all.filter(f => !f.suppressed && !f.preexisting);
+                  const pre = all.filter(f => f.preexisting).length, sup = all.filter(f => f.suppressed).length;
+                  for (const f of live) {
+                    // 0.8.1 實測：schema profile 的 finding 是聚合的，object 為空、objects 列出受影響的表/索引。
+                    const objs = Array.isArray(f.objects) && f.objects.length ? f.objects : (f.object ? [f.object] : []);
+                    const shown = objs.slice(0, 5).join(', ') + (objs.length > 5 ? ' (+' + (objs.length - 5) + ' more)' : '');
+                    console.log('::warning title=pgbot ' + f.id + '::' + (f.severity||'') + ' ' + (f.title||f.id) + (shown ? ' [' + shown + ']' : '') + ' — advisory, needs human judgement; see vendor/snippets/pg-health-baseline/README.md § 判讀紀律');
+                  }
+                  console.log('pgbot lint: ' + live.length + ' finding(s) annotated, ' + pre + ' pre-existing (base report), ' + sup + ' suppressed by .pgbot.toml. schema_version=' + (r.schema_version||'?'));
+                "
+              else
+                echo "pgbot produced no parseable JSON — advisory step skipped."
+              fi
+            fi
+          fi
+          echo "::endgroup::"
+        fi
+
+        exit "$FAILED"

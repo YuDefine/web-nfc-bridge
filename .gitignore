@@ -1,5 +1,4 @@
 # Spectra app data
-.spectra/
 node_modules/
 .nuxt/
 .output/
@@ -19,3 +18,39 @@ public/downloads/*.pkg
 public/downloads/*.msi
 public/downloads/*.deb
 public/downloads/*.AppImage
+
+# Clade local runtime state
+.claude/.commit.lock
+.claude/.commit.lock.guard/
+.claude/.commit.lock.history/
+.claude/.commit-recovery/
+.claude/.commit.lock.*.claim*
+.agents/*
+!.agents/constitution/
+.codex/
+.clade/runtime/
+.clade/vendor/ledger/*.jsonl
+.clade/vendor/ledger/*.jsonl.lock
+.clade/flow/
+.clade/*
+!.clade/manifest.json
+!.clade/rules/
+!.clade/ai-control-plane/
+.clade/ai-control-plane/*
+!.clade/ai-control-plane/intent/
+!.clade/ai-control-plane/human-decisions.jsonl
+/screenshots/**/*.png
+/screenshots/**/*.jpg
+/screenshots/**/*.jpeg
+/screenshots/**/*.webp
+/screenshots/**/*.gif
+/screenshots/**/*.svg
+/screenshots/**/*.avif
+/screenshots/**/*.bmp
+/screenshots/**/*.tif
+/screenshots/**/*.tiff
+/screenshots/**/*.md
+/screenshots/**/*.json
+.pi/*
+!.pi/settings.json
+.codebase-memory/

@@ -1,0 +1,654 @@
+---
+name: work-loop
+description: "Use for unattended progression of plan tasks, HANDOFF items, tech debt, or roadmaps. Not for one-time handoff or user decisions."
+metadata:
+  author: clade
+  version: '3.1'
+  clade:
+    permission_tier: action
+effort: xhigh
+---
+
+
+# /work-loop — 待辦自主推進迴圈
+
+> 2026-08-05 由 `/change-loop`（含 `--turbo`）與 `/handoff-loop` 合併而成。舊名已移除，無相容 stub。
+
+本 skill 是 loop 四型分類中的 **proactive loop**——trigger 交給 `runner.sh` 或 `/loop`，工作清單交給 scan 自己找。四型分類與通用方法論見 cookbook `vendor/snippets/loop-engineering/`。
+
+**主檔與 reference 的分工**：本檔保留 mode、routing、hard gate、順序、output 與停止條件；具名分支的 recipe 與 recovery 在 `reference/`，每一處都標了「什麼時機 MUST 讀」。命中那個時機卻沒讀就動手，等同沒照本 skill 做。
+
+## Host 支援
+
+兩種跑法：**in-session**＝使用者自己開的 host session 載入本 skill，在該 session 內推進；**unattended**＝`runner.sh` 每輪起一個全新 host process，沒有人在場。
+
+| Host | in-session | unattended（`runner.sh`） |
+| --- | --- | --- |
+| Claude | 支援（含 `/loop`、`ScheduleWakeup` 續跑） | 支援：`runner.sh` 只投影到 Claude |
+| Codex | 支援：在該 session 內逐輪跑迴圈，沒有跨閒置的 durable wakeup（host 綁定見 Codex adapter 段） | **不支援**：agent NEVER 以 codex CLI 起 worker（`rules/core/agent-routing.pi-watch-protocol.md`），`runner.sh` 在 Codex session 內直接拒跑 |
+
+「不支援」的那一格要回報不可用並保留 work 身分，**NEVER** 改用別端 launcher 代跑（[[TD-445]]）。
+
+**沒有「走哪一支」的判定。** repo 有沒有 `specs/plans/`、待辦是 plan package 還是 tech-debt 條目，都由 Step 2 的 scan 結果決定路由——沒有 `specs/plans/` 的 repo 掃出來的 `plans` 段就是空的，**這是正常的，不是 scan 失敗**。
+
+核心 contract：**每次被叫起來，把待辦盡可能推到「已完成」「可驗收」或「已備妥決策選項」狀態。能自主決策的自主完成；必須人拍板的 NEVER 直接 skip——MUST 走 § Decision packaging 推進到「一句話就能答」的狀態。**
+
+**Output contract**：loop 的 output 是**進度報告**，不是 user call-to-action。
+
+- ✅ 「`<change>` 標 🟢 ready-for-review（寫入 HANDOFF）」「TD-317 已修並 commit `a1b2c3d`」— 報告事實
+- ✅ 「本輪處理 3 items：2 completed / 1 packaged。fingerprint 已變，續跑」— 報告進度
+- ❌ 「待 user 決定：TD-402 要用 A 還是 B？」— 決策要落 `awaiting[]` + HANDOFF `## ⏳ Awaiting Charles`，不是 chat 敘述（attended 下由 Step 2.7 用 `AskUserQuestion` 端出去問）
+- ❌ 「下一輪可推進：1. ... 2. ...」— 列選單讓 user 決定
+
+---
+
+## Step 0 — Mode detection、lock、continuous invocation
+
+```text
+$ARGUMENTS
+```
+
+### Runtime-neutral operation contract
+
+Every host must preserve the same scan, classification, ownership, approval, dispatch, notification, and state-write obligations. Use the host-provided file reader and question surface; attended mode may ask the user, while unattended mode packages decisions without asking. A single attended round may run when continuous execution is unavailable. Continuous or unattended execution is blocked unless the host provides a verified durable invocation and wakeup surface; never substitute the Claude runner or claim a generated artifact is a runner receipt.
+
+### Flags
+
+- `--unattended`（`runner.sh` 每輪固定帶）：**5-item cap**（避免 runaway）+ **禁止詢問操作；改走 decision packaging**。不帶時無 item cap，改由 Step 6 的 round cap / fingerprint 控制。cap 之內優先把**同一 Location／同一 skill** 的 item 併進同一輪；**NEVER** 為了湊滿 5 個把不相干的 item 拉進同一輪——cap 是上限不是配額（成本理由見 [run-modes.md](reference/run-modes.md) § unattended 的裝載準則與 runner-only flag 的理由）。
+- `--runner-child`（只由 `runner.sh` 帶）：模型可見的 runner child 身分 marker；`WORK_LOOP_RUNNER_CHILD=1` 是同一身分的機械補強。
+- `--linked-dispatch-mode foreground`（只由 `runner.sh` 帶）：runner child 內每一筆 decision-linked Pi dispatch 都是同輪 dependency，依 Step 1.5 的 foreground 契約執行；不帶時沿用一般 async watch protocol。
+- `--scan-helper-command <cmd>`／`--rotate-helper-command <cmd>`（只由 `runner.sh` 帶）：逐字等於 runner `--allowedTools` 放行的那兩條 Bash invocation。runner child 跑 scan／closedBloat rotate 時 **MUST** 逐字用這兩個值，**NEVER** 改用下文的 `${CLADE_HOME:-…}` 等價形狀——字面不同就不在 allowance 內，headless child 沒人能批准。
+- `--min-wakeup-seconds <n>`（僅 Claude runner adapter 參數）：本輪**每一個** `ScheduleWakeup` / `Monitor` 的 interval **MUST ≥ n**，**NEVER** 因為「這次只等一下下」用更短的值。不帶時各處原有的 interval 建議照舊。
+- 使用者說「自動推」「把待辦跑完」「持續做」「不要停」「無人值守」→ 等同要求 continuous（見下）。
+
+**沒有 `--turbo`。** 非 plan package 的待辦（HANDOFF / tech-debt / ROADMAP）是**預設 scope**，不需要任何 flag 開啟。
+
+### Iron Law：runner child 永遠只執行單輪
+
+`$ARGUMENTS` 含 `--runner-child`，**或**本 process 的 runner 身分是 `WORK_LOOP_RUNNER_CHILD=1` → 直接進 Step 1，執行一次 Step 1–7 後退出。**NEVER** 進入本 Step 後面的 continuous route 判定、**NEVER** 啟動 `runner.sh`、**NEVER** 呼叫 `/loop`。
+
+marker 有兩層是刻意的：prompt 裡的 `--runner-child` 讓模型必定看得見；env 身分讓 shell fixture 與診斷能機械驗證。任一層存在都已足以判定，**NEVER** 因另一層讀不到就把 child 當成直接呼叫。
+
+| Red Flag | 立即動作 |
+| --- | --- |
+| arguments 已有 `--runner-child`，卻正在比較「runner 還是 in-session」 | 停止 route；這就是 runner 已啟動的 child，直接跑單輪 |
+| 正要從 runner child 呼叫 `runner.sh` 或 `/loop` | 停止；完成本輪 Step 1–7 後退出 |
+
+### Iron Law：詢問操作的可用性由 mode 決定，不由 item 決定
+
+| 可觀察 predicate | 詢問操作 |
+| --- | --- |
+| `--unattended` 帶了，或本輪由同 runtime runner 起 | **NEVER 詢問。** 選不出來的一律走 Decision packaging 落 HANDOFF。 |
+| attended 且 host 有 structured question tool | 使用該 structured question tool；真的選不出來時 MUST 問。 |
+| attended 但 host 沒有 structured question tool | 使用當前對話提問；真的選不出來時 MUST 問。 |
+
+判不出自己在哪個 mode → 當作 unattended（保守側是不打斷不在場的人）。unattended 下任何形式的提問都禁止，重要 item 仍走 packaging，不得靜默 skip。
+
+### 兩種跑法 —— 無人值守優先選 runner
+
+無人值守只有在當前 host 有已驗證同 runtime runner 時才走 runner；Claude 的 `runner.sh` 每輪一個 `claude --print` process，Codex 無此入口時 continuous/unattended blocked，仍可做 attended 一輪；只想跑一兩輪或要邊看邊介入才用 in-session `/loop /work-loop`。
+
+**決定怎麼起這個 loop 時 MUST 先讀 [reference/run-modes.md](reference/run-modes.md)**。**NEVER** 因為「in-session 比較好觀察」就對長清單用 in-session 版——runner 每輪都留 log，觀察性沒有損失。
+
+### 開場佇列檢查（在 route 判定之前）
+
+route 表判定**之前** MUST 先讀 state 的 `awaiting[]` 長度——只讀這一個欄位，不做完整 re-hydrate（那是 Step 1 的事）：
+
+```bash
+node -e '
+const fs=require("fs");let s;
+try{ s=JSON.parse(fs.readFileSync(process.argv[1],"utf8")) }
+catch(e){ console.log(e.code==="ENOENT"?0:"STATE_CORRUPT"); process.exit(0) }
+console.log(Array.isArray(s.awaiting)?s.awaiting.length:"STATE_CORRUPT")
+' "$(git rev-parse --show-toplevel)/.clade/work-loop/state.json"
+```
+
+**只有 `ENOENT` 才是 0。** parse 失敗、或 `awaiting` 不是 array，一律回 `STATE_CORRUPT` —— **NEVER** 把它們也折成 `0`：折成 0 會讓損毀的 state 判成「佇列空」直接 route 到 runner，而 runner child 只跑 `(a) prune`，唯一的出列動作永遠不會執行。
+
+| 可觀察 predicate | 動作 |
+| --- | --- |
+| 回 `STATE_CORRUPT` | **STOP，NEVER 進 route 表。** 先走 Step 1 的 `STATE_CORRUPT` 還原程序 |
+| user 直接呼叫（非 `--unattended`、非 `--runner-child`）**且** `awaiting[]` 非空 | **NEVER route 到 runner。** 先在本 session 走 Step 2.7 (a)(b)(c) 清算並送達全部待答題；依 host 實際等待語義處理答案，未取得答案時不發 grant，獨立已授權工作仍依 Step 2.7 狀態表判定 |
+| 其餘（從 `/loop` 進來、`--unattended`、`--runner-child`） | 照 route 表，本步不動作 |
+
+清算是有界的，清完仍照 route 表與 headroom 判定決定待辦由誰承載。**NEVER** 拿「這個 session 快滿了」當跳過清算的理由，**也 NEVER** 把「runner 起跑時會印一行待答提示」當成出口；**NEVER** 拿清算論證「所以該用 in-session 跑待辦」。理由與證據邊界見 [run-modes.md](reference/run-modes.md) § 開場佇列檢查的理由。
+
+### Continuous invocation（hard rule）
+
+單次 `/work-loop` = 一輪 scan → 分類 → dispatch/packaging → 收割 → 寫狀態。**一輪不是完成。**
+
+- **直接呼叫**（非從 `/loop`、非 `--unattended`、非 `--runner-child`）→ **NEVER 自己跑完一輪就停**。先照下表 route 到承載這個 loop 的跑法，**NEVER** 無條件選 in-session：
+
+  | 可觀察 predicate | route 到 |
+  | --- | --- |
+  | user 訊息帶無人值守意圖（「自動推」「把待辦跑完」「持續做」「不要停」「無人值守」），**或** 本輪 scan 出的 candidate 多到一個 session 跑不完 | **同 runtime runner** —— 當前 host 無已驗證 runner 則標記 continuous blocked，保留 attended 步驟，形狀照 § 起 runner 的形狀與收尾契約 |
+  | user 明說只跑一兩輪、或要邊看邊介入 | 當前 turn 續跑；若 adapter 有已驗證 in-session continuation 才使用該 host 操作 |
+  | 判不出來 | **同 runtime runner** —— 當前 host 無已驗證 runner 則標記 continuous blocked，保留 attended 步驟；保守側是續航力，不是觀察便利 |
+
+  **route 判準是「這個 loop 要跑多久」，NEVER 是「哪個叫得比較順手」**（見 [run-modes.md](reference/run-modes.md) § 為什麼 in-session 版有天花板）。
+- **從 `/loop` 呼叫**（正常路徑）→ 每輪結束**先判「現在還有沒有事做」，再決定要不要排 wakeup**。**每一次**要排 wakeup 或結束 turn 之前 MUST 讀 [run-modes.md](reference/run-modes.md) § in-session `/loop` 的每輪收尾表，逐列判。
+
+  **Iron Law：durable 喚醒是「現在無事可做」的宣告，NEVER 是「這輪做夠了」的休息。** 每一次排 wakeup 之前 MUST 能指出 candidate list 裡**每一個** item 現在都動不了、以及動不了的具體理由（已完成 / 已 packaging / 已 escalated / 命中 skip 窮舉 / 在等某個具名 notification）。指不出來就是還有事做，**接著跑**。逐條反藉口見 [reference/guardrails.md](reference/guardrails.md) § D。
+
+- **「完成」的定義**：Step 6 的停止條件任一成立。**NEVER** 把「本輪無 actionable item」當成完成——那只代表這一輪 scan 沒新東西，user 答完一條 packaged 決策後下一輪就會有。
+
+### 開場 headroom 判定（在取鎖與 scan 之前）
+
+每次進入 loop 前先判斷本 session 是否仍有足夠 headroom。判定只決定承載方式，不改門檻、不跳過 scan、不宣稱完成。
+
+| 可觀察 predicate | 動作 |
+| --- | --- |
+| context budget 已達 soft/hard 警示，且當前 host 有已驗證同 runtime runner | 交給該 runtime adapter 啟動 runner，保留原 headroom gate；啟動與收尾依 adapter 契約。 |
+| context budget 已達警示，但當前 host 沒有已驗證同 runtime runner | continuous 部分 blocked；先保存 durable state、ownership 與當輪可驗收結果，保留可做的 attended 步驟，**NEVER** 起 Claude runner 或要求 user 代跑。 |
+| 尚未收到 budget 警示，或本輪由同 runtime runner/本 session 第一個工作段起 | 依序取鎖並進入開場准入與 scan。 |
+
+context 不足時不得先 scan 來湊工作、降低門檻、改寫停止條件或宣稱 complete。換載體是承載選擇，不是 skip；待辦與 ownership 必須留在 durable state。
+
+### 起 runner 的形狀與收尾契約
+
+route 表判到 `runner.sh` 之後（含 headroom 判定改判過去的那條），起跑與收尾**全部由主線扛完**：user 不需要自己跑任何指令、不需要輪詢進度、不需要來問它停了沒。
+
+**起 runner 之前、以及收到 runner 退出通知之後，MUST 先讀 [reference/run-modes.md](reference/run-modes.md) § 起 runner 的形狀與收尾契約。** (a) 起跑形狀、(b) 收尾回報契約、(c) 中止分類、(d) cache-keepalive heartbeat、(e) per-round Monitor 五條逐條都是 hard rule，**NEVER** 憑印象起跑——(a) 的 `nohup` 禁令與 (e) 的 Monitor arm 條件都是靜默失敗，起跑當下零異常訊號。runner child NEVER 讀這一段（Iron Law 已禁止 child 起 runner）。
+
+### 開場准入判定（headroom 之後、取鎖與 scan 之前；**每一輪**都跑，含 runner child 的每一輪，不是只有第一輪）
+
+跑 `node "${CLADE_HOME:-$HOME/offline/clade}/vendor/scripts/work-loop-verdict.ts" --repo "$(git rev-parse --show-toplevel)"`（attended 加 `--attended`），讀 `admission.mode` 一欄分流：
+
+| `admission.mode` | 動作 |
+| --- | --- |
+| `harvest-only` | **准入**（`inFlight` 非空 = 有收割工作），本表其餘列不再判 |
+| `normal` | 准入，照常取鎖進 Step 1 |
+| `harvest-only`（`debtReady` 已 0） | 准入，但本輪**只做收割**：有 worker 回報了 outcome 而沒人收。**NEVER** 因為「債已經 0 了」就當成收工 |
+| `drain-only` | 准入，但本輪只做 Step 2.7 清算，**NEVER** dispatch 新工作 |
+| `refused` 且 `admission.stoppedReason` 非 null | **不准入**。把該值寫進 state `stoppedReason`（走 Step 7.3 正常寫入路徑，允許只寫這一個欄位），**NEVER 取鎖、NEVER 跑 scan**，結束本輪 |
+| `refused` 且 `admission.stoppedReason` 為 null | helper 自己失敗了，**不是** debtReady=0。與 Step 2 scan 失敗同級：STOP，結束本輪，**NEVER** 寫任何 `stoppedReason` |
+
+**准入這一題由 verdict 判，不由你判。** 覺得它判錯 → **停下來把 `admission.reason` 逐字回報**，**NEVER** 自己重算一次 `debtReady`、**NEVER** 因為「掃一輪就知道了」先取鎖再說。
+
+**不准入是收工，NEVER 是 skip**。**NEVER** 把「缺 `### 自驗` heading」讀成不准入。回報措辭 MUST 是「**無可推進的債**（debtReady 0），需 attended 補彈藥或等 audit / digest signal」，**NEVER** 回報成「待辦已推完」。**NEVER 為了讓 `debtReady >= 1` 而登記新 TD**、**NEVER 用「掃一輪看看」繞過本節**、**不准入時 NEVER 排長間隔 wakeup**——`debtReady == 0` 的定義、實測案例與四條的依據見 [reference/productivity-gate.md](reference/productivity-gate.md) § 准入。
+
+### 互斥鎖
+
+單輪可能耗時數小時，無鎖會讓下一次觸發疊上第二輪。進 Step 1 前 **MUST** 跑：
+
+```bash
+node "${CLADE_HOME:-$HOME/offline/clade}/vendor/scripts/work-loop-lock.ts" acquire
+```
+
+| exit | 輸出 | 動作 |
+| --- | --- | --- |
+| 0 | `acquired` / `took-over` / `reentrant` / `continued` ＋ `WORK_LOOP_SESSION_ID=<id>` | 把 `<id>` 記進 state 的 `lockSessionId`，進 Step 1 |
+| 3 | `work-loop already running (…)` | **逐字照抄那一行輸出後結束本輪**，不做任何其他事 |
+| 1 | `error: …` | 與 Step 2 scan 失敗同級：STOP，直接結束本輪 |
+
+**Iron Law：鎖檔只由這支 script 讀寫。違反字面就是違反精神**——「用 Write tool 補一個就好」「script 跑不動先手寫一個」都不算遵守。
+
+- **heartbeat**：**每一次**寫 `.clade/work-loop/state.json` 的同時都 MUST 跑 `node "${CLADE_HOME:-$HOME/offline/clade}/vendor/scripts/work-loop-lock.ts" refresh --session <id>`（Step 1 / Step 5 **每一次**收割 / Step 7 各一次，不是只在 Step 7 刷）。窗口 45 分鐘
+- **釋放**：正常 terminal / attended reconciliation 才 MUST 跑 `node "${CLADE_HOME:-$HOME/offline/clade}/vendor/scripts/work-loop-lock.ts" release --session <id>`；in-flight ledger > 0 或 runner orphan quarantine 期間 **NEVER** 釋放。只有 attended 將每筆 ownership 標成 terminal/cancelled、清空 `inFlight`，再移除 marker 並 release lock（marker 與 lease 的分工見 [lock.md](reference/lock.md) § 釋放與 orphan quarantine）。
+- **Budget 計數器歸零（定義「一次 run」的唯一位置）**：`acquire` 回 `acquired` 或 `took-over` = **一次新的 run 開始** → 本輪 Step 7 寫 state 時 MUST 把 `subagentsSpawned` **歸零重新起算**；回 `reentrant` 或 `continued` = 同一個 run 續跑 → **沿用**既有值，**NEVER** 歸零。**`continued` 是 runner 模式的常態**（第 2 輪起每一輪都回它），**NEVER 讀成 `took-over`**；**改動 `subagentsSpawned` 歸零時機前 MUST 先讀 [reference/lock.md](reference/lock.md)**。
+
+**NEVER 用 Write tool、`printf`、`echo` 或任何其他方式手寫鎖檔。** 手寫的鎖沒有 session 識別也沒有 heartbeat，判準當場退回它要修的那個狀態：
+
+| 逐字實錄的開脫 | 實際 |
+| --- | --- |
+| 「sandbox 擋掉 `$$`，用 Write tool 補一個鎖檔就好」（round 33） | 手寫的鎖第一行是**已結束的那個 Bash call 的 pid**，寫進去的當下就是死的 |
+| 「pid 欄填 0 或哨兵值，反正判準會走 DEAD 分支」（round 30 / 36） | 那正是「鎖從未擋過任何一次」的成因，不是它的解法 |
+| 「這支 script 在這個 repo 找不到，先跳過鎖」 | 找不到 = 路徑打錯。先 `ls ${CLADE_HOME:-$HOME/offline/clade}/vendor/scripts/work-loop-lock.ts` 確認，**NEVER** 無鎖開跑 |
+
+**Red Flag**：正要對 `.clade/work-loop/lock` 下 Write / Edit / `printf` / `echo` —— 停手，回到上面那條指令。
+
+宣布模式一句話後進 Step 1。
+
+---
+
+## Step 1 — State re-hydrate（durable execution，每輪必做）
+
+**Iron Law：每一輪開頭 MUST 從 `.clade/work-loop/state.json` 重建狀態，NEVER 依賴對話記憶。** 主線 context 會被 auto-compaction 壓縮，壓掉的第一批就是「上一輪做了什麼」。
+
+```bash
+STATE="$(git rev-parse --show-toplevel)/.clade/work-loop/state.json"
+if [ ! -f "$STATE" ]; then
+  echo '{}'                                    # 真的第一輪
+elif node -e 'JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"))' "$STATE"; then
+  cat "$STATE"
+else
+  echo 'STATE_CORRUPT'; ls -la "$STATE" "$STATE.bak" 2>&1   # 走下面的還原程序
+fi
+```
+
+**檔案不存在** → 這是第 1 輪，用 `{round: 0}` 起手，Step 7 建檔。
+
+**`STATE_CORRUPT` NEVER 當成 `{}` 處理。** 讀到 `STATE_CORRUPT` 時 **MUST 先讀 [state-write.md](reference/state-write.md) § 讀取端 `STATE_CORRUPT` 的三步還原程序** 並照做——`.bak` 可用與不可用各自的處置、何時停下來回報 user 都只寫在那一節。
+
+**欄位 schema 與語義只寫在 [state-write.md](reference/state-write.md) § schema 範例與欄位語義，主檔不另存一份。** 寫入或判讀 `notes`／`awaiting`／`packaged`／`refused`／`decisions`／`blockers` 任一欄、寫任何不在 schema 內的自創欄位、讀到 `⟨截斷 …⟩` 標記、或 writer 在 stderr 印 `STATE_OVERSIZE` 時 **MUST** 讀它——`notes` 的型別與寫法、`awaiting`／`packaged`／`refused`／`decisions` 四者的關係與各自的唯一寫入時機、retention、自創欄位的收斂義務都在那一節。`blockers` 指紋表的語義在 [reference/blocker-ledger.md](reference/blocker-ledger.md)。
+
+**Dispatch lifecycle rehydrate（每輪 MUST）**：逐筆檢查 `inFlight`。`dispatching + taskId:null` 代表 process 可能死在 dispatch 回傳前，進 reconciliation / intervention，**NEVER** 自動重派或當 notification-only job；`dispatch-failed` 移出 in-flight 並按 failure packaging；Bash owner 的 `pending` MUST 有真實 taskId；notification-only `pending` MUST 有可由 `host owner cancellation operation` 操作的 owner ref 與 deadline。任何 schema 不完整條目 fail-closed 保留 ownership，先修 state 再 dispatch。
+
+**`failStreak` / `escalated` / `refused` 的來源是本檔，NEVER 是 HANDOFF 的 marker 段。** HANDOFF 段是**人讀輸出**——它可能被人手動編輯、被 rotate 搬走、被別的 skill 覆寫。狀態只認 state 檔。
+
+**Escalated 離場規則**（對 `escalated` 每一條逐項判定，兩條 predicate 任一成立＝已有人介入，streak 歸零、移出 escalated）：
+
+- 該 item 不再出現在本輪 scan（已 archive / 已刪除 / 已勾 `[x]`）
+- 該 item 本輪狀態 ≠ escalated 條目記錄的狀態（已被推動）
+
+兩條都不成立 → 續留 escalated（本輪**不 dispatch**），Step 7 原樣 re-emit。
+
+### Decay 偵測（hard gate，先判身分再判 decay）
+
+觸發訊號只有一個：`guardrailsAck` 讀不到。**MUST** 依下表分流，**每一列**都要照著判，不是只看第一列：
+
+| 代號 | 可觀察 predicate | 動作 |
+| --- | --- | --- |
+| **D4** | **HANDOFF 寫入失敗**——Step 7.2 的 `## ⏳ Awaiting Charles` 收尾寫入失敗 | 中止本輪（release lock、退出），照 [decay.md](reference/decay.md) 的部分寫入白名單落檔。**D4 命中時壓過其餘各列**：同時命中 D5 一律以 D4 為準 |
+| **D5** | runner child，`guardrailsAck` 讀不到 | **NEVER 判 decay**。那是第 1 輪、或 state 檔不完整；照常進 Step 1.5，讀完在 Step 7 補寫 `guardrailsAck`。與 D4 同時命中則以 D4 為準 |
+| **D6** | **非** runner child（in-session `/loop`），任一訊號命中 | 判定 context decayed，**MUST** 結束本輪：state 寫 `roundEndReason: "context-decay"`、跑 `work-loop-lock.ts release --session <id>`、退出。**NEVER**「感覺還記得」就繼續跑。**但下列不算訊號命中**（那是首輪的正常長相，不是 decay）：state 檔不存在或 `round` 為 0 |
+
+**D4 命中、或要改動 D4–D6 任一列之前，MUST 先讀 [reference/decay.md](reference/decay.md)**。**NEVER** 在沒讀白名單的情況下走 D4 路徑：它與 Step 7.2 的「寫入失敗時 NEVER 繼續寫 7.3」只差在寫哪兩個欄位，寫錯就是謊報進度。
+
+## Step 1.5 — Guardrails re-read（hard rule，dispatch 前）
+
+**MUST Read [reference/guardrails.md](reference/guardrails.md) —— 每一輪都讀，不是只在第 1 輪讀。** **NEVER** 因為「我這輪還記得護欄」「上一輪剛讀過」「這輪只做一個小 item」跳過——compaction 抹掉時不會通知你。讀完把 `guardrailsAck` 更新為當前 ISO 時間（Step 7 落檔）。
+
+### Routing re-read（同一輪，同樣 hard rule）
+
+**每一輪** dispatch 前 **MUST** 一併讀 [[agent-routing]] 的 § 派不派（先於派給誰）、§ Routing Table、§ Claude 委派的 model 檔位。三條在 loop 路徑上最常滑掉的：
+
+- **主線自己動手也要過 Routing Table**。mechanical fan-out 與 read-heavy 兩列的觸發條件**不限於委派**：準備自己跑 ≥3 條唯讀指令、或自己讀 ≥5 個檔／>500 行長文件，就已經命中 → 派 `--model gemini --effort high`。**NEVER** 因「順手跑掉比較快」略過查表
+- **原判 Claude `sonnet`／`haiku` 等級的委派 MUST 走 delegate-sub 鏈**：`--model grok-xai --effort xhigh` → 鏈尾（readonly 交 `dispatch-fallback`、mutation 交 `sonnet-implementer`）；Grok 品質不合格升一次 `sonnet-implementer`。Haiku 與 Sonnet 5 以下已禁用，`general-purpose`＋`model: sonnet` 不是合格載體，准入判準見該 §
+- **每一次 dispatch MUST 帶 `--route` 與 `--tier-basis`**（各缺就 exit 1），重試帶 `--retry-of <label>`。**NEVER** 不確定就填 `manual`／`table-row`——兩者都與「判定根本沒發生」事後不可區分。宣告與實際檔位矛盾時 dispatcher 直接 exit 1，**NEVER** 改宣告去遷就已經打好的 `--model`
+
+### Runner child 的 decision-linked dispatch（同輪 foreground dependency）
+
+runner child（`--runner-child --linked-dispatch-mode foreground` 或 `WORK_LOOP_RUNNER_CHILD=1`）遇 routing gate 阻擋 Read / Bash 並回傳 `decision_id` 時，該 dispatch 是本輪繼續執行的前置：**MUST 先讀 [run-modes.md](reference/run-modes.md) § Runner child 的 decision-linked dispatch** 照 foreground 形狀執行。**NEVER** 在 runner child 對 decision-linked dispatch 使用 `run_in_background=true`。非 runner child 沿用 [[agent-routing.pi-watch-protocol]] 的 async watch protocol。
+
+---
+
+## Step 2 — Scan
+
+```bash
+# runner child MUST 從 $ARGUMENTS 的 --scan-helper-command 取完整命令並逐字執行；那是
+# runner.sh --allowedTools 放行的 Bash invocation（scan helper；closedBloat rotate 同理取 --rotate-helper-command）。命令以 cwd 推導 repo，故不得把 repo
+# path（尤其含空白、引號或換行）插進 prompt / allowance。非 runner child 才用下列等價形狀。
+node "${CLADE_HOME:-$HOME/offline/clade}/vendor/scripts/work-loop-scan.ts"
+# 需求來源由下方 § 需求來源查詢 的 carrier 掃描與 flow status 讀取。
+```
+
+任何 `WORK_LOOP_SCAN_MISMATCH` / `WORK_LOOP_SCAN_MALFORMED` / nonzero 都視為 scan 失敗，既有 latest 不得被覆蓋（原子邊界見 [run-modes.md](reference/run-modes.md) § scan helper 的原子邊界）。
+
+**同一輪內 NEVER 為了「找不到上一份輸出」重跑 scan**：要回頭看就讀 `scan-latest.json`，只要摘要就跑 `node "${CLADE_HOME:-$HOME/offline/clade}/vendor/scripts/work-loop-summary.ts"`。本輪合法的重跑**只有兩個**時機：① `tech-debt-closed-bloat` warn 時跑完 `rotate-closed-bloat.ts` 之後；② Step 5 收割後的 re-scan。**NEVER 因此改成「N 輪跑一次」**：scan 是路由輸入，跳過的那一輪是盲跑。
+
+**失敗 fallback**：script 不存在或回 error、**或 `SCAN-MISMATCH` / `MISSING`** → **STOP**，寫 HANDOFF 一行 `work-loop: scan failed at <ISO>`，跑 `work-loop-lock.ts release --session <id>` 後結束。**NEVER** 憑記憶或 HANDOFF 既有 narrative 猜待辦狀態。
+
+### 需求來源查詢
+
+本輪 `scan-latest.json` 的 `plans` 欄位已由 scan helper 取得（掃 `specs/plans/*/tasks.md` 與 `tasks/*.md` 的未勾項，並對照 `flow status --json` 的卡片狀態），後續沿用這份 inventory。runner child 不另起 Bash list 命令。互動模式單獨查詢時可執行 `node vendor/scripts/flow/flow.ts status --json`（consumer 是 `.clade/vendor/scripts/flow/flow.ts`）。讀取失敗（JSON 解析不了、路徑權限）**MUST** 記錄具體錯誤並走補件，**NEVER** 當作空清單。
+
+### 單一 candidate list，兩種 source
+
+| source | 來自 | 進 Step 3 走哪條 |
+| --- | --- | --- |
+| `plans` | `specs/plans/*/tasks.md` 與 `tasks/*.md` 的未勾項（依 carrier 路徑去重）；人工 gate 由 `reviewGuiReadiness`（`flow gates`）補 | § 3.1a carrier 接續 |
+| `handoff` / `techdebt` / `roadmap` | `HANDOFF.md` 待辦段、`techDebtHygiene.raw`、repo 根目錄 `ROADMAP.md` | § 3.1b 分類表 |
+
+另含 `worktreeStash`。**讀 `handoff`／`techdebt`／`roadmap`／`worktreeStash` source、要跑 `--run-selfverify`、或 `tech-debt-closed-bloat` 為 warn 時 MUST 先讀 [non-plan-dispatch.md](reference/non-plan-dispatch.md) § Step 2 各 source 的掃描細節**——各 source 掃哪些段、tech-debt 主檔的讀法與優先序、`--run-selfverify` 必帶的旗標、unattended 下 `blocked-attended-only` 的處置、closedBloat rotate 的跑法都只寫在那一節，主檔不另存一份。
+
+**Consumer filter**：只處理 `consumerId` = 當前 repo 的 entries。**Carrier association**：非 `plans` source 的 candidate 若文字命中某個 active carrier 的 slug（word boundary match，非 substring）→ 改判為 `plans` source 走 3.1a。細節見 [reference/non-plan-dispatch.md](reference/non-plan-dispatch.md) § Carrier association。
+
+**In-flight filter（防單 item 雙派）**：已有對應 worktree 的 item **不一定跳過**，先查 `.clade/claims/` 的 session claim 鮮度——active claim < 30min 才跳過；claim > 2h 或無 claim 視為可接手。**每一個** dispatch 前都要對照，不是只在開場檢查一次。
+
+**排除**：state 的 `packaged` 已有 timestamp、`refused` ledger 已有相同 id / scope、或 `escalated` 未離場的 item，本輪跳過。`refused` 只排除被拒 scope，不阻塞其他 candidate；user 明確改變決定時才移除該 ledger entry。
+
+---
+
+## Step 2.5 — 工具健檢（分類前，每一輪都跑）
+
+**Iron Law：探針 MUST 是實跑一次，NEVER 是 `[ -f ]` / `command -v` / 「檔案在就算活」。** 分類之前先實跑一次，死掉的組直接標不可用——**NEVER** 派 worktree 進去「看看能不能跑」。
+
+對本輪 candidate list 會用到的每一組各跑一次（沒有 item 落在該組就跳過該列）：
+
+| 組 | 探針 | 判活 |
+| --- | --- | --- |
+| dev-port | `node scripts/dev-session.ts status`（無此檔改 `dev-singleton.ts`） | exit 0 |
+| main | `node scripts/wt-helper.ts list`（**產地 clade home 在 `vendor/scripts/wt-helper.ts`** —— `scripts/` 是投影側路徑） | exit 0 |
+| 扇出 | 同上（`wt` 靠 wt-helper 建 worktree） | exit 0 |
+| 需求 item 存在時 | `node vendor/scripts/flow/flow.ts status --json` | exit 0、JSON 可解析；來源狀態依 Step 2 判讀 |
+
+**任一探針回非 0 → MUST 讀 [run-modes.md](reference/run-modes.md) § 工具健檢（Step 2.5）探針非 0 的處置，照那一節的四步做完，缺一不可。** 探針路徑怎麼先確認、該組怎麼標、該組 item 的去向、修法落在別的 repo 時怎麼辦，都只寫在那一節。
+
+---
+
+## Step 2.7 — 開場決策清算（每一輪都跑）
+
+**MUST 先完整讀 [reference/decision-drain.md](reference/decision-drain.md) 再執行**——每一輪都讀，不是只在第 1 輪讀。(a) Prune／(b) Ask／(c) Record 三步、(a2) open TD 判準與 grant 契約都在那份。
+
+Iron Law（attended 先送達待答題、再依依賴範圍開工）、Mode 分岔（attended 與 unattended／runner 各跑哪幾步、判不出 mode 時怎麼當）、以及「佇列非空不是停 loop 的理由」的判準本體都在那份的同名節，主檔不另存一份。
+
+主檔只補那份沒有的一條：attended 清算完**接著逐條重量 `blockers` 的 predicate**（[blocker-ledger.md](reference/blocker-ledger.md) § 清 ledger 是正當工作）。
+
+---
+
+## Step 3 — 分類與自主判定
+
+**每一個** candidate 都 MUST 走完三步（3.1 分類 → 3.2 自主判定 → 3.3 分組），不是只對前幾條。
+
+### 3.1a 需求 source — carrier 接續
+
+每一筆需求依本表接續，執行入口統一為交 `wt` 建立隔離環境並在樹內續跑 `/implement`。
+
+| 可觀察狀態 | 動作與出口 |
+| --- | --- |
+| carrier 與 flow 卡都在、`tasks.md` 有未勾 phase | 交 `wt` 建立隔離環境並在樹內續跑 `/implement`：讀 carrier → 執行下一個未勾 phase → 收 evidence → 回寫 checkbox。依原本風險政策完成 BDD 與獨立審查。 |
+| carrier 在但沒有 flow 卡（開樹時沒帶 `--origin`） | 先 `flow open <slug> --origin tasks:<carrier 路徑>` 補卡並 `export CLADE_WORK_ID`，再照上一列接續。**NEVER** 為同一個 carrier 開第二張卡。 |
+| 有 feedback／stale evidence／待 agent 驗證或討論 | 先處理每一項 agent 可做的工作、提交當前 revision 收據並重新 project；全部清除後才能呈現待人驗收。 |
+| 當前 evidence 與人的 gate 全通過，任務包含收尾 | 標 `work.done`；依 checkout workflow 合回並走 `/commit`，產品碼與 carrier 一起落地，再回讀證據。 |
+| 實作或驗收受阻 | 先讀 [blocker-ledger.md](reference/blocker-ledger.md) 查表，再診斷並補件；需人裁決才走 Decision packaging。 |
+| carrier 的 `## 人工檢查` 區格式錯誤 | 先跑 `manual-review-check.sh <slug>` 讀 violation，修 carrier 後重驗，**NEVER** 直接勾寫繞過。 |
+
+**MUST** 保留每一筆 legacy 未完需求，直到有可回讀的承接關係或明確處置。**NEVER** 呼叫 Spectra writer、unpark 或用修改歷史 checkbox 代替接續。`flow gates` 有卡只代表那一題等人；仍有 feedback、stale evidence 或 agent 可處理項時，先修復並重驗，不能因為有卡就把整件工作交回給人。實作未完的大小或進度不構成略過理由。
+
+### 3.1b 非 plan source — 分類表
+
+**MUST Read [reference/non-plan-dispatch.md](reference/non-plan-dispatch.md)** 取分類表（code task / investigation / blocked / 模糊）與 **skip 合法理由窮舉 3 條 + 7 條不合法藉口逐字實錄**。**NEVER** 自創第 4 條 skip 理由。分類為 blocked 的 candidate **先過 [blocker-ledger.md](reference/blocker-ledger.md) 三步查表**，沒命中才逐條診斷。
+
+### 3.2 自主判定（七條 AND）
+
+**MUST Read [reference/autonomy-predicate.md](reference/autonomy-predicate.md)** 取判定表與 packaging SOP。摘要：七條全成立 → 自主做；任一不成立 → **decision packaging**（不是 skip）。**NEVER** 把「不確定能不能自主」當成「必須等人」——判不出來時先跑唯讀調查補齊事實再重判（該檔 § 判不出來時的三步）。
+
+### 3.3 分組
+
+**MUST Read [reference/dispatch-topology.md](reference/dispatch-topology.md)**。四組併發契約（扇出 ≤4 / dev-port 1 / main 1 / 主線即時）對**兩種 source 一視同仁**，**每一個** item 都要落進其中一組。`plans` item 與非 `plans` item 共用同一個扇出上限，不是各自一套。
+
+---
+
+## Step 4 — 執行
+
+執行模型（**不是**單一佇列逐一取）：
+
+1. **先把扇出組填到 4 個 in-flight**（各自交 `wt` 開 worktree）
+2. **主線接著推進序列組**：main 組（archive/commit/push）→ dev-port 組（evidence，取得 lease 後仍交 `wt`）→ 主線即時組（investigation / blocker 評估 / 單檔文字改動，主線自己做）
+3. **收到 `<task-notification>` 或 host completion notification** → 走 Step 5 收割 → 從扇出組補一個新 dispatch
+4. 每完成一個 item，**立即** commit + 重跑 scan 更新狀態
+
+同一個 item 的步驟之間序列；**不同 item 之間沒有依賴**，NEVER 讓 B 等 A 完成。
+
+### Runner child 的 background ownership（hard rule）
+
+runner child 一旦建立任何 background task（含 `host background dispatch operation`），**同一個 `claude --print` process MUST 留著直到 terminal harvest**：立刻以 `host bounded completion wait` 等待；timeout 只代表本次等待窗結束，照全域長等待規則再次 block，直到收到 terminal completion / failure，再依 Step 5 收割並從 `inFlight` 移除。
+
+`inFlight` 非空時，item cap、turn cap、budget proxy 與「等待 notification」都**只能停止新 dispatch**，NEVER 輸出 final text、釋放 lock 或退出 process。**同一 process 收割完成**壓過所有收輪 cap；不得把 taskId 留給下一個 runner child。runner.sh 另有 mechanical fail-closed（見 [run-modes.md](reference/run-modes.md) § runner.sh 的 inFlight mechanical fail-closed），它只防 orphan 擴大，不取代本節契約。
+
+### 4a. 自主 item → dispatch
+
+- 要改 tracked code → 交 `wt` 建立隔離環境並派出 brief（扇出組，**≤4 in-flight**；這個 4 綁的是「**每個 worker 各自 worktree**」，**NEVER** 套到共享 working tree 的 dispatch 上，那條上限是 2）
+- plan package 的實作 → 交 `wt` 建立隔離環境並在樹內續跑 `/implement`
+- 純唯讀調查 / 單檔文字改動 → 主線即時組（read-heavy 者先過 [dispatch-topology.md](reference/dispatch-topology.md) § 主線即時組的 pre-scan 前置判定派 pi，主線消費 report）
+- 記進 state 的 `inFlight`，`subagentsSpawned` +1
+
+上面三條假設 `wt` 在本 repo 叫得動，而那個假設在**產地（clade home）不成立**。開工前判一次：
+
+| 可觀察 predicate | dispatch 形狀 |
+| --- | --- |
+| `ls .claude/skills/wt` 存在，**或** `jq -r '.enabledPlugins' .claude/settings.json` 不是 `none` | 照上面三條走，扇出組 ≤4 in-flight |
+| 兩者皆不成立 | **主線自己進 worktree**，扇出組併發降為 **1**。**MUST 先完整讀 [no-wt-dispatch.md](reference/no-wt-dispatch.md)** —— 那份的第 4b 步（`merge-back` 只 stage 不 commit；落地走 `/commit`，白名單才 `--only`）漏掉會讓整份工作停在 index 裡 |
+
+兩格都不是 skip：「工具叫不動」不在 § Skip 合法理由窮舉 的 3 條之內。
+
+**每一個**交 `wt` 派出的 brief **MUST 逐字內嵌** [guardrails.md](reference/guardrails.md) § C 的護欄區塊。**NEVER** 只寫「照護欄做」這種 by-reference 指示。
+
+**NEVER 因 size / progress 跳過 dispatch**：實作未完的 carrier 不管進度 0% 或工作看起來多大，MUST dispatch。「需要完整 session」「不適合 loop」都是違規。
+
+### 4b. 本輪承載不了的 item → 出口分流（dispatch 是 default，登記是付費 fallback）
+
+**每一個**收輪時仍非 completed 且不在 `inFlight` 的 item（含 turn cap 擠出的自主 item）都 MUST 過下表，依序判、first-match，**不是只處理最後一個**：
+
+| 條件（依序判） | 動作 |
+| --- | --- |
+| 殘工 <15 分鐘 | 本輪做完，不落任何檔（turn cap 為此 +0 不 +1） |
+| 需要 Charles 拍板（過不了自主判定七條 AND） | **packaging**——照下方既有 Packaging SOP 全文執行（唯一免費的登記） |
+| 需要 attended / permission gate（publish、`.claude/**`） | attended 佇列（`tasks/` 既有形狀，一檔一條） |
+| 可執行，且 context 可 durable 化成 ≤5K thin brief | **裸 dispatch**（default 出口）：`herdr-session-handoff.ts --cwd <main-checkout> --label <描述性 label> --prompt-file <brief> --model <slug> --effort <level> --route <policy> --tier-basis <conclusion>`，**不帶 `--relay`、不帶 `--coordinate`**。brief 紀律照 [[session-tasks.operations]] § Herdr session transport |
+| 等具體外部 signal | 有 `specs/truth/work-lifecycle.md` → `flow plan open` ＋ **可觀察 signal predicate**。未遷移 consumer 才寫 TD ＋ `wontfix-until-signal`。寫不出 predicate 就不准用本格——那是等待區，不是掩埋場 |
+| 以上皆非（context 無法 durable 化） | 有 `specs/truth/work-lifecycle.md` → `flow plan open`，**NEVER** 新 TD。未遷移 consumer 才 TD 登記，**MUST 同 commit 附 `### Restart brief` 段**：檔案路徑、指令、驗收 predicate、已排除方案。heading 逐字 `### Restart brief`（`####` 亦可），**NEVER** 寫成 `**Restart brief**` 粗體或 `## `（前者不是 heading、後者被 TD parser 當成新 entry 的起點）。`audit-tech-debt-hygiene` 的 Invariant 13 只對未遷移 consumer fail-loud；plan-truth repo 的舊 `docs/tech-debt.md` 是 read-only legacy carrier，該 invariant retired。 |
+
+**Iron Law：登記之前先問「這條為什麼不能現在 dispatch」。違反字面就是違反精神**——「登記比較快」「brief 明天再補」「反正 HANDOFF 會有人看」都不成立：Restart brief 的內容就是 thin brief 的內容，寫得出來的當下 dispatch 幾乎恆優於登記。
+
+**runner NEVER 走 `/handoff` 的任何 arg**（`park`／`relay`／`fanout`／`next` 全部以本 session 收工結束，round 結束不是收工）。逐字反開脫：「反正 relay 也是派出去」「派完這輪就結束了」。這條禁的是「交位置」，不是「並行」——**NEVER** 從「不准 relay」推出「runner 不能並行」。要在 runner 底下並行、或有人主張 relay／fanout 也算派出時 **MUST 讀 [run-modes.md](reference/run-modes.md) § runner 為什麼不走 `/handoff`、並行走哪個載體**。
+
+**dispatch 的三個不准**：探索型（結論仍依賴本 session 判斷鏈、brief 落不下來）NEVER dispatch——先把判斷落盤，落不了走登記；需 attended gate 的 NEVER dispatch——新 session 一樣 blocked；**共享同一 working tree 的並行 dispatch 已 ≥2 條時 NEVER 再發**——排入下一輪。這個 2 綁「**共用一棵 working tree**」，**NEVER** 讀成全域併發上限，判的時候先問「這幾條 dispatch 共用一棵樹嗎」（見 [dispatch-topology.md](reference/dispatch-topology.md) § 併發上限是兩個，按載體選）。
+
+#### Packaging SOP（「需要拍板」那格的執行內容；本體不動）
+
+**NEVER log + skip。** 依 [autonomy-predicate.md](reference/autonomy-predicate.md) § Packaging SOP 做三件事（蒐證 → 抽 startable 子集先做掉 → 寫 2–3 個排序選項進 HANDOFF `## ⏳ Awaiting Charles`），完成後**同步**寫進 state 的 `awaiting[]`（完整條目：`id` / `title` / `blocker` / `startableDone` / `options` / `rationale` / `nextStep` / `packagedAt` / `round`）與 `packaged`（id → ISO 投影）。
+
+**`awaiting[]` 是 Step 2.7 清算的唯一輸入。** 只寫 HANDOFF 不寫 `awaiting[]` = 這條決策永遠不會被端到 Charles 面前——**NEVER** 只寫其中一邊。**packaging 本身算合法進度**——它會改變 fingerprint，Step 6 不會誤判成空轉。
+
+attended mode 且真的選不出來 → 依 Step 0 Iron Law **MUST `AskUserQuestion`**；unattended / runner → packaging，**NEVER** 呼叫。
+
+### 4c. Dispatch 共通規則
+
+- **Lifecycle 兩階段綁定（MUST）**：dispatch 前先把 intent 寫入 state：`inFlight={agent,item,dispatchedAt,taskId:null,owner,deadline,lifecycle:"dispatching"}`。`host background dispatch operation` 回傳後，**同一 assistant turn** 原子綁定真實 `taskId`、確認 owner / deadline、改 `lifecycle:"pending"`，再 arm `ASYNC_KEEPALIVE_CONTROL`。dispatch 失敗則移除 intent或標 `lifecycle:"dispatch-failed"`，**NEVER** 留下假 ownership。無 task id 的 Agent / Monitor / Workflow 保留 `taskId:null`，但 MUST 寫可由 `host owner cancellation operation` 操作的 owner ref 與 deadline，並 arm 逐字填 `task=none` 的 `ASYNC_KEEPALIVE_CONTROL`。Pi pre-scan owner 固定 `pi-watch`。
+- **Per-item task 追蹤（MUST）**：每條 dispatch item MUST 先 `TaskCreate`（subject 用 `<item>: <狀態> → <動作>`），dispatch 時標 `in_progress`，完成/skip/blocked 立即標 `completed`。**NEVER** 只建概括性收割 task
+- **Dev server 協調**：evidence collection 需要 dev server 時**主線自行協調**，**NEVER** 把 port 被佔當 user 協調事項跳過。池滿時先跑 `wt-helper reclaim-stale`（指令見 [[wt]] 的 `wt-helper指令.md`「維護」段；三層機械判定：stale 自動釋放 dev-port record → live 不動 → unknown 才問 user / packaging），reclaim 後仍滿才進人工分流
+- **Workflow model 感知**（archive 後 push 前 MUST）：讀 `${CLADE_HOME:-$HOME/offline/clade}/registry/consumers.json` 的 `workflow_model`——`trunk-based` 直接 push；`pr-merge-based` **NEVER 直推 main**，改 push feature branch + `gh pr create --fill`；查不到當 `pr-merge-based` 保守處理
+- **Commit 紀律**：每個 item 保存 scoped checkpoint；主線驗收並登記就緒，4 件 distinct work id 批次跑一次完整 `/commit`（0-A + `Via: /commit`），正式 commits 仍按功能分組。手動要求無最低件數，dependency／drained／stop 提前結批。**NEVER** 用 work-loop 當跳過 `/commit` 的理由。卡人工檢查 → packaging。登記及清理必讀 commit skill 的 `batch.md`；worker checkpoint 見 [guardrails.md](reference/guardrails.md) § C
+- **Error handling**：
+  - **Dispatch failure**（skill 報錯 / infra 不可達）→ log + skip + `failStreak` +1，繼續下一個
+  - **Fixable issue found during dispatch**（E2E selector bug / guard 漏路徑 / annotation drift / test assertion 要更新）→ **MUST 就地修 → 重跑 → re-scan → 繼續**，**NEVER** 當成 dispatch failure skip。判準：「我能在當前 session 用 Edit + Bash 修好嗎？」是 → 就地修
+  - `failStreak` ≥3 → 移進 state 的 `escalated`，下一輪起不再 dispatch
+  - **pi pre-scan 的 exit 2 / 3 / 4 NEVER 記入 `failStreak` / `consecutiveDispatchFailures`**（分流見 [dispatch-topology.md](reference/dispatch-topology.md) § pre-scan 的 exit code 分流）
+
+---
+
+## Step 5 — 收割（每個 notification 到達時做，不是階段）
+
+收割跟 dispatch 交錯進行，**不是** dispatch 全部結束後才開始的階段。收完從扇出組補一個 dispatch，再回主線的序列組工作。
+
+**每一個** host completion notification 到達時 **MUST 先完整讀 [reference/harvest.md](reference/harvest.md)** 走它的 8 步 SOP 與 lifecycle waiting protocol。deadline 到達只進 `cancelling` / intervention：先停 wakeup、依 owner 用 `TaskStop` 或原生 cancel protocol，並等待 terminal confirmation；terminal 前保留 ledger 與 lock，**NEVER** 記 fail-streak、移除 ownership、重派或收割。
+
+只有 terminal completion / failure notification 且 task-id claim 成功後才更新 state：成功 → 該 item `failStreak` 歸零、來源條目勾 `[x]` 或補完成摘要；失敗 → `failStreak[item] += 1`、`consecutiveDispatchFailures += 1`，≥3 進 `escalated`。兩者完成收割後才從 `inFlight` 移除。**每一次**收割寫完 state 後都 MUST 跑 `work-loop-lock.ts refresh --session <id>`。
+
+**反模式**（任一出現 = 立即停手自查）：
+
+- 有 actionable item 未處理卻停下來「等 user」
+- in-flight ledger > 0 就寫 HANDOFF、釋放 lock 收工
+- 寫「下一輪要做的」「下次 session 處理」然後收工——fixable issue MUST 就地修 → 重跑 → re-scan → 繼續
+
+---
+
+## Step 6 — Fingerprint 與停止判定
+
+停止判定前 MUST 跑 `wt-helper batch status --workflow <workflow_model>` 並依 commit skill `batch.md` 處置：沒有可推進開發時以 `drained` 結批，使用者明示結束本輪用 `stop`；就緒池尚未滿 4 件也可提交。單純換 session 保留池交接。已落地待清理只重試 cleanup；`WORK_LOOP_RUNNER_CHILD` 的 publish／propagate 禁令照常生效。
+
+### 6.1 算 fingerprint
+
+```bash
+node "${CLADE_HOME:-$HOME/offline/clade}/vendor/scripts/work-loop-verdict.ts" \
+  --repo "$(git rev-parse --show-toplevel)" --scan <本輪 scan JSON 路徑>
+```
+
+`fingerprint` 與 `fingerprintUnchangedRounds` 照抄進 state，Step 6.2 的 no-progress 條件讀後者。**NEVER 自己算 sha256**；輸入集合的 SoT 是 `computeFingerprint()`，**NEVER** 在這裡另列一份（理由見 [productivity-gate.md](reference/productivity-gate.md) § fingerprint 為什麼不准手算）。
+
+### 6.2 停止條件（任一成立即停；**每一條**都 MUST 跑 `work-loop-lock.ts release --session <id>`）
+
+| 件 | 條件 |
+| --- | --- |
+| No-progress | `fingerprintUnchangedRounds >= 3` |
+| Turn cap | `inFlight` 已空，且 `--unattended` 已處理 5 items（**含收割後補 dispatch 的**）；interactive `round >= 12`。`inFlight` 非空只停止新 dispatch，轉入 Step 4 的同 process wait + harvest |
+| Budget proxy | **本 run 內**（per lock session，歸零時機見 Step 0 § 互斥鎖）`subagentsSpawned >= 15`，或 lock timestamp 距今 ≥6h |
+| 非生產 | `nonProductiveRounds >= 2`（見 6.3） |
+| 系統性失敗 | `consecutiveDispatchFailures >= 2`（escalated 項不計入——它們本輪未 dispatch，沒有新失敗事件） |
+| Scan 失敗 | Step 2 已 STOP |
+| Step 1 中止（`context-decay` / `handoff-write-failed`；兩者都寫 `roundEndReason`，**NEVER** 寫成 `stoppedReason`——唯一例外是 D4 連續第 2 輪，那時兩個都寫） | Step 1 已 STOP |
+| 真正做完 | 四組皆空 ∧ `inFlight` 空 ∧ 無未 packaged 的非自主 item ∧ `techDebtHygiene.raw.flow.actionableOpen == 0`（**NEVER 讀 open 總數**，見下） |
+
+**「真正做完」讀 `actionableOpen`，NEVER 讀 open 總數**——open 總數含 `blocked-attended-only` 與 `wontfix-until-signal`，設計上就不可能歸零。
+
+**軟配額——`landed` 桶非空時，本輪 5 items 中 MUST 至少 1 項是 close/verify**（驗收 landed / 改判 wontfix / rotate 進 archive），不是 open/登記。`flow.window.closedInWindow == 0` 而 `openedInWindow > 0` 時這條**升為硬性**：不足額就不算合法進度。帶 `**Blocker**:` 的新條目與 packaging 決策**無條件通過**。
+
+**NEVER 靠改 status 讓 `actionableOpen` 下降。** `blockedWithoutGate` 非 0 時 **`actionableOpen` 讀數不可信，MUST 先修完再判停**（Invariant 12）。
+
+**寫 `stoppedReason` 之前 MUST 先清一次 `blockers` ledger**（逐條重量 predicate，值變了或 predicate 已不成立就刪條目），清完仍空才算真正做完，詳見 [reference/blocker-ledger.md](reference/blocker-ledger.md) § 清 ledger 是正當工作。
+
+`fingerprintUnchangedRounds == 2` 且 `inFlight` 空 → 不停，但下次 `ScheduleWakeup` 退到長間隔。
+
+**in-flight ledger > 0 就不是停止狀態**，即使 candidate list 空——此時退出 = 成果懸空等 user 手動善後。
+
+### 6.3 生產性判定（**每一輪**收輪時算，含 runner child 的每一輪；只當停止條件用，NEVER 當本輪目標）
+
+本輪為**生產輪**，若下列 P1–P4 **任一**成立。**判定跑 script，NEVER 手跑 git diff 分析**：
+
+```bash
+node "${CLADE_HOME:-$HOME/offline/clade}/vendor/scripts/work-loop-verdict.ts" \
+  --repo "$(git rev-parse --show-toplevel)" --round-start-sha <round-start 基線 sha> \
+  --prev-state <本輪 Step 1 讀到的 state 副本路徑>
+```
+
+讀 `productive` 一欄：`true` → 生產輪，`false` → 非生產輪，**`null` → script 判不出來**（缺基線 sha、`git diff` 失敗，或 P3 的憑證不在 diff 裡）。`null` **MUST** 當「未判定」處理：補齊缺的輸入重跑，或把 `p1`–`p4` 各自的 `basis` 逐字回報。**NEVER 把 `null` 讀成 `false`**。
+
+| # | Predicate | 一句話 |
+| --- | --- | --- |
+| P1 | Tier A 淨減 | 待辦檔行數真的少了（搬進 archives 的不算） |
+| P2 | 交付物 landed | 本輪 commit 觸及排除集以外的 tracked 檔。**判準是排除集，NEVER 是白名單** |
+| P3 | TD 關閉帶憑證 | Status token 由 open-class 轉 closed-class，且同輪有憑證 |
+| P4 | 新決策 packaging | `awaiting[]` 新增先前未出現過的 id。單輪至多計一次 |
+
+**SoT 是 script**；完整定義在 [reference/productivity-gate.md](reference/productivity-gate.md) § P1–P4 逐條定義，**改動 `work-loop-verdict.ts` 的任一 predicate 之前 MUST 先讀它**，**NEVER** 拿上表當實作依據。
+
+皆不成立 → `nonProductiveRounds += 1`（Step 7.3 寫）；任一成立 → 歸零。軟配額（6.2）不足額的輪**必為**非生產輪，反向不成立，兩者矛盾時嚴者恆贏（[productivity-gate.md](reference/productivity-gate.md) § 與軟配額的關係是包含，不是並列）。
+
+---
+
+## Step 7 — 寫 HANDOFF + state
+
+依 `follow-up-register.md` § 主動消化，同步驗證並關閉本次完成的 TD，回讀 flow 關卡後移出主清單；HANDOFF 移除完成流水帳，已有 TD 的未完項只保留指針。等待訊號、部分完成及未驗收工作保留具體接手入口。
+
+### 7.1 路徑 invariant
+
+`HANDOFF.md` / `ROADMAP.md`（未遷移 consumer 另含 `docs/tech-debt.md`）**MUST** 寫到 main worktree absolute path——用 `dirname "$(git rev-parse --path-format=absolute --git-common-dir)"` 解。**禁止**用 cwd-相對路徑寫這幾個檔（在 linked worktree 內跑會寫進 worktree 副本，下一輪讀到舊版）。
+
+### 7.2 HANDOFF 的一個段
+
+**Iron Law：HANDOFF 先寫、state 後寫，順序不可對調。** 7.2 與 7.3 是兩個獨立寫入、**沒有原子性**，所以要讓失敗往無害的一側倒：
+
+| 先寫誰 | 中途失敗後的下一輪 | 後果 |
+| --- | --- | --- |
+| **HANDOFF 先**（本 skill 的順序） | 待答條目已寫進 HANDOFF、state 沒記 → 下一輪重做一次已完成的 bookkeeping | 冪等、無害 |
+| state 先 | state 說某條已 packaged、HANDOFF 卻沒有那條的選項 → Charles 看不到題目，佇列永遠不清 | 靜默失效 |
+
+**7.2 寫入失敗時 NEVER 繼續寫 7.3 的 bookkeeping** —— 中止本輪並照 Step 1 § D4 的**部分寫入白名單**落檔：只寫 `roundEndReason`（＋連續第 2 輪的 `stoppedReason`），`round` / `fingerprint` / `inFlight` 等其餘欄位一律不動。「state 先落下來至少不會丟進度」是製造死鎖的那個推論，**NEVER** 採用。
+
+**NEVER 把 loop 進度 render 進 HANDOFF**（2026-08-13 TD-495 起）。`.clade/work-loop/state.json` 是進度的**唯一** SoT；要看進度跑 `jq . .clade/work-loop/state.json`。
+
+**舊 marker 遷移（每輪 MUST 檢查，不是只在第一輪）**：HANDOFF 若存在 `<!-- BEGIN: work-loop-status -->`、`<!-- BEGIN: loop-engineer-status -->` 或 `<!-- BEGIN: handoff-loop-status -->` 包夾的段落 → **整段刪除**（連 marker 連 `## Work Loop Status` 標題），**不產生取代內容**。**NEVER** 因為「本輪有值得記的發現」就把它寫回 HANDOFF —— 那類發現的載體是 TD entry / pitfall / `tasks/`。
+
+`## ⏳ Awaiting Charles` —— 格式見 [autonomy-predicate.md](reference/autonomy-predicate.md) § 段模板。**Append 不覆寫**（尚未答的舊決策不能被沖掉）；已答的由下一輪 scan 判定移除。
+
+寫入形狀（待辦一律 checkbox 行、結案段的 checkbox 全部勾掉、已有 TD 編號的只留一行 pointer）走 `/handoff` SKILL 的 § HANDOFF 寫回契約。本輪寫的每一條都要過那三條 —— 散文段在下一輪的 Step 2 只算**一個** candidate。
+
+### 7.3 落 state 檔
+
+把 Step 1 schema 的每個欄位更新後寫回 `.clade/work-loop/state.json`（`.clade/` 已 gitignored）。`guardrailsAck` 用 Step 1.5 讀完的時間。
+
+**`subagentsSpawned` 是唯一一個「不是累加就好」的欄位**：本輪 Step 0 的 `acquire` 回 `acquired` / `took-over` 時 MUST 從 **0** 起算，回 `reentrant` / `continued` 才是舊值 + 本輪新增。**NEVER** 因為「schema 範例長得像單調遞增」就無條件累加（[[TD-424]] 同型，見 [lock.md](reference/lock.md)）。
+
+**Scratch 命名 contract：本輪寫進 `.clade/work-loop/` 的**每一個**中間檔 MUST 叫 `<tag>-r<N>.<ext>`**（前綴形 `r<N>-<tag>.<ext>` 也認），**大型 dump（>1MB）MUST 落 scratchpad 或 OS tmp，NEVER 落本目錄**。本輪要在 `.clade/work-loop/` 寫任何中間檔、或改 sweep 判準之前 **MUST 讀 [state-write.md](reference/state-write.md) § Scratch 命名 contract 與 sweep**（sweep 的三個呼叫點、執行狀態白名單、保留期限都在那裡）。
+
+**Iron Law：NEVER 直接覆寫 `state.json`。一律 temp → 驗 → 備份 → rename。** 這個檔是整個 loop 的**唯一**記憶載體，寫壞它等於把 N 輪進度一次歸零，而失敗完全靜默。
+
+**寫入一律走 `work-loop-state-write.ts`，NEVER 自己生成一支 write-state script。** 本輪要產出的只有一份 **patch**（改了什麼寫什麼）：
+
+```bash
+ORIGIN_ID="${CLADE_DISPATCH_ORIGIN_ID:-wl-r<N>}"
+ROUTING_SUMMARY="$(node "${CLADE_HOME:-$HOME/offline/clade}/vendor/scripts/work-loop-routing-summary.mjs" --origin-id "$ORIGIN_ID")" || \
+  ROUTING_SUMMARY="{\"schemaVersion\":1,\"origin\":\"work-loop\",\"originId\":\"$ORIGIN_ID\",\"error\":\"summary-failed\"}"
+printf 'routing summary: %s\n' "$ROUTING_SUMMARY"   # runner round log 直接可見；zero 也照印
+
+PATCH="$(mktemp -t work-loop-patch.XXXXXX)"
+node -e '
+  const fs = require("node:fs")
+  const patch = {
+    round: Number(process.argv[2]),
+    lastRoundAt: process.argv[3],
+    sessionNote: process.argv[4],
+    routingSummary: JSON.parse(process.argv[5]),
+  }
+  fs.writeFileSync(process.argv[1], JSON.stringify(patch))
+' "$PATCH" '<N>' '<ISO>' '<本輪一句話>' "$ROUTING_SUMMARY"
+node "${CLADE_HOME:-$HOME/offline/clade}/vendor/scripts/work-loop-state-write.ts" --patch "$PATCH"
+rm -f "$PATCH"
+```
+
+本輪零 dispatch 時也寫 zero routing summary，**NEVER** 以欄位缺席暗示「可能有派」（欄位語義見 [state-write.md](reference/state-write.md) § routingSummary 欄位語義）。
+
+patch 語義：**給值＝覆蓋、給 `null`＝刪除、沒提到＝原值不動**。合併是**淺層**的，**NEVER** 期待深合併 —— `awaiting[]` / `blockers` / `decisions` 的正確更新常常是「整個換成本輪算出來的版本」。
+
+該 script 已內建五道保護，**NEVER** 因為「這輪只改一個欄位」就改用 `>` 直接覆寫來繞過。
+
+**判讀規則只有一條：stdout 不是 `STATE_OK` 就停止本輪 bookkeeping。** `STATE_WRITE_FAILED` / `STATE_BACKUP_FAILED` / `STATE_ROUND_REGRESS` / `STATE_CORRUPT_REFUSED` 每一個都是——四者都保證正本仍是上一輪的完好版本。stderr 的 `STATE_ARCHIVE_FAILED` / `STATE_OVERSIZE` **不是**失敗 token（stdout 仍是 `STATE_OK`），**NEVER** 因為看到它們就中止。
+
+**收到 `STATE_OK` 以外的任何 token 時 MUST 先讀 [reference/state-write.md](reference/state-write.md)**——`STATE_CORRUPT_REFUSED` 與 `STATE_ROUND_REGRESS` 的處置方向相反，憑印象選一個就是把 N 輪 bookkeeping 賭在記憶上。
+
+寫完 **MUST** 跑 `node "${CLADE_HOME:-$HOME/offline/clade}/vendor/scripts/work-loop-lock.ts" refresh --session <lockSessionId>`——漏掉一次就讓還在跑的這一輪被下一輪判成死掉並接手，兩個 loop 同時跑、state 互相覆寫，沒有任何錯誤訊號。
+
+**`decisions` 的內容 NEVER 在本步才寫**——Step 2.7 (c) 收到答案當下就已落檔。本步只是把 Step 2.7 之後又變動的欄位一併寫回。
+
+### 7.4 Commit
+
+本步 **只 commit 白名單路徑**（`HANDOFF.md`、`docs/tech-debt.md`、`tasks/**` 等，見 [[commit.detail]] § `--only` 適用範圍）。產品碼不走這步——它在 harvest / archive 時已由 `/commit` 落地。
+
+```bash
+git commit --only -m "📝 docs(handoff): work-loop round <N> 狀態段更新" -- HANDOFF.md
+git show --stat HEAD | tail -3   # 驗 scope；出現 .ts/.vue/.sql 等 → STOP，那批改走 /commit
+```
+
+若本輪也改了 `tasks/**`（未遷移 consumer 另含 `docs/tech-debt.md`；有 `specs/truth/work-lifecycle.md` 時該檔凍結），把它們加進同一個 `--only` pathspec。**NEVER** 把白名單外的檔塞進來。**NEVER** `git add` + `git commit` 兩段式——會吞掉別 session 預 stage 的內容。
+
+message header 必須是 `<emoji> <type>[(<scope>)]: <subject>`，emoji 與 type 一對一綁定（`docs` 只能配 📝），clade 另要求 subject 含中文——commitlint 會擋配錯或漏 emoji。
+
+---
+
+## 安全護欄
+
+完整護欄清單 + dispatch 內嵌段 + 反藉口逐字實錄在 [reference/guardrails.md](reference/guardrails.md)——**每輪 Step 1.5 re-read 的就是那份**。最常被違反的三條各自寫在它們生效的位置：`AskUserQuestion` 的 mode 分岔在 Step 0 Iron Law、「非自主 item NEVER skip」在 Step 4b、「每輪 re-read」在 Step 1.5。
+
+## Reference
+
+| 檔 | 什麼時候 MUST 讀 |
+| --- | --- |
+| [guardrails.md](reference/guardrails.md) | **每一輪**（Step 1.5，hard rule） |
+| [run-modes.md](reference/run-modes.md) | 決定怎麼起這個 loop 時（Step 0）、起 runner 之前與收到 runner 退出通知之後；in-session `/loop` 每次要排 wakeup 或結束 turn 之前；runner child 遇 decision-linked dispatch 時（Step 1.5）；Step 2.5 任一探針非 0 時；Step 4b 要在 runner 底下並行時 |
+| [lock.md](reference/lock.md) | 改動 `subagentsSpawned` 歸零時機之前（Step 0 § 互斥鎖 / Step 7.3）——執行時不必讀 |
+| [decay.md](reference/decay.md) | **D4 命中時**，或要改動 D4–D6 任一列之前（Step 1 § Decay 偵測） |
+| [state-write.md](reference/state-write.md) | Step 1 讀到 `STATE_CORRUPT`、寫入或判讀 state 欄位、讀到截斷標記或 `STATE_OVERSIZE`；Step 7.3 在 `.clade/work-loop/` 寫中間檔、或收到 `STATE_OK` 以外的**任何** token 時 |
+| [productivity-gate.md](reference/productivity-gate.md) | 改准入／生產性判準之前（Step 0 § 開場准入判定、Step 6.3）——執行時不必讀 |
+| [decision-drain.md](reference/decision-drain.md) | **每一輪**（Step 2.7，hard rule） |
+| [blocker-evaluation.md](reference/blocker-evaluation.md) | 需求或文件待辦的 blocker 需要診斷（Step 3.1a） |
+| [blocker-ledger.md](reference/blocker-ledger.md) | **任一** blocked item 進評估之前（Step 3.1a 的**每一個**受阻需求／3.1b，不限受阻與待決策兩類）、以及寫 `stoppedReason` 之前（Step 6.2） |
+| [non-plan-dispatch.md](reference/non-plan-dispatch.md) | 讀非 plan source 或跑 selfverify／closedBloat rotate 時（Step 2）、分類非 plan candidate（Step 3.1b） |
+| [autonomy-predicate.md](reference/autonomy-predicate.md) | 判自主 / 做 packaging（Step 3.2 / 4b） |
+| [dispatch-topology.md](reference/dispatch-topology.md) | 分組（Step 3.3） |
+| [harvest.md](reference/harvest.md) | 每個 notification 到達時（Step 5） |
+| [no-wt-dispatch.md](reference/no-wt-dispatch.md) | Step 4a 判出 `wt` 叫不動時（產地 clade home 恆命中） |
+| [skill-relations.md](reference/skill-relations.md) | 查與其他 skill 的邊界、scope 排除清單 |
+| `vendor/scripts/flow/nodes/README.md` | **本輪要手刻一次性 script 之前**——先查 node library 有沒有現成的。有就 `node vendor/scripts/flow/flow.ts step <node> [--flags]`。沒有就照常手刻，**NEVER** 為了湊節點硬套。（產地 clade home 才有；consumer 端尚未散播） |
+
+## 與其他 skill 的銜接
+
+- `/handoff` —— 本 skill 不取代它。`park`（登記）仍由 `/handoff` 做；本 skill 自動化的是 `next` 的「盤點 → 推薦 → 執行」，並在 unattended 下把 `AskUserQuestion` 換成 packaging
+- `/goal` —— attended 姊妹：user 在場、要逐項拍板 dispatch 優先序時用它
+- `/implement` —— 需求實作與驗證入口，本 skill 只編排不介入其內部流程
+- `wt` —— 所有 tracked code 改動的 dispatch 入口
+- `/loop`（內建）—— interval 盲跑某 prompt、stateless 無 verifier。「每 N 分鐘重跑 X」用它；「狀態驅動推進待辦」用本 skill
+
+
+
+## Claude host 契約（本 skill 目前唯一經驗證的載體）
+
+本 skill 的每一條義務都寫在 Claude 的工具契約上，逐項對照：無人值守載體是 `runner.sh`
+（每輪一個 `claude --print` process，`cc`／`ccw` 機械選帳號）、互動提問是 `AskUserQuestion`、
+背景工作與收割是 `Bash(run_in_background)` ＋ `TaskOutput` ／ `TaskStop`、喚醒是 `ScheduleWakeup`
+／ `Monitor`、worktree 派工是 `/wt`、截圖收集是 Pi `--table-row screenshot-review-verify`。
+
+**無人值守（`runner.sh`）只有 Claude 這一端。** Codex 只支援 in-session
+單輪（見共用 SKILL.md § Host 支援）；`runner.sh` 不投影到 Codex，在 Codex session 內也直接拒跑。在 Codex 要連續推進時回報不可用並保留
+work 身分，**NEVER** 靜默改用 Claude launcher 代跑。

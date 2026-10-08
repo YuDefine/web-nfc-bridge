@@ -1,0 +1,16 @@
+{
+  "version": "1.13.60",
+  "consumer_id": "web-nfc-bridge",
+  "modules": {
+    "auth": "none",
+    "db-schema": "none",
+    "db-runtime": "none",
+    "runtime": "cf-workers",
+    "framework": "nuxt",
+    "domain": [],
+    "ecosystem": [
+      "node"
+    ]
+  },
+  "localHooks": []
+}

@@ -1,0 +1,214 @@
+# Worktree 批次提交
+
+本分支適用每個 runtime 的 `/commit`、手動 merge back 與自動收割。Helper 在 clade 為 `vendor/scripts/wt-helper.ts`，consumer 為 `scripts/wt-helper.ts`；以下命令以 consumer 路徑表示。用工作目錄參數在指定 tree 執行，不要求使用者切換 task。
+
+## 1. 收件與觸發
+
+Worker 完成實作、必要測試、行為驗收後，先把 scoped 變更 commit（hooks 照跑），再記錄 checkpoint。Checkpoint 只保存來源 HEAD、作者與 scope，**不**啟動完整 AI review、不收割全 repo WIP、不發版。
+
+```bash
+node scripts/wt-helper.ts batch checkpoint <source-path> --work-id <work-id> --author <作者>
+node scripts/wt-helper.ts batch ready <source-path> --work-id <work-id> \
+  --evidence <驗收證據檔> --authorize-landing --release-writer
+node scripts/wt-helper.ts batch status --trigger auto --workflow <workflow_model>
+```
+
+`batch ready` 才是 PR ready／品質入口。證據放來源外可持久讀取的檔；紀錄實跑命令、結果、受測 HEAD。`--authorize-landing` 表示既有工作授權允許正式落地及安全回收，不是由 flag 創造授權。需保留來源時加 `--retain <owner 與下一個落地事件>`。
+
+```bash
+node scripts/wt-helper.ts batch unready <source-path> --reason <撤回原因>
+```
+
+`batch unready` 撤回單一來源的 ready 登記：只刪該來源的 ready 紀錄，並把 path／branch／head／workId／reason 記進 state 的 `unready[]`（例如來源經 ad-hoc `commit --only` 或他人 merge-back 在 batch 外落地、或已被取代）。屬於 in-flight batch（integrating／review／sealed）的成員拒絕——成員由 batch lifecycle（cancel／cleanup）處理，**NEVER** 用 unready 抽別人批次的成員。撤回後該來源可重驗再 `batch ready`。`<source-path>` 必填（不預設 cwd），旗標順序自由；worktree 目錄已被手動刪除的 stale ready 列同樣可撤回。缺 path、多餘位置參數或其他 usage error 一律印 usage 並 exit 2。
+
+### Draft PR（可見性；不是 ready）
+
+相對 `main` 已有非空 committed diff 後，**slice owner** 自己 push 該 session branch 並開 draft PR（全文 [[github-flow]]）。同一個 work id 有 2 個以上切片時（預設）**不走這一段**——切片對 `integration/<work-id>` 開 PR，由 coordinator 以 `integration-merge.ts --pr <n>` 落地，只有 integration 那一條對 `main` 開 draft、登記 receipt（[[github-flow]] § Integration branch）。開 draft 後 **MUST** 登記可見性 receipt，否則 prepare 沒有完整綁定：
+
+```bash
+node scripts/wt-helper.ts batch draft <source-path> \
+  --work-id <work-id> --pr <number> --kind visibility
+```
+
+```bash
+gh pr view <session-branch> --json number,isDraft,headRefName
+git push -u origin <session-branch>
+: "${CLADE_WORK_ID:?先 export CLADE_WORK_ID=<work-id>}" && \
+gh pr create --draft --base main --head <session-branch> --title '<切片摘要>' \
+  --body "$(printf '%s\n\nWork: %s\nOwner: %s\nReview: node scripts/pulls-review.ts %s\n' '<scope；CI 紅燈回這張 PR>' "$CLADE_WORK_ID" "${CLADE_DISPATCH_ID:-session:<claude_session_id>}" '<session-branch>')"
+gh pr view <session-branch> --json number,isDraft,headRefName
+```
+
+body 的 `Work:`／`Owner:` 兩行必填（`Owner:` 填 `<dispatch_id>`、`session:<claude_session_id>` 或 `bot:<job>`）：PR 主人消失後，coordinator 分診靠它才派得了修補。`Review:` 行是給讀這張 PR 的人貼進 terminal 的閱讀指令（[[my]] 的 `rules/待拍板條目寫法.md` Rule 22；target 是 branch，所以讀的是本機 diff），只印在 body 裡，**NEVER** 代跑。沒有 `Work:` 行的 `gh pr create` 會被 PreToolUse hook 擋下（`CLADE_ALLOW_NO_WORK=1` 前綴只給非 clade 工作）。PR 合入後跑 `node scripts/wt-helper.ts batch retire-merged` retire 指向已合 PR 的 draft receipt。**NEVER** 把該來源放進 ready 池、**NEVER** 當 `prepare` 成員、**NEVER** 啟動完整品質鏈、**NEVER** merge、**NEVER** push `origin main`。空 branch、只有 WIP → 不開 PR。CI 紅燈修回同一張 PR（處置見下方 § CI 紅燈處置）。討論 draft 另加具名討論者與具體問題時才跑（舊命令無 `--kind` 仍是 discussion，兩欄都必填）：
+
+```bash
+node scripts/wt-helper.ts batch draft <source-path> \
+  --work-id <work-id> --pr <number> --kind discussion \
+  --discussant '<具名討論者>' --question '<會改變剩餘實作的具體問題>'
+```
+
+seal 之後同一 `workId` MUST 把受審 formal HEAD 交到**既有** draft 的 head ref，再標 ready。**NEVER** 開第二張 PR。轉換失敗就停。PR ready 仍走上面的 `batch ready`。
+
+| 事件 | trigger | 行為 |
+| --- | --- | --- |
+| 就緒／收割／session 接手 | `auto` | `pr-merge-based`：1 個 distinct work id 即準備獨立 PR；`trunk-based`：4 個才啟動。未達門檻繼續開發、不佔 commit lock。ready backlog 達 3 件時優先交付，active implementation 預設最多 3 件——**數的是進 `main` 的 PR**，一條 `integration/<work-id>` 連同它底下每一個切片合計算 1 件（[[github-flow]]） |
+| 使用者 `/commit` 或 merge back | `manual` | 無最低件數；未就緒工作不阻擋；緊密相依工作可明確合批 |
+| 下游須先落地 | `dependency` | 有就緒成員即結批 |
+| 已授權開發皆完成或受阻 | `drained` | 有就緒成員即結批 |
+| 使用者結束本輪開發 | `stop` | 有就緒成員即結批；換 session 不屬於 stop |
+
+Status 沒有就緒 wt，也沒有待續跑批次時，回普通 `/commit`。所有輸出中的 stale／invalid 來源列名保留，不假裝進池。既有 active batch 優先續跑，新就緒工作進下一批。單成員 PR 預設；Charles-only leftover 卡該來源時跑 `batch yield-blocked` 讓出 active slot，blocked source 不可自動重回 ready，須具名 `batch unlock-blocked --event` 後重驗再 ready。回報這個 leftover 時，要讀 diff 才能判的照 [[my]] 的 `rules/待拍板條目寫法.md` Rule 22 附閱讀指令。無關獨立 workId 繼續。合批內一成員 blocked 則整批不落地。
+
+### CI 紅燈處置
+
+本節在落地路徑上被讀：draft／ready PR 的 CI 紅了，處置從這裡開始，不是從「再推一次」。**違反字面就是違反精神。**
+
+**Iron Law：先判讀再處置。** 紅燈當下第一個動作是跑 `node scripts/test-lanes/ci-triage.ts --run <id> --json`，讀它的 `action`／`rerun_shards`／`register`／`failures[].class`。沒有這份輸出就 **NEVER** 重跑、**NEVER** 再 push。
+
+| `action` | MUST |
+| --- | --- |
+| `fix` | 修 `failures` 裡的 real，push **同一張** PR。**NEVER** 開第二張 PR。帶 `rerun_blocked` 而無 real 時，見下一段：回報而非重跑 |
+| `rerun-failed-shards` | `node vendor/scripts/ci-rerun.ts <id>`（內部只下 `gh run rerun <id> --failed`，先讀 `run_attempt`）。**同一 run 最多自動 rerun 1 次**：`run_attempt` ≥ 2 它回 `RERUN-DENIED`，`ci-triage` 也不再給此 action |
+| `register-flaky` | 同一張 PR 同一支檔的**第二次** flaky：登記（`flow plan` 或 TD）並附 `register[].evidence`，**NEVER** 再重跑 |
+
+**同一 run 最多自動 rerun 1 次（單一 SoT：`vendor/scripts/lib/ci-rerun-cap.ts`）。** `run_attempt` ≥ 2 仍紅，`ci-triage` 回 `action=fix`＋`rerun_blocked`（全是 infra／flaky、沒有 real 可修）：**NEVER** 再 rerun，改走回報——infra 寫證據（job、runner、排隊逾時或 evict 紀錄）交主持者／ci-runners 查容量，flaky 登記；只有 head 變了（新 push）才有新 run。這條對任何自動化一視同仁：merge 佇列、PR 分診、overflow、修補 child，以及你自己寫的 watch／監看迴圈——迴圈裡要重跑一律呼叫 `node vendor/scripts/ci-rerun.ts <run-id> [-R owner/repo]`，**NEVER** 在迴圈裡直接打 `gh run rerun`，也 **NEVER** 在迴圈外面套 `grep` 濾掉它印的 `RERUN-` 行（run 36880784865 就是這樣被無聲重跑到 attempt 50、72 小時燒 642 job-小時）。
+
+合併門檻不變：所有 shard 都通過才可落地。本節不改 0-A／0-B／0-C、不改 `batch ready`、不改六 shard 互斥聯集。
+
+逐字禁令：
+
+- **NEVER** `gh run rerun <id>`（不帶 `--failed`）處理 flaky／infra
+- **NEVER** 以空 commit 或 force-push 觸發整輪重跑
+- **NEVER** 整輪重推同一 SHA 來「碰碰運氣」
+
+| 開脫（逐字） | 實際 |
+| --- | --- |
+| 「整輪 rerun 比較快，shard 對帳很煩」 | 先判讀再 `gh run rerun <id> --failed` 才是處置；整輪 rerun 不是較短的路 |
+| 「先 rerun 一遍，還紅再判」 | 沒有 `ci-triage` 輸出就重跑，是在用 runner 分鐘猜 class |
+| 「空 commit 觸發 CI 又沒改產品」 | 空 commit 就是整輪重跑，且污染歷史 |
+| 「force-push 清掉紅燈紀錄比較乾淨」 | 紅燈紀錄是 flaky 判準的輸入；清掉會把第二次 flaky 當成第一次 |
+| 「同一檔又紅了，再 rerun 一次就好」 | 同一 PR 同一檔第二次 flaky 走 `register-flaky`，不是第三次 `--failed` |
+
+P1 基線（`git show 72e80cf4d:specs/plans/W-2026-09-20-test-lane-overhaul/evidence/p1-pr-run-baseline.md`（W-2026-09-20-test-lane-overhaul 已退役，原文在 git history）；複驗：`gh run list --workflow validate.yml --event pull_request -L 100 --json databaseId,conclusion,runAttempt`）裡，rerun 轉綠的 run 平均用了 2.9 個整趟 attempt。本證據決定：flaky／infra 用 `--failed` 而不是整輪 rerun。本證據不決定：要不要修 real——real 的 `action` 是 `fix`，與 runner 分鐘無關。
+
+**Red Flags**：發現自己正要打不帶 `--failed` 的 `gh run rerun`、正要對 `run_attempt` ≥ 2 的 run 再 rerun、正要 `git commit --allow-empty`、正要 force-push 只為重跑、或還沒打開 `ci-triage` 輸出就伸手推——停，回到本節第一句。
+
+## 2. 準備隔離整合區
+
+```bash
+node scripts/wt-helper.ts batch prepare --trigger <trigger> --workflow <workflow_model>
+```
+
+`status` 與 `prepare` MUST 用**同一個**已解析 `workflow_model`。registry 裡已宣告的 consumer 用它的值；解析失敗 **NEVER** 默默改成 `pr-merge-based`。clade home 不是 registry consumer，試跑才准顯式 `--workflow pr-merge-based`。Trunk prepare 固定所有當下就緒成員。PR prepare 預設只收**一個** work id（一個獨立可接受目的對應一個 PR）；緊密相依合批必須顯式 `--group-work-ids <id>,<id>`，**NEVER** 把不相干的就緒來源默默塞進同一張 PR。來源 checkpoints 及整合中繼成果皆保留，main 不接收待審內容。另一位 coordinator 撞 active batch 時接續該批，**NEVER** 另開一批與它競爭。prepare 回傳既有批次時輸出帶 `reused: true`（新批為 `reused: false`），呼叫端可憑它分辨自己開的批與接續的批；帶 `--expect-work-id <id>`（逗號可複數）而回傳批成員不含該 id 時 prepare 直接拒絕。**NEVER** 看到成員不對就 `batch cancel`——先用 `batch status` 查那批是誰的。
+
+**平行批次**：`--expect-work-id` 點名的 work id 全部已就緒、且沒有任何活躍批持有時，prepare 只收這些 work id 另開一批（`reused: false`），前提是新批成員的異動路徑與**每一個**活躍批成員的異動路徑不相交（同一路徑、或一邊是另一邊的目錄前綴都算相交）。相交就拒絕並列出路徑，不建任何 worktree；等那批落地或取消後再 prepare。沒點名 work id 時行為不變：只有一個活躍批就接續它，有多個就拒絕。多個活躍批並存時，`resume`／`scope`／`refresh`／`review`／`seal`／`land`／`confirm-merged`／`cancel` 要帶 `--batch <id 或唯一前綴>`，或在該批的 integration worktree 內執行；兩者皆無即拒絕，**NEVER** 猜。`yield-blocked` 以 `--work-id` 找持有批。Trunk 平行批依序 land：先落地的一批前移 main，後一批 `land` 會回 `Main advanced`，照常 `batch refresh --batch <id>` → 重新 review／seal 再 land。
+
+衝突只在隔離區解，解完精確 stage 衝突檔後跑 `batch resume`；不删來源、不把未解衝突藏成就緒。中斷後先讀 `batch status`，依持久狀態續跑。`pr-merge-based` 的 base 是 `git fetch origin main` 後的 `refs/remotes/origin/main`；`trunk-based` 才使用 local main。main 前移用 `batch refresh` 對齊新基準並重新驗受影響範圍；來源變動則 `batch cancel --reason <原因>` 保存既有工作，重驗來源、重登記再 prepare。
+
+Helper 在整批合併後沿用既有 worktree runtime bootstrap，建立投影工具、環境檔、dev-port 與 backing service；失敗保留 integration 並由 resume 重試。接著在 integration path 依專案 package manager 以 frozen lockfile 安裝依賴，再確認 dev-port／db-preview 的獨立驗證環境。依 SKILL.md Step 0-Lock 解析鎖腳本與 integration 的絕對路徑，取得 commit lock 後跑 Step 0–5 的完整流程；Step 1 schema 同步判定前 MUST 先設 `BATCH_SCOPE=$(node scripts/wt-helper.ts batch scope) || BATCH_SCOPE='<batch scope 失敗>'`，否則只在 checkpoint 裡的 migration 會被 `git status` 乾淨漏掉；helper 非 0 退出（refresh 未完、仍在 integrating）時先照錯誤訊息收斂再重跑 Step 1——判定段在批次 branch 上把失敗當 HAS，**NEVER** 把它讀成可跳過。Scope 為該整合區的完整 base→candidate 差異；同一批只啟動一次品質鏈，可按功能建立多筆正式 commits。手動普通 commit 的全 WIP 契約只作用於普通工作區，不把 main WIP 偷渡進 batch。
+
+Prepare 已把整批差異呈現在 base 上的 index。中断後若已有部分正式 commits、或需要補審整批，先跑 `batch review`：它保留 candidate、重新呈現完整 staged diff 並使舊 seal 失效，再依同一批狀態續跑既有品質鏈。不能對乾淨 HEAD 跑空 diff review 後宣稱整批通過。有 active PR 批次時，其他 session 可以照常 commit 到 local main，但 **NEVER push**；push 會前移 origin/main，才會使批次要求 refresh。
+
+helper 登記的 integration 同樣適用 Step 0-MR／0-Archive 的 trunk 人工 gate，不能因 branch 名稱而 skip。依每個 member 的 change 與 archive 對應檢查整批 readiness；有 blocker 就保留整批與來源，修正後重驗。若要排除未就緒成員，取消本批後重新登記其餘成員、prepare，再跑完整品質鏈。
+
+## 3. 證據與正式落地
+
+### Integration worktree 的派工歸屬
+
+`prepare` 在建立 integration worktree 前，已把 `path`、`branch`、`phase` 與 `members[].workId`
+持久寫入 `<git-common-dir>/clade-wt-batch/state.json`。Herdr 與 Pi 共用 reader：沒有明示 `--work-id`
+與 ambient 時，先讀 claim，再以 worktree toplevel 的實際路徑及 branch 反查 batch journal。
+同一 work id 的多個來源去重後仍自動歸屬；`integrating`／`review`／`sealed`／尚未清理的 `landed`
+都可反查，`cleaned`／`cancelled` 不可。Integration 不需補 claim，避免把持久歸屬誤當活躍 writer 而擋住 cleanup。
+
+顯式合批包含多個不同 work id 時，reader 列出每個 `CLADE_WORK_ID=<id>` 候選，派工者依這次動作選定成員。
+Herdr slice 與 Pi call 會建立連到該成員的子卡；`--work-id` 會直接使用成員卡，成功派工可能把成員標 done。
+未選定仍沿用 `unattributed`，並診斷為多成員歧義；journal 損壞、版本不支援或讀不到則診斷為讀取失敗，退回現行派工。
+Herdr／Pi 在同一次派工重用反查結果。brief 宣告 `stage: implement` 或帶 `--implementation`，且歸屬工作有 lifecycle plan 時，
+specification-readiness gate 會核對該 plan；Pi 也核對明示 `--work-id`／execution ticket 的工作。未就緒時，在寫入派工紀錄前拒絕。
+
+```bash
+node scripts/wt-helper.ts batch scope
+```
+
+`batch ready` 的 evidence 與 seal 的 receipt／passed gate evidence 在登記當下以 sha256 為名複製進 `<common>/clade-wt-batch/evidence/`。原檔還在時照舊以原檔驗（被改過就拒絕）；原檔消失（例如放在 session scratchpad）才改讀複本，land 與 cleanup 不再因此卡住。已 land 的 batch 做 cleanup 時不再檢查 ready evidence。
+
+以輸出填寫 seal JSON 的 `base`、`tree`、`members`（逐成員保留 `path`／`workId`／`head`），另附 `gates`：`simplify`、`review`、`checks`、`human`。每格使用 `{ "status": "passed", "evidence": "<絕對路徑>", "hash": "<檔案 sha256>" }`；條件未觸發時使用 `{ "status": "not-applicable", "reason": "<可核對判準>" }`；gate 跑了但沒過使用 `{ "status": "unmet", "reason": "<沒過在哪>", "evidence": "<絕對路徑>", "hash": "<檔案 sha256>" }`——helper 驗完證據後把它留在 batch state 的 `unmetGates`，**拒絕 seal**、批次停在 review，修好重跑該 gate 改成 `passed` 才能 seal。Review 包含適用的 0-A／0-B，checks 包含其他已觸發的檢查；human 只收既有人工 gate 的實際結果。
+
+證據必須是本批真實執行產物，**NEVER** 用 worker checkpoint、布林 true 或自己寫的「all passed」代替。Helper 驗檔案與雜湊，不替主線判語意正確；主線仍須讀實際結果。任何審後修改（含 Step 5 bookkeeping）先依既有規約補驗／補審受影響範圍，證據覆蓋最終 tree 後才 seal。
+
+```bash
+node scripts/wt-helper.ts batch seal --evidence <seal.json>
+node scripts/wt-helper.ts batch land
+```
+
+`land` 與 `confirm-merged` 記錄 landed 之後，當場對**該批**跑一次 `batch cleanup`（只處理這一批，其他待清理的 landed 批不動），結果放在輸出的 `cleanup` 欄：`removed`／`retained` 同 § 4；cleanup 本身被拒（publish／propagate 在飛、lock 等）時是 `cleanup.deferred`，landed 不回滾，之後重跑 `batch cleanup` 即可。需要保留來源時加 `--no-cleanup`（輸出 `cleanup.skipped`）。所有保留條件與 § 4 相同，自動 cleanup 不放寬任何一條。`land`／`confirm-merged` 要在整合區**之外**執行（main checkout 帶 `--batch <id>`）：cwd 落在整合區內時，live-writer 探測會把自己這個 shell 判成寫入者，整合區記成 `cleanup.retained` 而不是 `deferred`——遇到時離開該樹後重跑 `batch cleanup`。
+
+Trunk 成功後，Step 6 的發布／push 依原有 gates 在 main 執行；不在 integration branch 對 main 推送未受審內容。main dirty 時協調持有者，不 stash／丟棄 main WIP 以換取放行。
+
+PR 制不直推 main：正式批次 commits 依原有 PR／ship 流程送審，PR 未合併時保留來源與 integration。確認 PR 合入 main 後，先保存一份 merge receipt，再跑：
+
+```bash
+node scripts/wt-helper.ts batch confirm-merged --receipt <merge-receipt.json>
+```
+
+Receipt 必須是 JSON 物件，欄位固定為：`repository`、`pr`（正整數）、`base`（`main`）、`merge_method`（`squash`）、`merged`（必須為 `true`）、`source_head`（reviewed formal HEAD）、`reviewed_base`、`candidate_tree`、`merge_sha`（GitHub squash 產生的單一 parent commit），以及 `content_patch_id`（`base..source_head` 的 `git patch-id --stable`）。Helper 會向 GitHub 查同一 `repository`／`pr`：必須 `merged=true`、base 為 `main`、遠端 merge SHA 等於 receipt、GitHub `head.sha` 等於 reviewed `source_head`；若本 checkout 有 `origin` GitHub remote，其 owner/repo 必須與 receipt 及遠端 PR 一致。**NEVER** 只信 caller 自填的 `merged`。接著 fetch origin/main，確認 `source_head` 仍是 reviewed formal HEAD、`reviewed_base` 仍是 seal 時的 base、`merge_sha` 可由 `refs/remotes/origin/main` 達到且是單一 parent commit，並比對 reviewed candidate tree 與 merge tree（涵蓋 binary／rename／file mode）以及 stable patch-id；任一不符即保留來源與 integration。審查期間 origin/main 前進時，squash 的 parent 是較新的 main 而非 reviewed base：此時 merge parent 必須是 reviewed base 的後裔、merge 引入的路徑集必須與審查集完全相同、且每個觸及路徑的內容逐一等於 candidate；上游在**已審查路徑**上的變動維持 fail-closed（GitHub 3-way 結果必與 candidate 不同），該批只能 refresh 重新送審，唯一的例外是 merge 丟棄上游改動、內容仍等於 candidate。PR merge 確認後，local main 以 `git merge origin/main` 對齊，**NEVER rebase**。
+
+`batch confirm-merged` 不接受沒有 receipt 的確認，也不接受 fast-forward／一般 merge 冒充 squash。PR 關閉但未合併、receipt 缺失或機械證據不足時保留並查證，不宣稱 landed。Receipt 驗證通過後才記錄 landed；cleanup 對 PR 批次以 receipt 的 `merge_sha` 驗證 main 可達性，同時仍以 formal HEAD 保護 integration branch 與來源回收。清理失敗只重試 cleanup，不重複合併。
+
+已誤記 cancelled 的批可用同一入口對帳：`batch confirm-merged --batch <id>` 在前綴比對時**live 批優先**，沒有 live 命中才退到 cancelled 批；receipt 的 `source_head` 必須是該批 seal 記錄證明的 candidate——`seal.head` 有記時必須逐字相等，否則 `source_head^{tree}` 必須等於 `seal.tree`。cancel 不清除 seal 記錄，但 `batch review`／refresh 重進審查會作廢它；從未 seal、或 seal 已被重審作廢後才 cancel 的批一律拒絕對帳（錯誤訊息指明 `no surviving seal record`），只能 refresh 重走 review→seal→重送 PR。對帳記 landed 時一併清掉該批的 `waiting` 記錄與 `blockedSources` 列，避免已落地的工作仍被 named event 喚醒重送。
+
+具名 coordinator 在 C 節 predicate 全成立時用下方 helper 合併——active batch 已有 seal／world 快照時**優先**走它，predicate 由工具機械驗證。沒有 batch 快照可用時，照 [[github-flow]] § Coordinator 直接合併 逐列核對後以 `gh pr merge --match-head-commit` 合併（該節的人工 gate、落地授權兩列就是本 helper 的同名 predicate）。兩條都**不需要** Charles 逐張授權。helper 路徑：
+
+```bash
+node scripts/wt-helper.ts batch yield-blocked \
+  --work-id <work-id> --reason '<Charles leftover>' --owner <coord> \
+  --carrier <path> --resume-event <named-event>
+node scripts/wt-helper.ts batch unlock-blocked \
+  --work-id <work-id> --event <named-event>
+node scripts/wt-helper.ts batch merge-unattended \
+  --authorization <auth.json> --world <world.json> --dry-run
+node scripts/wt-helper.ts batch merge-unattended \
+  --authorization <auth.json> --world <world.json>
+```
+
+`--world` 是當下 GitHub／CI／seal 快照；未知旗標 fail-closed。崩潰後重入：遠端已合併只補 receipt／confirm，不再次 merge。`batch land` 的 PR 路徑不偷偷啟用 auto-merge。Merge 後盯該 `merge_sha` 的 staging，不追下一個 SHA。
+
+## 4. 完成報告前的回收
+
+`/handoff park` / `/handoff next` 的 lifecycle drain 只會把已滿足 landing authorization、writer release 與 evidence 的工作送到這裡；handoff 不自行拼 merge。`trigger=drained` 代表本輪已授權工作都完成或明確受阻，仍須依本節完整跑 prepare → review → seal → land。
+
+```bash
+node scripts/wt-helper.ts batch cleanup
+```
+
+每個來源都需正式落地、HEAD 未變、無未保存工作／活 claim／lock／保留契約才移除；有不能安全刪的 ignored 內容也保留。**NEVER** 用 `--force` 補掉不成立的 predicate。來源只因點名得出的檔案 dirty 而保留時，用 `batch cleanup --discard-pathspec <path>[,…]`（語意同 `wt-helper cleanup`：只收 repo 內字面路徑、rename 兩端都要命中；移除前先存 `refs/clade-residue/<slug>`，存失敗就整棵保留；其他 dirty 照擋）。報告逐來源列 `path`、`branch`、`dirty`、`merged_to_main`、`locked` 與 removed／retained 原因，integration 最後回收。
+
+**來源在落地後合法繼續工作**（retained 原因是 `source HEAD changed` 或 `source branch advanced`，而新 commit 疊在登記 head 之上、或來源已 rebase 到含落地內容的 main 上）時，這棵樹不該被移除，也永遠不會回到登記 head。改走保留來源關閉：
+
+```bash
+node scripts/wt-helper.ts batch release-source <source-path> --reason "<為什麼這棵樹要留著>"
+```
+
+它驗 batch 已 landed、landed commit 在 main、來源沒有改寫已落地的 history（三者之一：登記 head 是來源現 head 的祖先、landed commit 是來源現 head 的祖先、來源現 head 本身在 main 上），通過後把登記 head 釘在 `refs/clade/batches/<id>/<index>`、該 member 算 settled 並立刻解除 batch 佔有（可用現 head 重新 `batch ready`）；下一次 `batch cleanup` 收掉 integration、批次轉 `cleaned`。三者都不成立（來源改寫過已落地的 history）時拒絕。**NEVER** 為了同一目的手改 state.json。
+
+**Cancelled 批次的 integration tree** 預設不收（`batch cancel` 保留它給人看）。確認不再需要時：
+
+```bash
+node scripts/wt-helper.ts batch cleanup --cancelled [--dry-run]
+```
+
+只收 integration tree，member 來源一律留著等重新登記。integration 必須仍停在取消當下的 head（舊 journal 沒記的以現 head 為準）、乾淨、沒有 lock／claim，保存流程與 landed 批相同；移除前把 head 釘在 `refs/clade/batches/<id>/integration`，批次維持 `cancelled`，integration path 記進 `removed`。取消後又有新 commit 的照舊保留。
+
+每次 `batch cleanup` 結尾回收 `evidence/` 下不再被 ready 列或未結束批次引用的複本（`cleaned` 批、integration 已收的 `cancelled` 批不算引用）。
+
+Cleanup 前，每一棵樹先被 P0 全量保存進 common Git 目錄下的 archive（receipt 記 inventory／Git closure，不再發 `excluded` 清單）。Teardown 需要兩樣：通過 `validateProfile` 的 profile，以及帶 mandatory exclusive-writer adapter 的 lifecycle。`wt-helper batch` 兩樣都提供——lifecycle 帶 `withProbedExclusiveWriterOwnership`，profile 依 consumer id 由 `preservation-profiles.ts` 解析（clade home 已有實證 profile），但 consumer id 先由 `wt-batch.ts` 用 origin 的 `owner/repo` 綁定：checkout 的 `remote.origin.url` 必須解析出 `trustedRepositoriesByConsumerId` 登記給該 consumer 的 repo（不分大小寫），對不上就降成 `unverified-consumer-identity`。registry `repo_id` 新增或改名時 MUST 同步那份 vendor map，parity 由 `test/wt-batch-profile-identity.test.ts` 鎖住。直接呼叫 `wt-batch.ts` 的 `defaultLifecycle` 沒有 adapter；profile 仍有 `unknown` 欄位的 consumer 會讓 `validateProfile` 失敗——這兩種情況 cleanup **retain 每一個來源**。
+
+**Profile 驗不過的 repo 走 retire 路徑收尾**：`phase=landed` 的批次，只要 landed commit 由 Git 實查是 main 的祖先（pr-merge-based 另需 `mergeReceipt.merged`）、成員 branch 未前進、樹上 HEAD 與登記相符、無 `retain`／`removing`，`handoff-retire.ts` 就不再把該來源（與 ready 裡同 path＋head 的條目）算作 batch owner，由它的 archive→validate→recheck→remove 保存並移除。之後 `batch cleanup` 對「來源已不在、`docs/archives/retired-work.jsonl` 有 path＋branch＋head 完全相符的 `retired` 紀錄、且 archive 每個檔 hash 仍相符」的成員與 integration 記為 removed 並把批次轉 `cleaned`；紀錄不符或 archive 受損一律照舊 retain。**NEVER** 為了讓 retire 接手而改 state.json 的 phase 或刪 ready 條目。
+
+兩件事讀報告時要知道：
+
+- **Teardown 跑的是 main checkout 的 `scripts/wt-env-bootstrap.ts`，不是被刪那棵樹自己的那一份。** 一棵樹帶著的是它 fork 當天的 shim，於是 fork 早於某個 branch 命名形式的樹認不得自己的 branch（`E_BRANCH_SLUG`），結構上永遠刪不掉自己。Provisioning 仍用該樹自己的 shim，只有 teardown 換根。目標身分一律由 `--worktree` 決定，換根只換 config 與 script 的來源。**副作用**：provisioning 讀該樹的 config、teardown 讀 main 的 config，所以 `.claude/worktree-db.json` 的 prefix 在 fork 之後改過時，destroy 會算出不同的 dbName 而找不到 clone，留下 orphan。真的改過 prefix 時 MUST 先確認在途的樹已回收。
+- **Nested repository（典型：Pi dispatch clone 進 `.pi/git/**`、或 `modules/` 裡 deinitialized / damaged submodule git dir）預設整棵保存，不排除。** P0 全量保存：沒有 nested-repository adapter 證明可離線復原時 MUST retain。不能只把「有 `.git` 且 `is-bare-repository=true`」當 nested；source 與 captured common metadata 都要查。top-level fsck 不能替代 nested closure。有 adapter 且證明成立時仍保存 remote 交還不了的部分（修改過的 tracked 檔、untracked、ignored）；證明不成立就整棵保存。
+
+清理重試只跑 cleanup，不重跑完整品質鏈。下一次 `/commit` 或接手先檢查已落地待清理批次；使用原 integration 路徑取得的 commit lock，於刪 integration 之前釋放，或以原 canonical lock path 釋放。發布未授權不妨礙已正式落地的本地來源安全清理；PR 未合併則不能清理。

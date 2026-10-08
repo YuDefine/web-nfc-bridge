@@ -1,0 +1,264 @@
+#!/usr/bin/env bash
+# 🔒 LOCKED — managed by clade · Source: vendor/scripts/pre-commit/checks/supabase-migration-safety.sh · 改這裡無效，下次 propagate 會覆寫；請改 $CLADE_HOME/vendor/scripts/pre-commit/checks/supabase-migration-safety.sh
+# CLADE:VENDOR-SCRIPT
+#
+# supabase-migration-safety — 對 staged supabase migrations 做安全檢查
+#
+# Auto-detect：偵測 supabase/migrations/ 目錄存在 + 有 staged
+# supabase/migrations/*.sql 才跑。沒有 supabase 的 consumer 自動跳過。
+#
+# 規則：
+#   1) 禁止 `SET search_path = public` 等具名 schema 設定
+#      （Supabase function security best practice — 防 search_path injection）
+#      所有 function 必須使用 SET search_path = ''（空字串）
+#   2) Out-of-order timestamp 檢查
+#      新增 / rename 的 migration timestamp 必須晚於 origin/main 上的 latest
+#      （supabase db push 預設拒絕 out-of-order，會讓 production deploy 紅燈）
+#   3) 新增 migration 的風險分類（warn-only）：跑 classify-migrations.ts，非 online_safe 且
+#      檔內沒有 `-- Migration risk:` header 時警告——分類從 deploy 前提早到 commit，
+#      與 migration 是 `migration new` 手寫還是 declarative 產生無關
+#   4) supabase db lint --level warning（warn-only，不擋 commit）
+
+set -euo pipefail
+
+PROJECT_ROOT="$(git rev-parse --show-toplevel)"
+cd "$PROJECT_ROOT"
+
+# Auto-detect：沒有 supabase/migrations/ 直接跳
+[[ -d "supabase/migrations" ]] || exit 0
+
+# 蒐集 staged 的 migration SQL
+migration_files=()
+while IFS= read -r -d '' file; do
+  migration_files+=("$file")
+done < <(git diff --cached --name-only --diff-filter=ACM -z -- 'supabase/migrations/*.sql')
+
+((${#migration_files[@]} == 0)) && exit 0
+
+echo "🔍 偵測到 ${#migration_files[@]} 個 staged migration，執行安全檢查..."
+
+# 1) search_path 檢查
+# 用 awk 做 per-statement 驗證：先剝掉 `--` 行尾註解，再依 `;` 切成多個 statement，
+# 對每個 `SET search_path = X` 個別判斷。唯一允許 X = `''`（空字串）。
+# 為什麼不用 line-level grep -v：`SET search_path = ''; SET search_path = public`
+# 同一行混合允許 + 禁止形式時，line-level 過濾會把整行視為允許而漏掉違規 statement。
+forbidden=$(awk '
+  function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
+  {
+    line = $0
+    sub(/[ \t]*--.*$/, "", line)              # strip line comment
+    n = split(line, stmts, ";")
+    for (i = 1; i <= n; i++) {
+      s = trim(stmts[i])
+      if (s == "") continue
+      if (match(s, /^SET[ \t]+search_path[ \t]*=[ \t]*/)) {
+        val = trim(substr(s, RSTART + RLENGTH))
+        if (val != "\047\047") {              # \047 = single quote
+          printf("%s:%d: %s\n", FILENAME, NR, s)
+        }
+      }
+    }
+  }
+' "${migration_files[@]}" 2>/dev/null || true)
+if [[ -n "$forbidden" ]]; then
+  cat <<EOF >&2
+
+❌ 錯誤：發現禁止的 search_path 設定！
+
+$forbidden
+
+⚠️  所有函數必須使用 SET search_path = ''（空字串）
+   理由：Supabase function security best practice，防止 search_path injection
+   參考：https://supabase.com/docs/guides/database/functions#security-considerations
+
+正確範例：
+  SET search_path = ''               -- ✅ 正確
+  SET search_path = '';              -- ✅ 正確
+
+錯誤範例：
+  SET search_path = public, pg_temp  -- ❌ 錯誤
+  SET search_path = public           -- ❌ 錯誤
+  SET search_path = 'public'         -- ❌ 錯誤（帶引號的非空字串）
+  SET search_path = '', public       -- ❌ 錯誤（空字串後仍接非空 schema）
+
+EOF
+  exit 1
+fi
+
+# 2) Out-of-order timestamp 檢查
+# 抓 staged 新增 (A) + rename (R) 的 migration（rename 後新名也要符合順序）
+out_of_order=()
+while IFS= read -r -d '' file; do
+  out_of_order+=("$file")
+done < <(git diff --cached --name-only --diff-filter=AR -z -- 'supabase/migrations/*.sql')
+
+# Merge commit false-positive 防護（TD-190）：merge in progress（MERGE_HEAD 存在）
+# 時，staged diff（vs HEAD）含 merge 帶進來的 origin/main 既有 migration，
+# --diff-filter=AR 會把它們當「新增」→ 全判 out-of-order（含 latest 自己）。
+# 把已存在於 origin/main 的路徑從候選集合 exclude，只檢查真正本地新增 / rename 的檔案。
+if ((${#out_of_order[@]} > 0)) \
+  && git rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1 \
+  && git rev-parse --verify origin/main >/dev/null 2>&1; then
+  main_migration_paths=$(git ls-tree -r --name-only origin/main -- 'supabase/migrations/' 2>/dev/null || true)
+  filtered=()
+  for f in "${out_of_order[@]}"; do
+    if grep -qxF "$f" <<<"$main_migration_paths"; then
+      continue
+    fi
+    filtered+=("$f")
+  done
+  out_of_order=("${filtered[@]+"${filtered[@]}"}")
+fi
+
+if ((${#out_of_order[@]} > 0)); then
+  # origin/main 上 supabase/migrations/*.sql 的 latest timestamp
+  # 不主動 fetch（避免拖慢 commit），用 local cached origin/main ref
+  # origin/main 還沒有任何 migration 時 grep 無輸出回 1；pipefail 下那會讓整支
+  # hook 在 set -e 中止、不印任何原因，所以這裡把「沒有」收斂成空字串。
+  latest_on_main=""
+  if git rev-parse --verify origin/main >/dev/null 2>&1; then
+    latest_on_main=$(
+      git ls-tree -r --name-only origin/main -- 'supabase/migrations/' 2>/dev/null \
+        | awk -F/ '{print $NF}' \
+        | { grep -oE '^[0-9]{14}' || true; } \
+        | sort -n \
+        | tail -1
+    )
+  fi
+
+  if [[ -n "$latest_on_main" ]]; then
+    fail_entries=()
+    for f in "${out_of_order[@]}"; do
+      bname=$(basename "$f")
+      [[ "$bname" =~ ^[0-9]{14}_ ]] || continue
+      ts="${bname:0:14}"
+      # Catalog-alignment stub 豁免：多個 repo 共用一台 Postgres 時，
+      # supabase_migrations.schema_migrations 是整個 DB 一份、不分 schema，
+      # 於是 remote catalog 會出現本 repo 沒有的 version，`db push` 便以
+      # "Remote migration versions not found in local migrations directory"
+      # 整批拒絕。解法是補一個同名、零 SQL 的對齊檔——它的 version 必須逐字
+      # 等於 remote 那筆，rename 到當下 timestamp 反而會破壞對齊。
+      #
+      # 兩個條件都成立才豁免（缺一不可）：
+      #   1) 帶 CLADE:CATALOG-ALIGNMENT-STUB marker —— 表明是刻意的對齊檔
+      #   2) 檔案不含任何非註解、非空白行 —— 零 SQL 就不可能造成 out-of-order DDL
+      # 只看 marker 會放行「加了 marker 又寫 SQL」的檔；只看零 SQL 會放行
+      # 「忘了貼內容」的半成品。
+      if grep -q 'CLADE:CATALOG-ALIGNMENT-STUB' "$f" 2>/dev/null \
+        && ! grep -qE '^[[:space:]]*[^-[:space:]]' "$f" 2>/dev/null; then
+        echo "skip catalog-alignment stub: $bname" >&2
+        continue
+      fi
+      if [[ "$ts" < "$latest_on_main" || "$ts" == "$latest_on_main" ]]; then
+        fail_entries+=("$f|$ts")
+      fi
+    done
+
+    if ((${#fail_entries[@]} > 0)); then
+      now=$(date -u +%Y%m%d%H%M%S)
+      cat <<EOF >&2
+
+❌ 錯誤：偵測到 out-of-order migration（timestamp 早於或等於 origin/main latest）！
+
+origin/main 上 latest migration timestamp: $latest_on_main
+
+問題檔案：
+EOF
+      for entry in "${fail_entries[@]}"; do
+        f="${entry%|*}"
+        ts="${entry##*|}"
+        echo "  $f (timestamp: $ts)" >&2
+      done
+      cat <<EOF >&2
+
+⚠️  Supabase db push 預設拒絕 out-of-order migration —
+   tag push 觸發 production deploy 時會紅燈。
+
+修正方式（rename 到當下 UTC timestamp）：
+EOF
+      for entry in "${fail_entries[@]}"; do
+        f="${entry%|*}"
+        bname=$(basename "$f")
+        # 切掉 14 位 timestamp + 底線，保留 descriptor
+        rest="${bname:15}"
+        echo "  git mv $f supabase/migrations/${now}_${rest}" >&2
+      done
+      cat <<'EOF' >&2
+
+繞過：若已驗證遠端環境從未 applied 此 migration、確需保留原 timestamp，
+      此 hook 仍會擋；請依上述 git mv 命令重新命名後再 commit。
+
+例外 —— catalog-alignment stub：多個 repo 共用同一台 Postgres 時，remote catalog
+      會有本 repo 沒有的 version，db push 整批拒絕。此時補的同名零 SQL 對齊檔
+      MUST 保留原 timestamp（rename 會破壞對齊），本 hook 會放行，條件是
+      同時滿足：檔案含 CLADE:CATALOG-ALIGNMENT-STUB marker，且不含任何
+      非註解、非空白行。詳見規約的「例外：catalog-alignment stub」段。
+
+詳細規則：rules/modules/db-schema/supabase/migration.md
+          「Timestamp 順序契約」段落
+
+EOF
+      exit 1
+    fi
+  fi
+fi
+
+# 3) 新增 migration 的風險分類（warn-only，排在 db lint 前：lint 可能因 Docker 未起而很慢）
+# classifier 用 clade canonical 優先（`--unannotated` 是新旗標，consumer 的舊 vendor 副本不認得），
+# 否則 repo 內副本；clade root 找法鏡射 clade-projection-drift.sh。找不到、沒有 node 或副本
+# 太舊就跳過——deploy 前的分類仍是 hard gate，這裡只是提早提醒。
+added_migrations=()
+while IFS= read -r -d '' file; do
+  added_migrations+=("$file")
+done < <(git diff --cached --name-only --diff-filter=A -z -- 'supabase/migrations/*.sql')
+
+if ((${#added_migrations[@]} > 0)) && command -v node >/dev/null 2>&1; then
+  clade_root="${CLADE_HOME:-}"
+  for candidate in "$HOME/clade" "$HOME/offline/clade"; do
+    [[ -n "$clade_root" ]] && break
+    [[ -d "$candidate" ]] && clade_root="$candidate"
+  done
+  classifier=""
+  for candidate in ${clade_root:+"$clade_root/vendor/scripts/classify-migrations.ts"} \
+    vendor/scripts/classify-migrations.ts scripts/classify-migrations.ts; do
+    if [[ -f "$candidate" ]]; then
+      classifier="$candidate"
+      break
+    fi
+  done
+  unannotated=""
+  [[ -n "$classifier" ]] \
+    && unannotated=$(node "$classifier" --unannotated "${added_migrations[@]}" 2>/dev/null || true)
+  if [[ -n "$unannotated" ]]; then
+    cat <<EOF >&2
+
+⚠️  新增 migration 分類非 online_safe，且缺 \`-- Migration risk:\` header（不擋 commit；deploy 前仍是 hard gate）：
+$unannotated
+
+   在 SQL 檔頭補三行（格式見 rules/modules/db-schema/supabase/migration.md § Pending Migration 分類）：
+     -- Migration risk: <分類>
+     -- Root cause: <觸發高風險分類的原因>
+     -- Lock strategy: <lock_timeout／concurrent／maintenance window 或無鎖理由>
+
+EOF
+  fi
+fi
+
+# 4) supabase db lint（warn-only）
+if command -v supabase >/dev/null 2>&1; then
+  echo "🔍 supabase db lint --level warning..."
+  if ! supabase db lint --level warning 2>/dev/null; then
+    cat <<'EOF' >&2
+
+⚠️  supabase linter 發現問題（不擋 commit，但建議修正）
+    詳情：supabase db lint --level warning
+
+EOF
+  else
+    echo "✅ supabase linter 通過"
+  fi
+else
+  echo "⊘ 未安裝 supabase CLI — 跳過 db lint" >&2
+fi
+
+echo "✅ migration 安全檢查完成"

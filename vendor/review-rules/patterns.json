@@ -1,0 +1,367 @@
+{
+  "$schema": "review-rules/v1",
+  "description": "clade 統一管理的共用 review 清單 — 機械可檢規則。由 pre-commit hook + audit script 消費。",
+  "rules": [
+    {
+      "id": "ubadge-size-ban",
+      "section": 3,
+      "severity": "error",
+      "fileGlob": "*.vue",
+      "multiLine": true,
+      "pattern": "<(Lazy)?UBadge[^>]*size=\"(xs|sm)\"",
+      "message": "UBadge size 只允許 md / lg / xl（或省略吃預設 md）。xs / sm 在密集表格字級過小、可讀性不足。",
+      "fix": "移除 size prop（吃預設 md），或顯式寫 size=\"md\" / \"lg\" / \"xl\"。"
+    },
+    {
+      "id": "ubadge-size-ban-dynamic",
+      "section": 3,
+      "severity": "error",
+      "fileGlob": "*.vue",
+      "multiLine": true,
+      "pattern": ":is=\"UBadge\"[^>]*size=\"(xs|sm)\"",
+      "message": "動態元件 :is=\"UBadge\" 的 size 只允許 md / lg / xl（或省略吃預設 md）。xs / sm 在密集表格字級過小、可讀性不足。",
+      "fix": "移除 size prop（吃預設 md），或顯式寫 size=\"md\" / \"lg\" / \"xl\"。"
+    },
+    {
+      "id": "client-side-mutation",
+      "section": 4,
+      "severity": "error",
+      "fileGlob": "*.vue",
+      "scanPaths": ["app/", "packages/*/app/"],
+      "pattern": "\\.(insert|update|delete|upsert)\\s*\\(",
+      "excludePattern": "\\.select\\(|\\.delete\\([^)]+\\)",
+      "message": "Client 端禁止直接寫入 DB。所有 mutation 必須透過 server/api/v1/* 的 Server API。",
+      "fix": "把 .insert() / .update() / .delete() / .upsert() 移到 server/api/ endpoint。"
+    },
+    {
+      "id": "dark-mode-hardcoded-color",
+      "section": 5,
+      "severity": "warning",
+      "fileGlob": "*.vue",
+      "pattern": "(bg|text|border)-(white|black|gray-[0-9]+|slate-[0-9]+|zinc-[0-9]+|neutral-[0-9]+)",
+      "excludePattern": "dark:",
+      "message": "hardcoded 灰階色 class 在 dark mode 不會自動反轉。用 Nuxt UI semantic token（bg-default / text-muted 等）或配對 dark: variant。",
+      "fix": "改用 Nuxt UI semantic color class（bg-default、text-default、text-muted、bg-elevated 等），或加對應 dark: variant。"
+    },
+    {
+      "id": "raw-img-tag",
+      "section": 1,
+      "severity": "warning",
+      "fileGlob": "*.vue",
+      "pattern": "<img\\s",
+      "excludePattern": "<!-- raw-img -->",
+      "message": "<img> 應改用 <NuxtImg>（自動優化 + responsive）。真需原生 <img> 在同行加 <!-- raw-img --> 標記。",
+      "fix": "改用 <NuxtImg src=\"...\" /> 或在 <img> 同行加 <!-- raw-img --> exemption marker。"
+    },
+    {
+      "id": "overlay-width-class",
+      "section": 2,
+      "severity": "error",
+      "fileGlob": "*.vue",
+      "pattern": "<(UModal|USlideover|UDrawer)[^>]*class=\"[^\"]*max-w-",
+      "message": "Overlay 寬度必須用 :ui prop 覆寫，不可寫在 root class。class=\"max-w-*\" 不會覆蓋 content slot 的寬度約束。",
+      "fix": "改用 :ui=\"{ content: 'sm:max-w-2xl' }\" 覆寫 content slot。"
+    },
+    {
+      "id": "dark-mode-dark-prefix",
+      "section": 5,
+      "severity": "warning",
+      "fileGlob": "*.vue",
+      "pattern": "dark:(text|bg|border)-",
+      "excludePattern": "--ui-",
+      "message": "Nuxt UI color mode 會根據 semantic token 自動切色，手寫 dark: variant 會與系統衝突造成不一致。",
+      "fix": "改用 Nuxt UI semantic token（text-default / bg-default / border-default 等），由 color mode 自動處理。"
+    },
+    {
+      "id": "calendar-popover-min-width",
+      "section": 3,
+      "severity": "warning",
+      "fileGlob": "*.vue",
+      "pattern": "<UCalendar[^>]*class=\"[^\"]*(?!min-w-)",
+      "excludePattern": "min-w-",
+      "message": "UCalendar 在 UPopover 內使用時 MUST 設 min-w-[280px]（或透過 app.config.ts calendar.slots.root 全域設定）。CJK locale 的年份標籤（如「2020年」）在預設寬度下會擠成一塊。",
+      "fix": "在 UCalendar 加 class=\"min-w-[280px]\"，或在 app.config.ts 加 ui.calendar.slots.root: 'min-w-[280px]'。"
+    },
+    {
+      "id": "dark-mode-semantic-color",
+      "section": 5,
+      "severity": "warning",
+      "fileGlob": "*.vue",
+      "pattern": "(bg|text)-(blue|green|red|yellow|orange|purple|pink)-(50|100|500|600|700)",
+      "message": "語意色應用 Nuxt UI color token + opacity，不可 hardcode Tailwind 色彩值。",
+      "fix": "改用 bg-info/10 / text-error / text-success / text-warning 等 Nuxt UI semantic token。"
+    },
+    {
+      "id": "ubadge-size-ban-config",
+      "section": 3,
+      "severity": "error",
+      "fileGlob": "app.config.*",
+      "pattern": "size\\s*:\\s*['\"](?:xs|sm)['\"]",
+      "message": "app.config 的 badge defaultVariants.size 只允許 md / lg / xl。xs / sm 在密集表格字級過小、可讀性不足。透過 config 設定跟直接在 template 寫效果相同，一律禁止。",
+      "fix": "移除 size 欄位（吃預設 md），或改為 'md' / 'lg' / 'xl'。"
+    },
+    {
+      "id": "app-imports-server-internals",
+      "section": 6,
+      "severity": "error",
+      "layer": "ratchet",
+      "fileGlob": "app/**",
+      "pattern": "^(?!\\s*import\\s+type\\b).*from\\s+['\"]~{1,2}\\/server\\/",
+      "message": "app 層禁 import server 內部模組（type-only import 除外）——分層真相見 clade-review-rules §6。",
+      "fix": "改從 shared/schemas/** 或 shared/types/** 取型別／契約；真需 server 端邏輯，改走 server/api/** 的 HTTP endpoint，不要直接 import server 內部模組。"
+    },
+    {
+      "id": "shared-imports-server-internals",
+      "section": 6,
+      "severity": "error",
+      "layer": "ratchet",
+      "fileGlob": "shared/**",
+      "pattern": "^(?!\\s*import\\s+type\\b).*from\\s+['\"]~{1,2}\\/server\\/",
+      "message": "shared 層禁 import server 內部模組（type-only import 除外）——shared 同時被 client 與 server 匯入，從這裡 import 會把 server 碼一路帶進 client bundle。分層真相見 clade-review-rules §6。",
+      "fix": "改從 shared/schemas/** 或 shared/types/** 取型別／契約；真需 server 端邏輯，改走 server/api/** 的 HTTP endpoint，不要直接 import server 內部模組。"
+    },
+    {
+      "id": "server-console-logging",
+      "section": 8,
+      "severity": "error",
+      "layer": "ratchet",
+      "fileGlob": "server/**",
+      "exclude": ["**/*.test.*", "**/*.spec.*"],
+      "pattern": "\\bconsole\\.(log|warn|error|info|debug)\\(",
+      "message": "server 端一律走 evlog logger，禁裸 console——見 clade-review-rules §8。",
+      "fix": "API handler 用 useLogger(event) 取得的 log.*；job/cron 用 createLogger()。純 build/CLI script（scripts/**）例外，不受此規則約束。"
+    },
+    {
+      "id": "server-raw-throw-error",
+      "section": 8,
+      "severity": "error",
+      "layer": "ratchet",
+      "fileGlob": "server/api/**",
+      "pattern": "throw\\s+new\\s+Error\\(",
+      "message": "API handler 用 createError 帶 statusCode，禁裸 throw new Error——見 clade-review-rules §8。",
+      "fix": "改用 throw createError({ statusCode, statusMessage, message })，讓 client 拿到結構化 HTTP 錯誤而非未分類 500。"
+    },
+    {
+      "id": "audit-table-direct-insert",
+      "section": 9,
+      "severity": "error",
+      "layer": "ratchet",
+      "fileGlob": "server/**",
+      "exclude": ["**/audit/**"],
+      "pattern": "\\.from\\((['\"])(audit_logs|operation_logs)\\1\\)\\s*\\.insert|INSERT\\s+INTO\\s+(audit_logs|operation_logs)",
+      "message": "禁直插 audit 表，走 audit() helper——D-pattern 見 clade-review-rules §9。",
+      "fix": "改用 server/utils/audit.ts 的 audit() helper 寫入稽核紀錄，不要直接 .from('audit_logs').insert(...) 或裸 SQL INSERT INTO。"
+    },
+    {
+      "id": "fontsource-bare-import",
+      "section": 10,
+      "severity": "error",
+      "fileGlob": "**/*.css",
+      "pattern": "^\\s*@import\\s+['\"]@fontsource/[^/'\"]+['\"]",
+      "message": "@fontsource 靜態字型 bare import 只載入 weight 400（Fontsource 官方預設值），font-medium / font-semibold / font-bold 因此退化成瀏覽器合成粗體；CJK 字型的 faux bold 會讓筆畫糊化，是視覺正確性缺陷而非單純效能問題。",
+      "fix": "改為明列實際用到的 weight subpath：@import '@fontsource/<name>/400.css'; @import '@fontsource/<name>/600.css';。或改由 @nuxt/fonts 單一來源管理——但 NEVER 與 CSS @import 併存，兩者同時宣告同一字型會造成雙重載入。@fontsource-variable/* 是可變字型、bare import 即涵蓋全 weight，不受本規則約束。",
+      "excludePattern": "fontsource-bare-ok"
+    },
+    {
+      "id": "nuxtimg-missing-sizes",
+      "section": 10,
+      "severity": "warning",
+      "layer": "ratchet",
+      "fileGlob": "*.vue",
+      "multiLine": true,
+      "pattern": "<(Lazy)?Nuxt(Img|Picture)(?![^>]*\\bsizes=)[^>]*>",
+      "excludePattern": "data-no-srcset|src=[\"']data:",
+      "message": "NuxtImg / NuxtPicture 缺 sizes：沒有 sizes 就產生不出 responsive srcset，@nuxt/image 只做了格式轉換、沒做尺寸協商，手機也會下載桌機尺寸的原圖。",
+      "fix": "補 sizes（例：sizes=\"(max-width: 640px) 50vw, 200px\"），並搭配明確 width / height 消 CLS。非首屏圖另加 loading=\"lazy\"；LCP 圖反過來用 loading=\"eager\" + preload + fetchpriority=\"high\"。固定像素尺寸的 logo / avatar / QR code 這類不需要 srcset 的，在 tag 上加 data-no-srcset=\"<理由>\" 豁免。"
+    },
+    {
+      "id": "heavy-lib-client-static-import",
+      "section": 10,
+      "severity": "warning",
+      "layer": "ratchet",
+      "fileGlob": "*.vue",
+      "pattern": "^\\s*import\\s+(?!type\\s)[^;\\n]*from\\s+['\"](exceljs|jspdf|xlsx|pdfmake|html2canvas|monaco-editor|echarts(/[\\w-]+)?|@unovis/[\\w-]+)['\"]",
+      "excludePattern": "heavy-lib-ok",
+      "message": "重函式庫在元件層靜態 import 會整包綁進該 route 的同步 chunk（exceljs ~909KiB / jspdf ~424KiB / unovis ~910KiB / echarts ~507KB 級），使用者即使沒用到該功能也得先下載完才能互動。",
+      "fix": "依用途二選一：(1) **按需觸發**的功能（Excel 匯出 / PDF 產生 / 截圖）改成 handler 內 await import('exceljs')，只有真的點下去才下載；(2) **渲染必需**的函式庫（圖表）維持 import，但把用到它的元件本身改 <LazyXxxChart />，讓整個元件連同函式庫一起切成 async chunk——注意改 import 形式對這類無效，因為元件一渲染就需要它。確有理由必須同步載入的個案在該行加 heavy-lib-ok 標記豁免。"
+    },
+    {
+      "id": "lazy-atomic-component",
+      "section": 10,
+      "severity": "warning",
+      "layer": "ratchet",
+      "fileGlob": "*.vue",
+      "pattern": "<Lazy(UButton|UBadge|UIcon|USeparator|USkeleton|UFormField|UInput|UTextarea|UAlert|UTooltip|UKbd|UAvatar|UChip)\\b",
+      "excludePattern": "lazy-atomic-ok",
+      "message": "首屏輕量原子元件加 Lazy 前綴是淨負面：拆出獨立 async chunk 卻換不到 hydration 節省（Nuxt 官方明載 Avoid delayed hydration for critical, above-the-fold content）。LazyUSkeleton 尤其本末倒置——loading 指示器自己得先等 chunk 下載完才顯示。",
+      "fix": "移除 Lazy 前綴，改用一般元件。只有真正該延後載入的重元件（chart / editor / map / 大型 modal）才用 Lazy。ssr: true 的專案另 MUST 搭 hydration strategy（hydrate-on-visible / hydrate-on-idle / hydrate-on-interaction）；ssr: false 的 SPA 沒有 hydration 階段，NEVER 補這些屬性（無效程式碼），<Lazy*> 的 code-split 效果本身仍有效。確有正當理由的個案在該行加 lazy-atomic-ok 標記豁免。"
+    },
+    {
+      "id": "colada-query-missing-signal",
+      "section": 10,
+      "severity": "warning",
+      "layer": "ratchet",
+      "fileGlob": "*.vue",
+      "pattern": "query:\\s*(?:async\\s*)?\\(\\s*\\)\\s*=>",
+      "excludePattern": "colada-signal-ok",
+      "message": "Pinia Colada 的取消是無條件的——每次 fetch() 砍前一個 pending、最後一個 dep 移除進 gc 排程時也砍。但 query function 沒接住 signal 就沒有東西可砍，切 tab / 離開頁面時瀏覽器仍會把整個 response body 下載完，取消等於空包彈。",
+      "fix": "把 query 改成 query: ({ signal }) => $fetch(url, { signal })（nuxt-data-perf HR-6）。共用 client 的 onRequest interceptor NEVER 覆寫已存在的 options.signal，需要自己的 controller 時用 AbortSignal.any([options.signal, mine]) 合併。範本：vendor/snippets/nuxt-data-perf/colada-query-signal.ts。確有理由不接 signal 的個案在該行加 colada-signal-ok 標記豁免。"
+    },
+    {
+      "id": "colada-query-missing-signal-ts",
+      "section": 10,
+      "severity": "warning",
+      "layer": "ratchet",
+      "fileGlob": "**/queries/**",
+      "pattern": "query:\\s*(?:async\\s*)?\\(\\s*\\)\\s*=>",
+      "excludePattern": "colada-signal-ok",
+      "message": "Pinia Colada 的取消是無條件的——每次 fetch() 砍前一個 pending、最後一個 dep 移除進 gc 排程時也砍。但 query function 沒接住 signal 就沒有東西可砍，切 tab / 離開頁面時瀏覽器仍會把整個 response body 下載完，取消等於空包彈。",
+      "fix": "把 query 改成 query: ({ signal }) => $fetch(url, { signal })（nuxt-data-perf HR-6）。共用 client 的 onRequest interceptor NEVER 覆寫已存在的 options.signal，需要自己的 controller 時用 AbortSignal.any([options.signal, mine]) 合併。範本：vendor/snippets/nuxt-data-perf/colada-query-signal.ts。確有理由不接 signal 的個案在該行加 colada-signal-ok 標記豁免。"
+    },
+    {
+      "id": "closing-brace-tag",
+      "matchComments": true,
+      "section": 11,
+      "severity": "warning",
+      "fileGlob": "**/*.ts",
+      "pattern": "\\}\\s*//\\s*[Ee]nd(\\s+[Oo]f)?\\b",
+      "message": "} // end 這類 closing-brace tag 是編輯器摺疊還沒出現時的遺物。函式 / 區塊過長到需要標結尾 = 該抽函式，不是該加註解。",
+      "fix": "刪掉 } 後面的 // end … 註解。若沒有它就對不到結尾，把區塊抽成具名函式。"
+    },
+    {
+      "id": "file-header-changelog",
+      "matchComments": true,
+      "section": 11,
+      "severity": "warning",
+      "fileGlob": "**/*.ts",
+      "pattern": "^\\s*(//|\\*)\\s*(@author|Modified by|Change[ -]?log|Created by)\\b",
+      "message": "檔頭 @author / Modified by / Change log 區塊與 git history 重複，而且會過期。作者與變更紀錄以 git 為準。",
+      "fix": "刪掉檔頭 changelog / @author 區塊。workaround 成因改寫成帶 @followup[<id>] 的一行註解（id 用 follow-up register 的登記：plan:<work-id>；未遷移 consumer 用 TD-NNN），見 code-style.md § 註解。"
+    },
+    {
+      "id": "prose-difficulty-dismissal-en",
+      "matchComments": true,
+      "severity": "warning",
+      "fileGlob": "**",
+      "scanPaths": ["content/", "app/pages/"],
+      "pattern": "\\b([Ee]asy|[Ss]imple|[Jj]ust|[Oo]bvious|[Ss]traightforward|[Tt]rivial)\\b",
+      "excludePattern": "^\\s*(//|<!--)|`[^`]*\\b([Ee]asy|[Ss]imple|[Jj]ust|[Oo]bvious|[Ss]traightforward|[Tt]rivial)\\b[^`]*`",
+      "message": "對外文案 NEVER 用難度詞描述任務。讀者卡在這一步時，這些詞不提供協助，只告訴他「卡住的是你的問題」。severity 是 warning 而非 error：行層掃描看不出 markdown code fence 與 .vue script 區塊，套件名 / 識別字裡的 simple、just 會誤報。",
+      "fix": "把字數花在下一個實際動作上。套件名 / 指令名等識別字請用 `code font` 包起來（inline code 已自動豁免）。"
+    },
+    {
+      "id": "prose-vague-anchor-text",
+      "matchComments": true,
+      "severity": "error",
+      "fileGlob": "**",
+      "scanPaths": ["content/", "app/pages/"],
+      "pattern": "\\[(點這裡|點擊這裡|這裡|詳見連結|連結|[Cc]lick [Hh]ere|here)\\]\\(|>\\s*(點這裡|點擊這裡|詳見連結|[Cc]lick [Hh]ere)\\s*<",
+      "message": "錨文字 MUST 說出目的地是什麼。螢幕閱讀器使用者會拿到一串「點這裡」，無從分辨。",
+      "fix": "把錨文字換成目的地名稱：[Nuxt 的 SSR 設定](...) 勝過 [點這裡](...)。"
+    },
+    {
+      "id": "prose-anthropomorphism",
+      "matchComments": true,
+      "severity": "error",
+      "fileGlob": "**",
+      "scanPaths": ["content/", "app/pages/"],
+      "pattern": "(系統認為|系統以為|系統覺得|它以為|程式覺得|機器不喜歡)",
+      "message": "NEVER 用擬人化描述系統行為。讀者無法從「系統認為」推出任何可操作的下一步。",
+      "fix": "寫實際發生的事與判定條件：「系統把這筆記錄判定為逾期，因為結束時間早於開始時間。」"
+    },
+    {
+      "id": "prose-appeal-to-authority",
+      "matchComments": true,
+      "severity": "warning",
+      "fileGlob": "**",
+      "scanPaths": ["content/", "app/pages/"],
+      "exclude": ["content/authors/**"],
+      "pattern": "(最佳實踐|業界標準|大家都這樣做|業界慣例)|[Bb]est [Pp]ractice|[Ii]ndustry [Ss]tandard",
+      "message": "訴諸權威不是理由。讀者無法從「這是最佳實踐」判斷該不該照做。",
+      "fix": "寫出問題是什麼、這樣做省下什麼、代價是什麼。寫不出這三項時，那條建議本身還沒想清楚。"
+    },
+    {
+      "id": "text-size-floor",
+      "section": 3,
+      "severity": "error",
+      "layer": "ratchet",
+      "fileGlob": "*.vue",
+      "pattern": "\\b(?:text-xs\\b|text-\\[(?:[0-9]|1[0-3])px\\])",
+      "message": "字級下限是 text-sm（14px）。text-xs 與任意 text-[<14px] 一律禁——這些畫面主要在手機上讀，而 14px 也是 iOS 不觸發輸入框 auto-zoom 的下限。",
+      "fix": "改用 text-sm 或更大。真的需要次要層級就用 text-muted / font-normal 降對比，NEVER 用縮字級表達層級。"
+    },
+    {
+      "id": "interactive-size-floor",
+      "section": 3,
+      "severity": "error",
+      "layer": "ratchet",
+      "fileGlob": "*.vue",
+      "multiLine": true,
+      "pattern": "<(?:Lazy)?U(?:Button|Input|InputNumber|Select|SelectMenu|Textarea|Checkbox|Radio|Switch)\\b[^>]*size=\"xs\"",
+      "message": "可點擊元件的 size 下限是 sm，禁 xs。理由比 UBadge 那條更強：UBadge 只是讀不清楚，可點擊元件的 xs 是觸控目標過小，屬可用性缺陷。",
+      "fix": "移除 size prop（吃預設）或顯式寫 sm / md / lg。密集版面要省空間就調 padding 與間距，NEVER 縮點擊目標。"
+    }
+  ],
+  "semantic": [
+    {
+      "id": "reader-facing-prose",
+      "title": "對外文案的段落契約、標題與步驟結構（writing-for-humans 判斷層）",
+      "guidance": "只對 content/** 與 app/pages/** 的 diff 適用；其餘檔案判 n/a。逐字類（英文難度詞、錨文字、擬人化、訴諸權威）已由機械規則 prose-* 擋下，本 verdict 只判機器測不了的四件事：(1) 難度詞的上下文——中文「簡單 / 容易 / 只要 / 不難」機械層刻意不擋，因為「判準很簡單：X」這類收斂句是本 fleet blog-voice 要求的文體；要判的是它有沒有被用來描述『讀者該覺得容易』，是則 fail，描述判準本身簡短則 pass。(2) 段落契約——每一節第一段的第 1 句給讀者遇到的狀況（不是功能名稱）、第 2 句讓他當場決定要不要往下讀；用功能名開場（『本節介紹 X 模組的設計』）是 fail。(3) 標題描述讀者的問題或任務而非功能名稱：『為什麼百分比跟我算的不一樣』勝過『壽命百分比計算邏輯』。(4) 操作步驟四部件——引導句結尾冒號、順序步驟用編號不用 bullet、每步動詞開頭且條件寫在動作之前、選用步驟明標『選用：』，且流程結束給一句怎麼確認做對了。複合 verdict：任一適用的檢查不通過即 fail；全部不適用才 n/a。SoT 見 rules/modules/docs-audience/human-zh-tw/writing-for-humans.md。"
+    },
+    {
+      "id": "lazy-hydration-strategy",
+      "title": "Lazy 元件須搭 hydration strategy，且不得用於首屏",
+      "guidance": "每個新增的 <Lazy*> 元件都須判斷：(1) 它是否真的非首屏或條件渲染——首屏元件用 Lazy 只多切一個必定被下載的 chunk 卻無收益，應移除前綴（全部 consumer 適用）；(2) 僅當本專案 ssr: true 時才檢查有無 hydration strategy。ssr: false（SPA）沒有 hydration 階段——Vue 的 hydrateStrategy 只在 __asyncHydrate() 路徑被讀取，SPA 走一般 mount 完全不經過，要求補 hydrate-on-* 等於要求寫無效程式碼，須判 n/a 而非 fail。SSR 專案另注意三個讓 strategy 靜默失效的限制：任何 prop 變更會立即觸發 hydration 繞過 strategy；lazy hydration 僅在 SFC 有效；prop 必須寫在 template 上（不可用 v-bind 展開物件）。複合 verdict 規則：只要**有任一適用的檢查不通過**就判 fail；只有在**全部**檢查都不適用時才判 n/a。SPA 專案的 (2) 不適用不會讓整條規則變 n/a——(1) 對全部 consumer 都適用，diff 內有首屏原子元件加 Lazy 就是 fail，即使機械層 lazy-atomic-component 也會擋同一行。 機械層 lazy-atomic-component 只擋最明確的原子元件濫用，本 verdict 補判斷需讀 context 的部分（clade-review-rules.md § Nuxt 效能規約）。"
+    },
+    {
+      "id": "nitro-cache-auth-safety",
+      "title": "Nitro 快取不得套用於帶認證的 endpoint",
+      "guidance": "defineCachedEventHandler / cachedEventHandler / defineCachedFunction 的 diff 須逐一檢查認證邊界。Nitro 官方明載 Request headers are dropped when handling cached responses——對帶 auth 的 endpoint 套用會把 A 使用者的回應快取後回給 B 使用者，屬跨使用者資料外洩。僅允許用於「回應內容與呼叫者身分完全無關」的 public endpoint；若 endpoint 確實依身分而變又需要快取，MUST 用 getKey() 把使用者識別納入快取鍵、並用 varies 保留必要 header。另檢查部署目標：Nitro production 預設 memory storage，在 Cloudflare Workers 上不跨 isolate 持久，等同快取未生效，須顯式設定 storage driver（如 cloudflare-kv-binding）（clade-review-rules.md § Nuxt 效能規約）。"
+    },
+    {
+      "id": "overlay-body-slot",
+      "title": "Overlay 內容須放 #body slot",
+      "guidance": "USlideover/UModal/UDrawer 用 :open 且無 trigger 時 default slot 應為空，內容須放 #body slot；#header 內手寫 close button 應優先改用 title prop（clade-review-rules.md § Overlay 元件語意補充）。"
+    },
+    {
+      "id": "layered-truth",
+      "title": "分層真相／API 契約單一來源",
+      "guidance": "request/response contract 真相須在 shared/schemas/**，shared/types/** 只能相容轉發或做 UI view-model；handler 預設用 getSupabaseWithContext(event)（modules.auth 為 better-auth / nuxt-auth-utils 的 consumer 等價名為 getAuthedSupabase(event)，兩者皆不做授權，授權在 handler），回傳前須經 response schema parse() 做 drift guard（clade-review-rules.md § 分層真相 / API 契約）。"
+    },
+    {
+      "id": "error-localization",
+      "title": "錯誤訊息本地化與 unknown-code 顯示",
+      "guidance": "UI 錯誤訊息須本地化且 unknown code 須有 fallback 顯示；機械可檢部分已收斂進 nuxt-error-localization.md path-scoped rule，clade-review-rules.md 本節僅留 hot-zone pointer。"
+    },
+    {
+      "id": "evlog-consistency",
+      "title": "evlog 採用一致性（缺 logger 的檔）",
+      "guidance": "已採用 evlog 的專案，新寫/大改的 server 程式碼須套用 evlog pattern；機械層已擋 console.* / no-why createError，本 verdict 補判斷『handler 缺第一行 const log = useLogger(event)』這類需逐檔讀的缺 logger 情形（clade-review-rules.md § evlog 採用一致性）。"
+    },
+    {
+      "id": "d-pattern-audit",
+      "title": "D-pattern：mutation 缺 audit() 呼叫",
+      "guidance": "已採用 D-pattern 的專案，新寫/大改 mutation handler 須套用；機械層已擋 helper bypass / PII in migration，本 verdict 補判斷『該 audit 的 mutation 是否缺對應 audit() 呼叫』（clade-review-rules.md § D-pattern audit 一致性）。"
+    },
+    {
+      "id": "form-validation",
+      "title": "UForm + Zod 驗證採用",
+      "guidance": "表單驗證應採用 UForm + Zod schema 一致模式；機械可檢的 maxlength 缺漏已收斂進 nuxt-form-validation.md path-scoped rule，clade-review-rules.md 本節僅留 hot-zone pointer，本 verdict 補判斷整體 UForm 採用是否到位。"
+    },
+    {
+      "id": "a11y-adoption",
+      "title": "a11y 採用一致性（focus trap／heading 層級）",
+      "guidance": "已採用 @nuxt/a11y 的專案，新寫/大改 UI 元件須套用 a11y 規則；機械層已擋 img 缺 alt / icon 缺 aria-label / 正數 tabindex 等 10 條 grep signal，本 verdict 補判斷『自製 modal 缺 focus trap』與『heading 跳級（h1 後直接 h3）』這類需語意判斷的項目（clade-review-rules.md § Nuxt a11y 採用一致性）。"
+    },
+    {
+      "id": "doc-sync",
+      "title": "Bug 修正／行為變更的文件同步",
+      "guidance": "行為變更的 diff 要檢查對應文件（README / docs/ / rules / cookbook / CHANGELOG 慣例）是否同步更新；有行為變更但文件未動 → fail 並指名該補哪份"
+    },
+    {
+      "id": "comment-test-conditional",
+      "title": "註解與測試的條件式判準",
+      "guidance": "只審本次 diff 新增或改到的行。新增註解：命中 code-style.md § 該刪的註解（C0 轉述 SSoT、C1 歷史敘事、C2 工作編號當理由、C3 行內日期、C4 翻譯 code、C5 注解掉的程式碼、C6 測試檔頭重述檔名）→ fail 並指名類別與該怎麼改；C0 先問該事實是否該進 SSoT。@followup[<id>]、結案改寫「（<id> 結案：…）」與指令型註解（@ts-expect-error、oxlint-disable 等）不算。新增 unit test：一列都不中 testing-anti-patterns.md § unit test 何時寫 的 U1–U4，或斷言對象是只給人讀的 prose、load-bearing 規約句（U5，應登記 rule-invariants）→ fail。刪測試：刪的是閘門類（U3）或某段產品碼唯一的行為測試 → fail。"
+    }
+  ]
+}

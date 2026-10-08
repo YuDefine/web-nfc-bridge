@@ -1,0 +1,73 @@
+# 收割（每個 notification 到達時做）
+
+
+> Runtime split: state, ownership, approval, and completion obligations are shared. Literal Claude tool names or runner commands in this reference are Claude host bindings; other hosts MUST use their adapter fragment or retain the dependent operation blocked.
+
+
+> 主檔 pointer：「每一個 `<task-notification>` 到達時立即走收割 SOP，MUST 先完整讀本檔」。
+
+## 收割不是階段，是 pipeline 的一段
+
+**觸發條件**：任一 in-flight agent 回報（`<task-notification>` 或 SendMessage）。**不需要**等 priority list 清空——收割 SOP 每一步都只用到**該 agent 自己**的產出，沒有一步需要「全部 agent 的結果」。把它做成 dispatch 之後的獨立階段，會讓先完成的 agent 成果乾等最慢的那個。
+
+收割完 → 從扇出組補一個 dispatch → 主線回去做序列組。dispatch 與收割全程交錯。
+
+**為什麼一定要收割**：dispatch 是非同步的——agent 完成時會產生**新的 actionable items**（apply 完成 → 可補 evidence / 可 archive），只有 re-scan 才看得到。不收割的 loop 在 dispatch 完就退出，archive / commit 全部懸空。
+
+### 驗收後登記批次（hard rule）
+
+驗收確認 worktree 有 checkpoint、scope 正確且原執行者已釋出寫入權後，主線讀 commit skill 的 `batch.md` 登記就緒並評估觸發條件：
+
+| 來源 | 何時落地 | 怎麼 commit |
+| --- | --- | --- |
+| plan package 需求 | 原實作 wt 的驗收 gate 完成並 checkpoint 後 | 登記就緒；達批次條件才 invoke 一次 `/commit` |
+| 非 plan（ad-hoc 隔離環境） | harvest 驗收後 | 登記就緒；達批次條件才 invoke 一次 `/commit` |
+
+每次收割與 session 接手跑 `wt-helper batch status --trigger auto --workflow <workflow_model>`：達 `batch.md` 的 auto 門檻（`pr-merge-based` 1 件、`trunk-based` 4 件 distinct work id）自動提交；不足時繼續開發。手動 `/commit`／merge back 無最低件數，dependency／drained／stop 提前結批。單純交接不結批。批次在隔離整合區審查，落地後由 commit skill cleanup，**NEVER** 收一個 wt 就重跑一遍完整 `/commit`。
+
+**NEVER** 用 `git commit --only` 把 source / migration / plugin 送上 main。`--only` 只給 [[commit.detail]] 白名單。卡 `/commit` 人工檢查 → packaging，**NEVER** `--only` 繞 0-A。
+
+### 等待機制
+
+`in-flight ledger > 0` 且四組皆空時，loop **不退出、不釋放 lock**。
+
+| 機制 | 行為 |
+| --- | --- |
+| Notification-only 等待 | 每個 in-flight agent 完成時系統送 `<task-notification>`（或 SendMessage 回報），主線收到才處理——不短輪詢。無 task id 的條目仍在 `inFlight` 持久記錄 `dispatchedAt`、`owner`、`deadline` 與 `lifecycle`。這類條目的 claim key 是 **owner ref**（`taskId: null`），狀態機與 task-id claim 相同：`pending → harvesting → harvested`，已是 `harvesting` / `harvested` 則 no-op |
+| 安全網 fallback | 有 `Bash(run_in_background)` harness task id 的 dispatch：把 `taskId`、`owner`、`deadline`、`lifecycle=pending` 記入 `inFlight`，並排 1500s canonical control wakeup（SoT：[[agent-routing.keepalive-wake]] § Async keepalive prompt）。只有 terminal 才排 `ASYNC_LIFECYCLE_HANDOFF` 並 claim；deadline / unknown 一律保留 ledger ownership，走下列 deadline protocol。無 task id 的 dispatch 改排同一份 canonical 模板並逐字填 `task=none`，並用 ledger deadline 觸發同一 deadline protocol。**NEVER** 放原 `/work-loop` prompt，或在 control turn 做任何 mutation |
+| 等待期間 | 主線工作來源見 [dispatch-topology.md](dispatch-topology.md) § 主線在做什麼。四組與 HANDOFF 補件皆空、且 in-flight > 0 時的等待是收斂，不是閒置 |
+| Hang 上限 | 每個 `deadline` = dispatch 後 **2 小時**。deadline 到達時先把 `lifecycle` 寫為 `cancelling`，停止 control wakeup，並以 `TaskStop` 取消可取消的 task；無 task id 的 owner 走自身 cancel protocol。**確認 terminal 前 NEVER** 記 fail-streak、移除 ledger、釋放 lock 或重派。terminal 通知到達後才 claim、按 dispatch failure 收尾、寫 HANDOFF 與釋放 lock |
+
+### pre-scan 通知的輕量收割（不走 8 步 SOP）
+
+`inFlight` 條目 `agent` 為 `pi:<label>`（`codex:<label>` 也認）者，收到通知只做三步：
+
+1. `BashOutput` 讀 dispatcher 的單行 JSON，依 [dispatch-topology.md](dispatch-topology.md) § pre-scan 的 exit code 分流 判處置
+2. `git status --short` 驗零新增改動（read-only 契約）；有改動 → revert 後按 exit 3 機械故障處置
+3. 消費 report，該 item 回 Step 3 續判
+
+ledger 移除照做、2h hang 上限照算。8 步 SOP 的 scope-verify / checker / re-scan 是為**寫入型** dispatch 設計的，對 read-only pre-scan 無對象。
+
+### 每收到一個 notification → 立即處理（收割 SOP）
+
+1. **驗收 agent 結果**：`git -C <worktree> log --oneline` + `git -C <worktree> status --short` + 讀 `WORKTREE-BRIEF.md` 的 Progress / frontmatter status——agent 的完成宣稱是未驗證主張（per [[agent-routing.dispatch-execution]] § Subagent 回報契約），MUST 有 commit 佐證
+   - **主線自走 worktree 時（[no-wt-dispatch.md](no-wt-dispatch.md) § `wt` 不可用時的 dispatch 形狀）這一步不放寬**：commit
+     照樣要有，只是由主線在 worktree 內產生。要放棄的是「讀 agent 的完成宣稱」那一半——
+     沒有 agent 可讀，也沒有未驗證主張要拆穿；`git log` 與 `git status --short` 兩條照跑
+2. **驗 scope**：`node "${CLADE_HOME:-$HOME/offline/clade}/scripts/scope-verify.ts" --repo <repo> --scope '<brief 宣告的每一條路徑>'`。scope 外的**實質**改動 → `git checkout HEAD -- <file>` revert 後 re-run 該 agent 交付的驗證（per [[subagent-scope-discipline]]）。subagent 自報「No changes outside scope」是未驗證主張，**NEVER** 採信
+3. **高擴散半徑 change MUST 派 checker**：該 dispatch 的 change 觸及跨 consumer 共用 SoT（`rules/core/` / `vendor/` / `hub-*` skill / `claude-md/`）或高擴散半徑 consumer 資產（DB migration / auth 路徑 / 多處 import 的共用 util / 對外 API contract）時，依 [[checker-subagent]] 派一個 **fresh-context** checker subagent（只給 diff + spec 的驗收標準；gate 全綠是派 checker 的**前置條件**，NEVER 塞進 brief 當判定材料），拿 PASS / FAIL。**phase 數不是判準**——3 個 phase 的純 UI 調整不派，1 個 phase 的 migration 要派。主線自己讀一遍 diff **不算**複核——主線是派工方，帶著「我知道我要它做什麼」的記憶，正是 Iron Law 指的有偏差裁判。FAIL 的 blocker finding 修完 MUST 重派新 checker
+4. **更新進度**：在記憶體中的 state 記下該 change 的推進，Step 7.3 再經 `work-loop-state-write.ts` 寫回 `.clade/work-loop/state.json`（**NEVER** 本步直接寫檔）；**NEVER** render 進 HANDOFF（SKILL.md Step 7.2）
+5. **Re-scan**：重跑 SKILL.md Step 2 的 scan（`work-loop-scan.ts`）
+6. **檢查新 actionable**：carrier 狀態位移（實作完 → 待收 evidence / 待收尾 / `work.done`）= 新 actionable → 回 Step 3 分類 + 分組 → 依組別 dispatch，計入 unattended cap
+7. **更新 in-flight ledger**：移除已處理的 agent；步驟 6 的新 dispatch 記進 ledger
+8. **補滿扇出組**：扇出 in-flight < 4 且扇出組還有未 dispatch 的 item → 補一個（4 只計扇出組，dev-port dispatch 另計）
+
+### 進 Step 6 停止判定的條件（兩者**同時**成立）
+
+- In-flight ledger = 0（所有派出的 agent 已回報並走完收割 SOP）
+- 最後一次 re-scan 後四組皆空，且 HANDOFF 補件來源也空；此時以 `drained` 評估就緒批次，先完成可執行的整合／提交／清理，真 gate blocker 才 packaging
+
+任一不成立 → 繼續 dispatch / 繼續等下一個 notification。
+
+
+Claude binding for this reference: consume background task completion with `TaskOutput`; at deadline mark `cancelling` and use `TaskStop` when the task is cancellable. Stop the control `ScheduleWakeup` after terminal notification, then perform the shared harvest and state writes.

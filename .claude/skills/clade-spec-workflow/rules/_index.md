@@ -1,0 +1,2 @@
+{"file":"aixbdd-workflow.md","source":"rules/core/aixbdd-workflow.md","paths":["specs/plans/**","specs/truth/**",".agents/constitution/**"]}
+{"file":"specformula.md","source":"rules/core/specformula.md","paths":["specs/truth/contracts/**","specs/truth/features/**","specs/truth/data/**","specs/api/**","specs/data/**","features/**","isa.yml","cucumber.cjs","server/routes/test/**","server/utils/time-service.ts","packages/*/server/routes/test/**","packages/*/server/utils/time-service.ts"]}

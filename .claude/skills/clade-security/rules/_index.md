@@ -1,0 +1,8 @@
+{"file":"auth-data-path-consistency.md","source":"rules/core/auth-data-path-consistency.md","paths":["app/**/*.ts","packages/*/app/**/*.ts","app/**/*.vue","packages/*/app/**/*.vue","supabase/migrations/**/*.sql","server/api/**/*.ts","server/utils/**/*.ts","packages/*/server/api/**/*.ts","packages/*/server/utils/**/*.ts"]}
+{"file":"prod-mcp-safety.enforcement.md","source":"rules/core/prod-mcp-safety.enforcement.md","paths":[".mcp.json",".claude/settings.json",".claude/settings.local.json",".codex/config.toml"]}
+{"file":"prod-mcp-safety.md","source":"rules/core/prod-mcp-safety.md","paths":null}
+{"file":"public-repo-hygiene.md","source":"rules/core/public-repo-hygiene.md","paths":[".github/workflows/**",".husky/**","HANDOFF.md","tasks/**","scripts/audit-public-tree-hygiene.ts","scripts/public-tree-hygiene-tokens.json"]}
+{"file":"secret-custody.md","source":"rules/core/secret-custody.md","paths":null}
+{"file":"secrets.md","source":"rules/modules/runtime/cf-workers/secrets.md","paths":[".github/workflows/**/*.yml","wrangler.toml","wrangler.jsonc"]}
+{"file":"security-policy.md","source":"rules/core/security-policy.md","paths":["SECURITY.md","packages/*/SECURITY.md","server/middleware/**","packages/*/server/middleware/**","supabase/migrations/**/*.sql","server/database/migrations/**/*.sql","packages/*/supabase/migrations/**/*.sql","packages/*/server/database/migrations/**/*.sql"]}
+{"file":"user-lifecycle.md","source":"rules/core/user-lifecycle.md","paths":["server/api/**/user*","packages/*/server/api/**/user*","server/api/**/admin/user*","packages/*/server/api/**/admin/user*","supabase/migrations/**/*.sql","server/database/migrations/**/*.sql","packages/*/server/database/migrations/**/*.sql"]}

@@ -1,0 +1,1 @@
+{"file":"db-preview-env.md","source":"rules/core/db-preview-env.md","paths":["supabase/migrations/**/*.sql",".github/workflows/**/*.yml","docker-compose*.yml","infra/**/*","scripts/dev-session*","scripts/worktree-*","scripts/singleton*",".claude/consumer-meta.json"]}
