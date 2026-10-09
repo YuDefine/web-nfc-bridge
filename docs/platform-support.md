@@ -13,7 +13,7 @@ Decision 6: Windows on ARM 驅動驗證列為先行風險排除工作。
 
 - 四個平台的安裝包都已隨 GitHub Release 發佈（public 最新為 v0.1.20，2026-03-12）；**發佈安裝包不等於完成驗證**
 - 已有正式驗證紀錄：僅 macOS Apple Silicon（見下方 Validation Snapshot）
-- Windows x64、Windows ARM64、Linux x64：已出安裝包、實機驗證中，對應 openspec `add-cross-platform-nfc-web-bridge` 任務 2.2–2.4
+- Windows x64、Windows ARM64、Linux x64：已出安裝包、實機驗證中
 - 狀態改為 Validated 的條件：依 [Platform Validation Playbook](platform-validation-playbook.md) 完成 Shared Success Criteria，並把日期、reader、結果寫進 Validation Snapshot
 - 在 Windows ARM64 完成前，不調整其 high-risk 標記
 

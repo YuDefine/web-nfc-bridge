@@ -28,7 +28,6 @@
 
 ## Current Repository Layout
 
-- `openspec/`: 規格、變更與專案 context
 - `docs/`: 架構、契約與支援文件
 - `pages/`, `composables/`, `assets/`: Nuxt 前端
 - `connector/`: Go Connector service

@@ -1,12 +1,9 @@
-# Spectra app data
-.spectra/
 node_modules/
 .nuxt/
 .output/
 dist/
 coverage/
 *.tsbuildinfo
-openspec/.vector-search.db*
 artifacts/
 /nfc-connector
 connector/nfc-connector
