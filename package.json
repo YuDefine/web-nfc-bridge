@@ -33,6 +33,7 @@
   "devDependencies": {
     "@types/node": "^25.3.5",
     "rolldown": "1.2.11",
+    "vite": "catalog:",
     "vite-plus": "1.0.0",
     "vue-tsc": "^3.2.5",
     "wrangler": "^4.71.0"
